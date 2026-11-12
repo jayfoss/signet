@@ -3,6 +3,8 @@ name = "signet-mls"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
+authors = ["Jerzy Foss"]
 description = "Signet's native crypto: MLS (RFC 9420, via OpenMLS), ECVRF (RFC 9381) and SPAKE2 pairing, with Node bindings"
 
 [lib]

@@ -2,11 +2,12 @@
   "name": "@signet/lib",
   "version": "0.0.0",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "main": "src/index.ts",
   "dependencies": {
     "@hpke/core": "^1.10.1",
     "mailparser": "^3.7.4",
     "nodemailer": "^10.5.0"
-  }
+  },
+  "author": "Jerzy Foss"
 }

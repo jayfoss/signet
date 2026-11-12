@@ -37,9 +37,9 @@ Status of This Memo
    no formal standing.
 
    It describes version 0 of Signet. The reference implementation is the
-   library (signet-lib), native core (signet-mls), server
-   (signet-server) and client (signet-client). Where the reference code
-   does not yet do what this text requires, or takes a shortcut a
+   library (@signet/lib), native core (@signet/mls), server
+   (@signet/server) and client (@signet/client). Where the reference
+   code does not yet do what this text requires, or takes a shortcut a
    production deployment cannot take, the gap is listed in the reference
    implementation's errata (packages/lib/ERRATA.md in the reference
    code), not here. The Open Issues subsections of this document list
@@ -49,20 +49,27 @@ Status of This Memo
    may change without notice in later versions. The reference code has
    not had an independent security audit.
 
-   This document may be copied and modified for the purpose of
-   reviewing, implementing or discussing Signet.
+Copyright Notice
 
+   Copyright (c) 2026 Jerzy Foss.
 
-
+   This document is licensed under the Creative Commons Attribution 4.0
 
 Foss                    Expires 15 May 2027                     [Page 1]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
+   International License (CC BY 4.0),
+   <https://creativecommons.org/licenses/by/4.0/>. You may copy, adapt
+   and redistribute it in any medium or format, including commercially,
+   provided that you credit the author, link to the license, and
+   indicate whether you made changes.
+
 Table of Contents
 
    Abstract .......................................................... 1
    Status of This Memo ............................................... 1
+   Copyright Notice .................................................. 1
    1.  Introduction .................................................. 5
       1.1.  Goals .................................................... 5
       1.2.  Non-goals ................................................ 6
@@ -106,6 +113,11 @@ Table of Contents
    5.  Key Transparency ............................................. 43
       5.1.  Overview ................................................ 43
       5.2.  VRF Index ............................................... 43
+
+Foss                    Expires 15 May 2027                     [Page 2]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       5.3.  Log Leaves .............................................. 43
       5.4.  Merkle Tree and Proofs .................................. 44
       5.5.  Signed Tree Heads ....................................... 45
@@ -113,11 +125,6 @@ Table of Contents
       5.7.  Proxied Log Queries ..................................... 47
       5.8.  Verifying a Lookup ...................................... 47
       5.9.  Monitoring .............................................. 49
-
-Foss                    Expires 15 May 2027                     [Page 2]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       5.10.  Log Trust .............................................. 50
       5.11.  Open Issues ............................................ 50
    6.  Discovery .................................................... 50
@@ -165,6 +172,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    10.  Delivery and Metadata Protection ............................ 81
       10.1.  Overview ............................................... 81
       10.2.  Submission ............................................. 82
+
+Foss                    Expires 15 May 2027                     [Page 3]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       10.3.  Delivery Tokens ........................................ 84
       10.4.  Oblivious HTTP ......................................... 85
       10.5.  Anonymous Requests ..................................... 87
@@ -172,11 +184,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       10.7.  Mailbox ................................................ 89
       10.8.  Open Issues ............................................ 89
    11.  Humans-only Mail and Escrow ................................. 90
-
-Foss                    Expires 15 May 2027                     [Page 3]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       11.1.  Principle .............................................. 90
       11.2.  Humans-only Requests ................................... 90
       11.3.  Audience Policy ........................................ 90
@@ -224,6 +231,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       15.6.  Contacts and Labels ................................... 108
       15.7.  Escrow ................................................ 108
       15.8.  Retention ............................................. 108
+
+Foss                    Expires 15 May 2027                     [Page 4]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    16.  IANA Considerations ........................................ 108
       16.1.  Well-Known URI ........................................ 108
       16.2.  Underscored DNS Node Name ............................. 108
@@ -231,11 +243,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       16.4.  Signet Intent Names ................................... 109
       16.5.  Values Used Without Registration ...................... 109
    17.  References ................................................. 109
-
-Foss                    Expires 15 May 2027                     [Page 4]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       17.1.  Normative References .................................. 109
       17.2.  Informative References ................................ 111
    Author's Address ................................................ 111
@@ -283,17 +290,17 @@ Experimental           Signet Protocol, Version 0          November 2026
        recipient's own clients, not its server, decide who is admitted.
 
    5.  Treat agents as first-class, bounded clients. Agents have their
+
+Foss                    Expires 15 May 2027                     [Page 5]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        own keys and certificates. What they may do is set by private
        scopes and limits, and by per-counterparty grants that the
        counterparty can verify.
 
    6.  Encrypt content end to end. Servers store and forward only
        ciphertext. Threads use MLS [RFC9420].
-
-
-Foss                    Expires 15 May 2027                     [Page 5]
-
-Experimental           Signet Protocol, Version 0          November 2026
 
    7.  Reduce the metadata servers learn, using sealed-sender delivery,
        Oblivious HTTP [RFC9458] and Privacy Pass [RFC9576].
@@ -342,17 +349,17 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  Public keys are raw keys in b64u: 32 bytes for Ed25519 [RFC8032]
       and X25519 [RFC7748].
 
+
+Foss                    Expires 15 May 2027                     [Page 6]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    *  A hash written as a string has the form sha256: followed by the
       b64u SHA-256 digest of the input.
 
    *  Timestamps are strings in the format produced by ECMAScript
       Date.prototype.toISOString, for example 2026-11-11T09:30:00.000Z.
       This is a profile of [RFC3339] in UTC with millisecond precision.
-
-
-Foss                    Expires 15 May 2027                     [Page 6]
-
-Experimental           Signet Protocol, Version 0          November 2026
 
    *  "Canonical JSON" means the serialization defined in Section 3.2.
       Every signature in this document is an Ed25519 signature over the
@@ -401,6 +408,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                    | owner.                                       |
    +--------------------+----------------------------------------------+
    | Agent              | A software client that acts for the owner    |
+
+Foss                    Expires 15 May 2027                     [Page 7]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                    | within scopes and limits. Also called an     |
    |                    | assistant.                                   |
    +--------------------+----------------------------------------------+
@@ -408,11 +420,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                    | receives every request, thread and           |
    |                    | humans-only message.                         |
    +--------------------+----------------------------------------------+
-
-Foss                    Expires 15 May 2027                     [Page 7]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    | Client certificate | The ClientCert object in the account log     |
    |                    | that binds a client id to its signing and    |
    |                    | agreement keys.                              |
@@ -460,6 +467,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------------------+----------------------------------------------+
    | Intent             | A typed, machine-readable action carried in  |
    |                    | a request or message, such as                |
+
+Foss                    Expires 15 May 2027                     [Page 8]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                    | schedule.propose.                            |
    +--------------------+----------------------------------------------+
    | Scope              | A string in a client certificate that limits |
@@ -467,11 +479,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                    | intent:schedule.*. Scopes are private to the |
    |                    | owner.                                       |
    +--------------------+----------------------------------------------+
-
-Foss                    Expires 15 May 2027                     [Page 8]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    | Grant              | An identity-key-signed statement that one    |
    |                    | agent may send certain intents to one        |
    |                    | counterparty, with optional limits.          |
@@ -506,13 +513,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 2.  Protocol Overview
 
    This section is informative. Sections 3 to 13 are normative.
-
-
-
-
-
-
-
 
 
 

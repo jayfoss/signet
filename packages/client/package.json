@@ -2,11 +2,12 @@
   "name": "@signet/client",
   "version": "0.0.0",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "dependencies": {
     "@signet/lib": "workspace:*"
   },
   "devDependencies": {
     "@signet/server": "workspace:*"
-  }
+  },
+  "author": "Jerzy Foss"
 }

@@ -1,6 +1,8 @@
 {
   "name": "signet",
   "private": true,
+  "license": "Apache-2.0",
+  "author": "Jerzy Foss",
   "packageManager": "pnpm@9.1.0",
   "engines": {
     "node": ">=24"

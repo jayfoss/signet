@@ -26,3 +26,9 @@ pnpm demo
 `pnpm demo` runs two domains, a log, an issuer and a relay in one process and walks through first contact, a thread, and the attacks Signet catches. `pnpm disclosure-demo` shows one agent asking a colleague's agent for information the colleague has to approve.
 
 Tests run per file, for example `pnpm jest packages/server/src/__tests__/server.test.ts`. `pnpm typecheck` checks all three TypeScript packages.
+
+## Licence
+
+Copyright 2026 Jerzy Foss.
+
+The code is licensed under the [Apache License, Version 2.0](LICENSE). The specification in [`docs/`](docs) is licensed under the [Creative Commons Attribution 4.0 International License](docs/LICENSE): you may copy, adapt and redistribute it, with credit and a note of what you changed. The authoritative Signet specification is the one published in this repository.

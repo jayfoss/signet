@@ -1,0 +1,11 @@
+{
+  "name": "@signet/mls",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "signet_mls.node",
+  "scripts": {
+    "build": "cargo build --release && cp target/release/libsignet_mls.$( [ \"$(uname)\" = Darwin ] && echo dylib || echo so ) signet_mls.node",
+    "test": "cargo test --release"
+  }
+}

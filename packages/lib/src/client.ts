@@ -1,0 +1,1469 @@
+import { simpleParser } from 'mailparser';
+import type { AdmissionDecision, AdmissionPolicy } from './admission';
+import { decideAdmission, isTrusted, knownDomains, lookalikeOf } from './admission';
+import type { AttachmentRef, FileInput } from './attachments';
+import { openAttachment, sealAttachment } from './attachments';
+import { clientAuthHeaders } from './auth';
+import type { Directory, Grant, SignedView, ViewMember } from './cards';
+import { cardHash, cardKeyHistory, verifyView, viewHash, viewMember } from './cards';
+import { randomId, sha256 } from './crypto';
+import type { ContactCard, DirectoryEntry, DomainPolicy, EnrolledEntry } from './directory';
+import {
+  HiddenAddressError,
+  IdentityChangedError,
+  contactCardLink,
+  parseContactCard,
+  normalizeAddress,
+  requesterHash,
+  splitAddress,
+  verifyDirectoryEntry,
+  verifyNotEnrolled,
+  verifyUnlisted,
+  UnlistedAddressError,
+} from './directory';
+import { decodeResponse, encodeRequest } from './bhttp';
+import type { ApprovalCard, ApprovalChoice, AudienceMember, DisclosureContext, OrgClaim } from './disclosure';
+import { DisclosureError, audienceHash, verifyOrgClaim } from './disclosure';
+import { b64u, canonicalJson, fromB64u, utf8 } from './encoding';
+import { OHTTP_REQUEST_TYPE, decapsulateResponse, encapsulateRequest } from './ohttp';
+import type { KeyPair } from './crypto';
+import type { ClientKeys, ClientKind, LogEntry } from './identity';
+import { keyChangeSince, recoveryProof, replayLog } from './identity';
+import type { PairingChannel, PendingClient } from './enrollment';
+import { EnrollmentError, HttpPairingChannel, completeEnrollment, newPairingSecret, pairAsNewClient, pairingCode, parsePairingCode } from './enrollment';
+import type { Intent } from './intents';
+import type { GmailMailbox } from './gmail';
+import type { AttestedFields, LegacyAuth, SealedLegacyMail } from './legacy';
+import { AUDIENCE_HEADER, SIGNET_HEADER, hasLegacyCopy, openLegacyMail, parseSignetHeader, verifyAttestation } from './legacy';
+import type { MessageFields, SignedMessage } from './message';
+import { composeMessage, verifyMessage } from './message';
+import type { Addition, ClaimedKeyPackage, Joiner, Member } from './mls';
+import { MlsSession } from './mls';
+import type { AgentCard } from './live';
+import { LIVE_LABEL, LiveSession, agentCardHash, newSessionId, tokensMatch } from './live';
+import type { IssuerKey } from './privacypass';
+import { blindTokenRequest, finalizeToken } from './privacypass';
+import type { Introduction, SealedRequest, SignedRequest } from './request';
+import { createIntroduction, createRequest, myCopy, openRequest } from './request';
+import type { Resolver } from './resolver';
+import { NotSignetDomainError } from './resolver';
+import { DELIVERY_LABEL, TOKEN_EPOCHS_KEPT, deliveryTokenHash, randomToken } from './sealed';
+import type { InclusionProof, LatestLeaf, LogLeaf, TreeHead, TrustedLog } from './transparency';
+import { TransparencyError, checkLeafDomain, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
+
+export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce';
+
+/** A mailbox entry. `from` is empty for sealed deliveries: the server never learned who sent them. */
+export interface MailItem {
+  seq: number;
+  id: string;
+  kind: MailKind;
+  from: string;
+  sealed?: boolean;
+  payload: unknown;
+  receivedAt: string;
+}
+
+export interface LegacyMail {
+  from: string;
+  subject: string;
+  text: string;
+  date: string | null;
+  auth: LegacyAuth;
+  /** `inbox` only when DMARC passed and the sender would be admitted anyway; everything else is a request. */
+  tier: 'inbox' | 'request';
+  /** Present when the mail carried a Signet header. */
+  signet: SignetCheck | null;
+  /** Set when the sender's domain reads like one you know but isn't it. */
+  lookalike?: string;
+  /** The sender asked that agents not read this (`Signet-Audience: humans`). */
+  humansOnly: boolean;
+  attachments: { filename: string; contentType: string; size: number }[];
+}
+
+/**
+ * What a Signet header on plain email proves. `onSignet`: that address is enrolled with the key the header
+ * names. `authenticated`: additionally, that address's own domain signed this exact From, To and Subject
+ * recently, so the email itself isn't a forgery. Only `authenticated` says anything about this message.
+ */
+export interface SignetCheck {
+  address: string;
+  onSignet: boolean;
+  authenticated: boolean;
+}
+
+/** A plain email found in Gmail that carries a Signet header. */
+export interface GmailSignetOffer {
+  gmailId: string;
+  from: string;
+  subject: string;
+  signet: SignetCheck;
+  humansOnly: boolean;
+}
+
+/** A client as others see it: device or agent, and a label only if it shared one in a thread. */
+export interface ClientSummary {
+  clientId: string;
+  kind: 'device' | 'agent' | 'escrow';
+  label?: string;
+}
+
+/** A person in a thread, with the clients (devices and agents) that read it for them. */
+export interface Participant {
+  principal: string;
+  clients: ClientSummary[];
+}
+
+export type SignetEvent =
+  | { kind: 'request'; request: SignedRequest; admission: AdmissionDecision }
+  | {
+      kind: 'joined' | 'rekeyed';
+      thread: string;
+      epoch: number;
+      members: Member[];
+      participants: Participant[];
+      humansOnly: boolean;
+      /** For a humans-only thread opened beside an ordinary one. */
+      linkedTo?: string;
+    }
+  | { kind: 'removed'; thread: string }
+  | { kind: 'message'; thread: string; message: SignedMessage; sender: ClientSummary }
+  | { kind: 'legacy'; mail: LegacyMail }
+  | { kind: 'bounce'; id: string; to: string[]; reason: string }
+  /** An agent handed a thread to its owner: their devices should show it as needing them. */
+  | { kind: 'handoff'; thread: string; by: string; reason: string }
+  /**
+   * A contact's identity key changed along the chain on their card. `rotated`: their own old key signed
+   * it. `recovered`: their recovery key did, because the old key was lost; worth a word with them.
+   */
+  | { kind: 'key-changed'; principal: string; how: 'rotated' | 'recovered'; from: string; to: string }
+  /** A domain told this client's server one thing about an address and anonymous lookups another. */
+  | { kind: 'directory-alert'; principal: string; alert: string }
+  | { kind: 'error'; item: MailItem; error: string };
+
+export interface ThreadMeta {
+  humansOnly: boolean;
+  linkedTo?: string;
+}
+
+/** Everything a client carries between runs apart from its signing keys. `mls` holds its MLS key store. */
+export interface ClientSnapshot {
+  cursor: number;
+  pins: Record<string, string>;
+  admission: AdmissionPolicy;
+  mls: string;
+  threads: string[];
+  /** Delivery-token hashes this client registered, per thread, oldest first. */
+  tokens: Record<string, string[]>;
+  /** Ids of this client's own deliveries, so their echoes are skipped. */
+  sentIds: string[];
+  treeHeads: Record<string, TreeHead>;
+  knownOwnClients: string[];
+  /** Grants this agent holds from its owner. */
+  grants: Grant[];
+  /** Contact views people presented to this client (in requests), checked against the log on every use. */
+  views: Record<string, SignedView>;
+  /** Labels other clients chose to share in threads. */
+  labels: Record<string, string>;
+  /** Which threads are humans-only, and which ordinary thread each sits beside. */
+  threadMeta: Record<string, ThreadMeta>;
+  /** Ordinary thread → its humans-only sibling, once one exists. */
+  siblings: Record<string, string>;
+  /** Live A2A sessions this client offered (host) or was offered (guest). */
+  liveSessions: Record<string, LiveSessionRecord>;
+  /** Threads an agent handed to a human; agents won't send in them until a human device has. */
+  needsHuman: Record<string, { by: string; reason: string; ts: string }>;
+  /** Contacts' key changes noticed during lookups, reported on the next sync. */
+  keyChanges: KeyChangedEvent[];
+  /** Domains caught answering inconsistently, reported on the next sync. */
+  directoryAlerts: Extract<SignetEvent, { kind: 'directory-alert' }>[];
+  /** Address → identity-key fingerprint, from plain email whose Signet header its domain authenticated. */
+  knownOnSignet: Record<string, string>;
+  /** Contact cards people handed this client, used when their domain says they are unlisted. */
+  contactCards: Record<string, ContactCard>;
+  /** This account's own thread for approval cards, once created. */
+  selfThread?: string;
+}
+
+export type KeyChangedEvent = Extract<SignetEvent, { kind: 'key-changed' }>;
+
+export interface LiveSessionRecord {
+  thread: string;
+  role: 'host' | 'guest';
+  url: string;
+  cardHash?: string;
+  expires: string;
+}
+
+export interface SignetClientOptions {
+  trustedLogs: TrustedLog[];
+  snapshot?: Partial<ClientSnapshot>;
+  fetchImpl?: typeof fetch;
+  /** How many unused key packages to keep on the home server, besides the last-resort one. */
+  keyPackageTarget?: number;
+  /** Share this client's label ("Phone", "Clerk") with the threads it writes in. Off by default. */
+  shareLabel?: boolean;
+  /**
+   * An Oblivious HTTP relay for anonymous directory lookups: cross-checking an "unlisted" answer, and the
+   * owner's check of what strangers see. Without one those lookups go direct, from this client's address.
+   */
+  ohttpRelay?: string;
+}
+
+export interface MonitorReport {
+  alerts: string[];
+  newClients: ClientSummary[];
+}
+
+/**
+ * `for` lists hashes of the joining clients' ids, so servers don't see who is being added. A humans-only
+ * thread says so, and names the ordinary thread it sits beside, if any, so clients can show them linked.
+ */
+interface WelcomePayload {
+  thread: string;
+  welcome: string;
+  for: string[];
+  humansOnly?: boolean;
+  linkedTo?: string;
+}
+
+interface MlsPayload {
+  thread: string;
+  mls: string;
+}
+
+
+const emptySnapshot = (): ClientSnapshot => ({
+  cursor: 0,
+  pins: {},
+  admission: { contacts: [], trustedDomains: [] },
+  mls: '',
+  threads: [],
+  tokens: {},
+  sentIds: [],
+  treeHeads: {},
+  knownOwnClients: [],
+  grants: [],
+  views: {},
+  labels: {},
+  threadMeta: {},
+  siblings: {},
+  liveSessions: {},
+  needsHuman: {},
+  keyChanges: [],
+  directoryAlerts: [],
+  knownOnSignet: {},
+  contactCards: {},
+});
+
+const SENT_IDS_KEPT = 1000;
+
+const joinerTag = (clientId: string): string => sha256(`signet joiner ${clientId}`);
+const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }): WelcomePayload => ({
+  thread,
+  welcome,
+  for: joiners.map((joiner) => joinerTag(joiner.clientId)),
+  ...(meta.humansOnly ? { humansOnly: true } : {}),
+  ...(meta.linkedTo ? { linkedTo: meta.linkedTo } : {}),
+});
+
+/** Who may be in a thread: readers, and in a humans-only thread only devices and agents their owner opted in. */
+const eligible = (member: ViewMember, humansOnly: boolean): boolean => member.reads && (!humansOnly || member.humansOnly);
+
+const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const unique = (values: string[]) => [...new Set(values)];
+
+/** Current clients that join this person's threads (only humans-only ones, if asked). Needs their contact view. */
+function readers(directory: Directory, humansOnly = false, now = new Date()): ViewMember[] {
+  if (!directory.view) throw new Error(`${directory.principal} hasn't shared their contact view with you`);
+  return directory.view.members.filter((member) => eligible(member, humansOnly) && Date.parse(member.expires) > now.getTime());
+}
+
+/**
+ * One approved client. It talks only to its own home server, which proxies lookups, key-package claims
+ * and log queries, so other domains rate-limit by requester and never see this client's address.
+ */
+export class SignetClient {
+  private readonly state: ClientSnapshot;
+  private readonly mls: MlsSession;
+  private readonly directories = new Map<string, Promise<Directory | null>>();
+  private readonly fetchImpl: typeof fetch;
+  private readonly ohttpRelay: string | undefined;
+  private released = 0;
+  /** Set while this client's own server refuses it: lookups then go straight to the public directory and log. */
+  private direct = false;
+
+  constructor(
+    readonly keys: ClientKeys,
+    private readonly resolver: Resolver,
+    private readonly options: SignetClientOptions,
+  ) {
+    this.state = { ...emptySnapshot(), ...structuredClone(options.snapshot ?? {}) };
+    this.mls = new MlsSession(keys, this.state.mls);
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.ohttpRelay = options.ohttpRelay;
+  }
+
+  get address(): string {
+    return this.keys.cert.principal;
+  }
+
+  get admission(): AdmissionPolicy {
+    return this.state.admission;
+  }
+
+  get threadIds(): string[] {
+    return [...this.state.threads];
+  }
+
+  members(thread: string): Member[] {
+    return this.mls.members(this.thread(thread));
+  }
+
+  /** The people in a thread, each with the clients that read it for them. */
+  async participants(thread: string): Promise<Participant[]> {
+    this.directories.clear();
+    return this.toParticipants(this.members(thread));
+  }
+
+  epoch(thread: string): number {
+    return this.mls.epoch(this.thread(thread));
+  }
+
+  snapshot(): ClientSnapshot {
+    return structuredClone({ ...this.state, mls: this.mls.state });
+  }
+
+  /**
+   * Contacts and trusted domains live on the account's home server, so every device and agent of the
+   * account admits the same people and warns about the same lookalikes. They're routing metadata the
+   * server already sees, not content. Each client keeps a copy and syncs it on every `sync`.
+   */
+  async addContact(address: string): Promise<void> {
+    const who = normalizeAddress(address);
+    if (!this.state.admission.contacts.includes(who)) this.state.admission.contacts.push(who);
+    await this.call('POST', '/v0/contacts', { contacts: [who] });
+  }
+
+  async trustDomain(domain: string): Promise<void> {
+    const name = domain.toLowerCase();
+    if (!this.state.admission.trustedDomains.includes(name)) this.state.admission.trustedDomains.push(name);
+    await this.call('POST', '/v0/contacts', { trustedDomains: [name] });
+  }
+
+  /** Mark a client this device approved itself, so `monitor` doesn't ask whether it was you. */
+  acknowledgeClient(clientId: string): void {
+    if (!this.state.knownOwnClients.includes(clientId)) this.state.knownOwnClients.push(clientId);
+  }
+
+  private async pullContacts(): Promise<void> {
+    const shared = (await this.call('GET', '/v0/contacts')) as AdmissionPolicy;
+    this.state.admission = {
+      contacts: unique([...this.state.admission.contacts, ...shared.contacts]),
+      trustedDomains: unique([...this.state.admission.trustedDomains, ...shared.trustedDomains]),
+    };
+  }
+
+  /** Hold a grant from this client's owner. The agent presents it only to the counterparty it names. */
+  addGrant(grant: Grant): void {
+    if (grant.agent !== this.keys.cert.clientId || grant.principal !== this.address) throw new Error('this grant is for another client');
+    this.state.grants = [...this.state.grants.filter((held) => held.id !== grant.id), grant];
+  }
+
+  /** Publish key packages so others can add this client to threads. Call once after enrolling; sync keeps them topped up. */
+  async ready(): Promise<void> {
+    this.directories.clear();
+    if (this.state.knownOwnClients.length === 0) {
+      const own = await this.require(this.address);
+      this.state.knownOwnClients = (own.view?.members ?? []).map((member) => member.clientId);
+    }
+    await this.topUpKeyPackages();
+  }
+
+  /**
+   * Fetch and verify an address's directory entry and its transparency-log record. Strangers get the
+   * public card; contacts who have been released the view get it too. Pins the identity key on first
+   * sight. Returns null when the address is provably not enrolled.
+   */
+  async lookup(address: string): Promise<Directory | null> {
+    this.directories.clear();
+    return this.cachedLookup(address);
+  }
+
+  /** Vouch for `introduced` to `to`, using this client's key and its current contact view. */
+  async introduce(introduced: string, to: string, context: string): Promise<Introduction> {
+    return createIntroduction(this.keys, await this.ownView(), normalizeAddress(introduced), normalizeAddress(to), context);
+  }
+
+  /**
+   * Send a first-contact request, sealed to the recipient's public request keys (just its intake agent,
+   * if it chose that). When the recipient's domain accepts Privacy Pass tokens, it goes anonymously: a
+   * token instead of a sender on the envelope. Pass `anonymous: false` to send it signed in the clear.
+   */
+  async sendRequest(
+    to: string,
+    fields: { subject: string; intent?: Intent; note?: string; introduction?: Introduction },
+    options: { anonymous?: boolean; humansOnly?: boolean } = {},
+  ): Promise<SealedRequest> {
+    this.directories.clear();
+    const recipient = await this.recipientFor(to);
+    const policy = await this.resolver.policy(splitAddress(recipient.principal).domain);
+    const anonymous = options.anonymous ?? policy.privacyPass !== undefined;
+    const replyToken = randomToken();
+    await this.registerTokens([deliveryTokenHash(replyToken, this.address)], []);
+    await this.releaseView([recipient.principal]);
+    const request = await createRequest(
+      this.keys,
+      await this.ownView(),
+      recipient,
+      { ...fields, replyToken, grants: this.state.grants, humansOnly: options.humansOnly },
+      new Date(),
+      anonymous,
+    );
+    if (anonymous) await this.submit([request.to], 'request', request, undefined, await this.privacyPassToken(policy));
+    else await this.submit([request.to], 'request', request);
+    await this.addContact(request.to);
+    return request;
+  }
+
+  /** Admit a request's sender: start a thread with every reading client on both sides (humans-only if the request was). */
+  async accept(request: SignedRequest): Promise<string> {
+    await this.addContact(request.body.from);
+    return this.startThread([request.body.from], { replyToken: request.body.replyToken, humansOnly: request.body.audience === 'humans' });
+  }
+
+  isHumansOnly(thread: string): boolean {
+    return this.state.threadMeta[thread]?.humansOnly ?? false;
+  }
+
+  /** The humans-only thread beside this one, if it has been opened. */
+  humansOnlySibling(thread: string): string | undefined {
+    return this.state.siblings[thread];
+  }
+
+  /**
+   * Start a thread with these people and this client's own other readers. It releases this account's
+   * contact view to them first. The welcome to the other side is sealed when they gave a reply token.
+   */
+  async startThread(with_: string[], options: { replyToken?: string; humansOnly?: boolean; linkedTo?: string } = {}): Promise<string> {
+    this.directories.clear();
+    const humansOnly = options.humansOnly ?? false;
+    const own = await this.require(this.address);
+    if (humansOnly && !viewMember(own.view, this.keys.cert.clientId)?.humansOnly) {
+      throw new Error('this client is an agent its owner hasn\'t allowed into humans-only threads');
+    }
+    const others = unique(with_.map(normalizeAddress)).filter((principal) => principal !== this.address);
+    await this.releaseView(others);
+    const additions: Addition[] = [];
+    for (const principal of [this.address, ...others]) {
+      const members = readers(await this.require(principal), humansOnly).filter((member) => member.clientId !== this.keys.cert.clientId);
+      additions.push(...(await this.claim(principal, members)));
+    }
+    const { thread, welcome, joiners } = this.mls.createGroup(additions);
+    const meta: ThreadMeta = { humansOnly, ...(options.linkedTo ? { linkedTo: options.linkedTo } : {}) };
+    this.state.threads.push(thread);
+    this.state.threadMeta[thread] = meta;
+    if (options.linkedTo) this.state.siblings[options.linkedTo] = thread;
+    await this.registerCurrentToken(thread);
+    if (welcome) {
+      const payload = welcomeFor(thread, welcome, joiners, meta);
+      const replyToken = options.replyToken;
+      if (joiners.some((joiner) => joiner.principal === this.address)) await this.submit([this.address], 'welcome', payload);
+      if (others.length > 0) await this.submit(others, 'welcome', payload, replyToken);
+    }
+    return thread;
+  }
+
+  /**
+   * Send to a thread. With `humansOnly` on an ordinary thread, the message goes to its humans-only
+   * sibling (same people, only their devices and opted-in agents), opened the first time it's needed.
+   * Everything stays inside MLS; the audience is the group's membership.
+   */
+  async send(thread: string, fields: MessageFields & { files?: FileInput[]; humansOnly?: boolean }): Promise<SignedMessage & { thread: string }> {
+    this.directories.clear();
+    let id = this.thread(thread);
+    const { files = [], humansOnly, ...rest } = fields;
+    const handsOff = (rest.intents ?? []).some((intent) => intent.name.startsWith('handoff.human'));
+    if (this.state.needsHuman[id]?.by === this.address && this.keys.cert.kind !== 'device' && !handsOff) {
+      throw new Error(`this thread was handed to a human (${this.state.needsHuman[id].reason}); an agent can't send in it until they reply`);
+    }
+    if (humansOnly && !this.isHumansOnly(id)) {
+      const others = this.principalsOf(this.mls.members(id)).filter((principal) => principal !== this.address);
+      id = this.state.siblings[id] ?? (await this.startThread(others, { humansOnly: true, linkedTo: id }));
+    }
+    if (this.isHumansOnly(id)) rest.audience = 'humans';
+    const uploaded = await Promise.all(files.map((file) => this.upload(file)));
+    const principals = this.principalsOf(this.mls.members(id));
+    const now = Date.now();
+    const grants = this.state.grants.filter((grant) => principals.includes(grant.counterparty) && Date.parse(grant.expires) > now);
+    const message = composeMessage(this.keys, id, {
+      ...rest,
+      attachments: [...(rest.attachments ?? []), ...uploaded],
+      grants: [...(rest.grants ?? []), ...grants],
+      profile: rest.profile ?? (this.options.shareLabel ? { label: this.keys.cert.label } : undefined),
+    });
+    const token = this.deliveryToken(id);
+    const mls = this.mls.encrypt(id, utf8(JSON.stringify(message)));
+    await this.submit(principals, 'message', { thread: id, mls } satisfies MlsPayload, token);
+    if (handsOff) this.handOff(id, this.address, rest.intents?.find((i) => i.name.startsWith('handoff.human'))?.args.reason as string);
+    else if (this.keys.cert.kind === 'device') delete this.state.needsHuman[id];
+    return { ...message, thread: id };
+  }
+
+  /**
+   * Offer to continue a thread as a live A2A session with this agent's gateway. The offer is a signed
+   * intent inside the thread, so only members see the URL; the token each side uses is derived from the
+   * thread's MLS exporter, so nothing secret is sent and a rekey ends the session.
+   */
+  async offerLiveSession(thread: string, card: AgentCard, ttlMinutes = 30): Promise<{ sessionId: string }> {
+    const sessionId = newSessionId();
+    const expires = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
+    const cardHash = agentCardHash(card);
+    await this.send(thread, {
+      subject: 'Live session',
+      text: `Continuing live at ${card.url} until ${expires}`,
+      intents: [{ name: 'session.offer', args: { protocol: 'a2a', url: card.url, cardHash, sessionId, expires } }],
+    });
+    this.state.liveSessions[sessionId] = { thread, role: 'host', url: card.url, cardHash, expires };
+    return { sessionId };
+  }
+
+  /** The current bearer token for a session: only members of the thread at its current epoch can derive it. */
+  liveToken(thread: string, sessionId: string): string {
+    return b64u(this.mls.exportSecret(this.thread(thread), `${LIVE_LABEL} ${sessionId}`));
+  }
+
+  /** For this agent's gateway: the session's thread if the token is current, else null. */
+  authorizeLive(sessionId: string, token: string): string | null {
+    const session = this.state.liveSessions[sessionId];
+    if (!session || session.role !== 'host' || Date.parse(session.expires) <= Date.now()) return null;
+    if (!this.state.threads.includes(session.thread) || this.state.needsHuman[session.thread]) return null;
+    return tokensMatch(token, this.liveToken(session.thread, sessionId)) ? session.thread : null;
+  }
+
+  /** Accept a `session.offer` from a thread message: check the agent card against its hash, then connect. */
+  async joinLiveSession(thread: string, message: SignedMessage): Promise<LiveSession> {
+    const offer = message.body.intents.find((intent) => intent.name.startsWith('session.offer'));
+    if (!offer || message.body.thread !== thread) throw new Error('that message is not a live-session offer for this thread');
+    const { url, sessionId, cardHash, expires } = offer.args as { url: string; sessionId: string; cardHash?: string; expires: string };
+    if (Date.parse(expires) <= Date.now()) throw new Error('the live-session offer has expired');
+    if (this.state.needsHuman[thread]?.by === this.address && this.keys.cert.kind !== 'device') throw new Error('this thread was handed to a human');
+    const card = (await this.getJson(`${url}/.well-known/agent-card.json`)) as AgentCard;
+    if (cardHash && agentCardHash(card) !== cardHash) throw new Error('agent card does not match the hash in the offer');
+    this.state.liveSessions[sessionId] = { thread, role: 'guest', url, cardHash, expires };
+    return new LiveSession(url, sessionId, this.liveToken(thread, sessionId), this.fetchImpl);
+  }
+
+  /** End a session this client offered, telling the thread. */
+  async endLiveSession(sessionId: string, reason = 'ended'): Promise<void> {
+    const session = this.state.liveSessions[sessionId];
+    if (!session) return;
+    delete this.state.liveSessions[sessionId];
+    await this.send(session.thread, { subject: 'Live session', text: `Live session ${reason}`, intents: [{ name: 'session.end', args: { sessionId, reason } }] });
+  }
+
+  needsHuman(thread: string): { by: string; reason: string; ts: string } | undefined {
+    return this.state.needsHuman[thread];
+  }
+
+  /** Mark a thread as handed to a human and end its live sessions. */
+  private handOff(thread: string, by: string, reason: string | undefined): void {
+    this.state.needsHuman[thread] = { by, reason: reason ?? 'needs a human', ts: new Date().toISOString() };
+    for (const [sessionId, session] of Object.entries(this.state.liveSessions)) {
+      if (session.thread === thread) delete this.state.liveSessions[sessionId];
+    }
+  }
+
+  /** Claims this account's organisation vouches for ("team:corporate"), signed by its domain key. */
+  async ownClaims(): Promise<OrgClaim[]> {
+    return ((await this.call('GET', '/v0/claims')) as { claims: OrgClaim[] }).claims;
+  }
+
+  /** Ask a thread for information, with the claims the organisation signed about this account. */
+  async requestInfo(thread: string, fields: { question: string; purpose?: string; neededBy?: string }): Promise<SignedMessage> {
+    const claims = await this.ownClaims();
+    return this.send(thread, {
+      subject: 'Information request',
+      text: fields.question,
+      intents: [{ name: 'info.request', args: { question: fields.question, purpose: fields.purpose, neededBy: fields.neededBy, claims } }],
+    });
+  }
+
+  /**
+   * What an answering agent can rely on about an `info.request`: who asked and from which kind of client,
+   * the claims that verify against the asker's domain key, and exactly who would read an answer here.
+   */
+  async disclosureContext(thread: string, message: SignedMessage): Promise<DisclosureContext> {
+    const intent = message.body.intents.find((candidate) => candidate.name.startsWith('info.request'));
+    if (!intent) throw new DisclosureError('that message is not an information request');
+    const { question, purpose, claims = [] } = intent.args as { question: string; purpose?: string; claims?: OrgClaim[] };
+    const requester = message.body.from;
+    const policy = await this.resolver.policy(splitAddress(requester).domain);
+    const verified = claims.filter((claim) => verifyOrgClaim(claim, requester, policy)).map((claim) => claim.body.claim);
+    const audience = await this.audience(thread);
+    const requesterKind = audience.find((member) => member.clientId === message.body.fromClient)?.kind ?? 'unknown';
+    return {
+      thread: this.thread(thread),
+      requestId: message.body.id,
+      question,
+      purpose,
+      requester,
+      requesterKind,
+      claims: [...new Set(verified)],
+      audience,
+      audienceHash: audienceHash(audience.map((member) => member.clientId)),
+    };
+  }
+
+  /** Every client that would read a message in this thread, with its owner and kind. */
+  async audience(thread: string): Promise<AudienceMember[]> {
+    const people = await this.participants(thread);
+    return people.flatMap((person) => person.clients.map((client) => ({ principal: person.principal, clientId: client.clientId, kind: client.kind, label: client.label })));
+  }
+
+  /** Answer directly, when the owner's rules already allow it. The answer names the membership it went to. */
+  async answerInfo(context: DisclosureContext, text: string, decision: 'answered' | 'narrowed' = 'answered'): Promise<SignedMessage> {
+    const current = audienceHash((await this.audience(context.thread)).map((member) => member.clientId));
+    if (current !== context.audienceHash) throw new DisclosureError("the thread's members changed since this was decided");
+    return this.send(context.thread, {
+      subject: 'Re: information request',
+      text,
+      inReplyTo: context.requestId,
+      intents: [{ name: 'info.answer', args: { requestId: context.requestId, decision, approvedFor: current } }],
+    });
+  }
+
+  async refuseInfo(context: DisclosureContext, reason: string): Promise<SignedMessage> {
+    return this.send(context.thread, {
+      subject: 'Re: information request',
+      text: reason,
+      inReplyTo: context.requestId,
+      intents: [{ name: 'info.answer', args: { requestId: context.requestId, decision: 'refused', reason } }],
+    });
+  }
+
+  /**
+   * Hand the decision to the owner: an approval card, with the draft and the exact audience, goes to a
+   * thread of this account's own clients only. Nothing reaches the asker until a device releases it.
+   */
+  async escalateInfo(context: DisclosureContext, draft: string): Promise<void> {
+    const card: ApprovalCard = { ...context, draft };
+    await this.send(await this.selfThread(), {
+      subject: `Approve a disclosure to ${context.requester}?`,
+      text: `${context.requester} asks: ${context.question}`,
+      intents: [{ name: 'info.approval', args: { ...card } }],
+    });
+  }
+
+  /** The approval card in a message from this account's own agent, if there is one. */
+  approvalCard(message: SignedMessage): ApprovalCard | null {
+    if (message.body.from !== this.address) return null;
+    const intent = message.body.intents.find((candidate) => candidate.name.startsWith('info.approval'));
+    return intent ? (intent.args as unknown as ApprovalCard) : null;
+  }
+
+  /**
+   * The owner decides on a device. Releasing to the thread is refused if anyone joined or left since the
+   * card was drawn: the owner approved that audience, not whoever is there now. Releasing to the
+   * requester only goes to the humans-only sibling (their devices, and anything they opted in).
+   */
+  async decideApproval(card: ApprovalCard, choice: ApprovalChoice): Promise<SignedMessage> {
+    if (this.keys.cert.kind !== 'device') throw new DisclosureError("only the owner's devices can release a disclosure");
+    const reply = { subject: 'Re: information request', inReplyTo: card.requestId };
+    if (choice.release === 'refuse') {
+      return this.send(card.thread, { ...reply, text: choice.reason, intents: [{ name: 'info.answer', args: { requestId: card.requestId, decision: 'refused', reason: choice.reason } }] });
+    }
+    const text = choice.text ?? card.draft;
+    const decision = text === card.draft ? 'answered' : 'narrowed';
+    if (choice.release === 'requester-only') {
+      return this.send(card.thread, { ...reply, text, humansOnly: true, intents: [{ name: 'info.answer', args: { requestId: card.requestId, decision } }] });
+    }
+    const audience = await this.audience(card.thread);
+    const current = audienceHash(audience.map((member) => member.clientId));
+    if (current !== card.audienceHash) {
+      const approved = new Set(card.audience.map((member) => member.clientId));
+      const joined = audience.filter((member) => !approved.has(member.clientId)).map((member) => `${member.principal} (${member.label ?? member.kind})`);
+      throw new DisclosureError(`the thread's members changed since you approved${joined.length ? `: ${joined.join(', ')} joined` : ''}. Approve again`);
+    }
+    return this.send(card.thread, { ...reply, text, intents: [{ name: 'info.answer', args: { requestId: card.requestId, decision, approvedFor: current } }] });
+  }
+
+  /** A thread of this account's own clients, for approval cards. Created on first use. */
+  private async selfThread(): Promise<string> {
+    const existing = this.state.selfThread;
+    if (existing && this.state.threads.includes(existing)) return existing;
+    const thread = await this.startThread([]);
+    this.state.selfThread = thread;
+    return thread;
+  }
+
+  /** Bring a thread in line with everyone's current views: remove revoked or expired clients, add new readers. */
+  async rekey(thread: string): Promise<{ removed: Member[]; added: Joiner[] }> {
+    this.directories.clear();
+    const id = this.thread(thread);
+    const members = this.mls.members(id);
+    const principals = this.principalsOf(members);
+    const directories = new Map<string, Directory | null>();
+    for (const principal of principals) directories.set(principal, await this.cachedLookup(principal));
+    const humansOnly = this.isHumansOnly(id);
+    const reading = (member: Member) => {
+      const current = viewMember(directories.get(member.principal)?.view, member.clientId);
+      return current !== undefined && current.sigKey === member.signatureKey && eligible(current, humansOnly);
+    };
+    const removed = members.filter((member) => member.clientId !== this.keys.cert.clientId && !reading(member));
+    const present = new Set(members.map((member) => member.clientId));
+    const additions: Addition[] = [];
+    for (const principal of principals) {
+      const directory = directories.get(principal);
+      if (directory?.view) additions.push(...(await this.claim(principal, readers(directory, humansOnly).filter((member) => !present.has(member.clientId)))));
+    }
+    if (removed.length === 0 && additions.length === 0) return { removed: [], added: [] };
+    const token = this.deliveryToken(id);
+    const result = this.mls.commit(id, removed.map((member) => member.leafIndex), additions);
+    await this.submit(principals, 'commit', { thread: id, mls: result.commit } satisfies MlsPayload, token);
+    if (result.welcome) {
+      await this.submit(this.principalsOf(result.joiners), 'welcome', welcomeFor(id, result.welcome, result.joiners, this.state.threadMeta[id]), token);
+    }
+    await this.registerCurrentToken(id);
+    return { removed, added: result.joiners };
+  }
+
+  /** Download and decrypt an attachment from a message this client has read. */
+  async fetchAttachment(ref: AttachmentRef): Promise<Buffer> {
+    const response = await this.fetchImpl(ref.url);
+    if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
+    return openAttachment(ref, new Uint8Array(await response.arrayBuffer()));
+  }
+
+  /** Plain email through the home server, for recipients who aren't on Signet. It carries the Signet header. */
+  async sendLegacy(to: string[], fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ messageId: string }> {
+    const attachments = (fields.files ?? []).map((file) => ({
+      filename: file.name,
+      contentType: file.type,
+      content: Buffer.from(file.data).toString('base64'),
+    }));
+    return (await this.call('POST', '/v0/legacy/send', { to, subject: fields.subject, text: fields.text, attachments, humansOnly: fields.humansOnly })) as {
+      messageId: string;
+    };
+  }
+
+  /** A Signet header for an outgoing plain email, attested by this account's home server with its domain key. */
+  async signetHeader(fields: { to: string[]; subject: string }): Promise<string> {
+    return ((await this.call('POST', '/v0/legacy/attest', fields)) as { header: string }).header;
+  }
+
+  /**
+   * Check a Signet header on plain email. Resolves the address (From, or the header's `addr`) through
+   * DNS and the transparency log, compares the fingerprint, and checks the domain's attestation over
+   * this message's From, To and Subject. Never trusts the header's `server`.
+   */
+  async checkSignetHeader(fields: AttestedFields, value: string | undefined): Promise<SignetCheck | null> {
+    const header = parseSignetHeader(value);
+    if (!header) return null;
+    const address = normalizeAddress(header.address ?? fields.from);
+    try {
+      let directory: Directory | null = null;
+      let hidden = false;
+      try {
+        directory = await this.cachedLookup(address);
+      } catch (error) {
+        if (!(error instanceof UnlistedAddressError || error instanceof HiddenAddressError)) throw error;
+        hidden = true;
+      }
+      // The attestation must come from the From address's own domain: nobody else can vouch for that mail.
+      const fromPolicy = await this.resolver.policy(splitAddress(fields.from).domain).catch(() => null);
+      const vouched = fromPolicy !== null && verifyAttestation(header, fields, fromPolicy.domainKey);
+      // An unlisted sender can't be looked up, but its domain's attestation still names its key.
+      const onSignet = directory ? sha256(directory.identityKey) === header.fingerprint : hidden && vouched;
+      const authenticated = onSignet && vouched;
+      // Remember it: if its domain later calls it unlisted, a first request won't go through the intake.
+      if (authenticated) this.state.knownOnSignet[address] = header.fingerprint;
+      return { address, onSignet, authenticated };
+    } catch {
+      return { address, onSignet: false, authenticated: false };
+    }
+  }
+
+  /** Plain email through the Gmail API (Gmail mode), carrying an attested Signet header. */
+  async sendViaGmail(gmail: GmailMailbox, to: string[], fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ id: string }> {
+    const header = await this.signetHeader({ to, subject: fields.subject });
+    return gmail.send({ from: this.address, to, subject: fields.subject, text: fields.text, signetHeader: header, humansOnly: fields.humansOnly, files: fields.files });
+  }
+
+  /** New Gmail messages since `historyId` that carry a Signet header, checked; and where to resume. */
+  async scanGmail(gmail: GmailMailbox, historyId: string): Promise<{ historyId: string; offers: GmailSignetOffer[] }> {
+    this.directories.clear();
+    const { historyId: next, messages } = await gmail.newMessages(historyId);
+    // Gmail can't seal anything, so here the owner's policy is honoured by the client itself.
+    const own = await this.require(this.address);
+    const mayReadHumansOnly = viewMember(own.view, this.keys.cert.clientId)?.humansOnly ?? this.keys.cert.kind === 'device';
+    const offers: GmailSignetOffer[] = [];
+    for (const message of messages) {
+      if (!message.signet || (message.humansOnly && !mayReadHumansOnly)) continue;
+      const signet = await this.checkSignetHeader({ from: message.from, to: message.to, subject: message.subject }, message.signet);
+      if (signet) offers.push({ gmailId: message.id, from: message.from, subject: message.subject, signet, humansOnly: message.humansOnly });
+    }
+    return { historyId: next, offers };
+  }
+
+  /** Signet when the recipient is enrolled (a request, or the existing thread), plain email otherwise. */
+  async mail(to: string, fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ via: 'signet' | 'smtp'; thread?: string }> {
+    this.directories.clear();
+    let enrolled: Directory | null = null;
+    let unlisted = false;
+    try {
+      enrolled = await this.cachedLookup(to);
+    } catch (error) {
+      if (error instanceof UnlistedAddressError) unlisted = true;
+      else if (!(error instanceof NotSignetDomainError)) throw error;
+    }
+    if (!enrolled && !unlisted) {
+      await this.sendLegacy([to], fields);
+      return { via: 'smtp' };
+    }
+    const who = normalizeAddress(to);
+    const existing = this.state.threads.find((thread) => {
+      const people = new Set(this.mls.members(thread).map((member) => member.principal));
+      return people.has(who) && [...people].every((principal) => principal === who || principal === this.address);
+    });
+    if (existing) {
+      await this.send(existing, fields);
+      return { via: 'signet', thread: existing };
+    }
+    await this.sendRequest(who, { subject: fields.subject, note: fields.text.slice(0, 500) }, { humansOnly: fields.humansOnly });
+    return { via: 'signet' };
+  }
+
+  /** Pull new mail from the home server and turn it into events. Bad items become error events. */
+  async sync(): Promise<SignetEvent[]> {
+    this.directories.clear();
+    await this.pullContacts();
+    const events: SignetEvent[] = [];
+    // Joining a thread registers its token, which can release deliveries the server parked; fetch again for those.
+    for (let round = 0; round < 3; round += 1) {
+      this.released = 0;
+      const { items } = (await this.call('GET', `/v0/mailbox?after=${this.state.cursor}`)) as { items: MailItem[] };
+      for (const item of items) {
+        this.state.cursor = item.seq;
+        if (this.state.sentIds.includes(item.id)) continue;
+        try {
+          events.push(...(await this.process(item)));
+        } catch (error) {
+          events.push({ kind: 'error', item, error: describe(error) });
+        }
+      }
+      if (this.released === 0) break;
+    }
+    await this.topUpKeyPackages();
+    events.push(...this.state.keyChanges.splice(0), ...this.state.directoryAlerts.splice(0));
+    return events;
+  }
+
+  /**
+   * Check this address's history in the transparency log. Alerts for anything this device can't
+   * account for: a different identity key, the address being unbound, or its own server locking it out.
+   */
+  async monitor(): Promise<MonitorReport> {
+    this.directories.clear();
+    const alerts: string[] = [];
+    let own: Directory | null = null;
+    try {
+      own = await this.require(this.address);
+    } catch (error) {
+      if (describe(error).includes(' 401 ')) {
+        alerts.push('your home server no longer accepts this client');
+        this.direct = true;
+        this.directories.clear();
+        try {
+          own = await this.require(this.address);
+        } catch (retry) {
+          if (!(retry instanceof IdentityChangedError)) throw retry;
+          alerts.push(`${this.address} is now bound to an identity key you don't hold`);
+        }
+      } else if (error instanceof IdentityChangedError) {
+        alerts.push(`${this.address} is now bound to an identity key you don't hold`);
+      } else {
+        throw error;
+      }
+    }
+    try {
+      return await this.checkHistory(own, alerts);
+    } finally {
+      this.direct = false;
+    }
+  }
+
+  /**
+   * Look up this address anonymously, as a stranger would, and compare. Catches a domain that tells
+   * strangers a listed address is unlisted (to read first requests at its intake), or shows an unlisted
+   * one, or shows strangers a different card. Senders cross-check "unlisted" the same way, so the domain
+   * can't tell this check from theirs.
+   */
+  private async checkStrangerView(own: Directory, alerts: string[]): Promise<void> {
+    const domain = splitAddress(this.address).domain;
+    let seen: DirectoryEntry;
+    try {
+      seen = await this.anonymousEntry(this.address);
+    } catch (error) {
+      alerts.push(`couldn't check what strangers see: ${describe(error)}`);
+      return;
+    }
+    if (own.log?.unlisted) {
+      if (seen.status === 'enrolled') alerts.push(`${domain} shows ${this.address} to strangers, though it is unlisted`);
+      return;
+    }
+    if (seen.status === 'unlisted') alerts.push(`${domain} tells strangers ${this.address} is unlisted, so their first requests would go through its intake, which can read them`);
+    else if (seen.status === 'not-enrolled') alerts.push(`${domain} tells strangers ${this.address} is not on Signet`);
+    else if (canonicalJson(seen.card.card) !== canonicalJson(own.card)) alerts.push(`${domain} shows strangers a different card for ${this.address}`);
+  }
+
+  private async checkHistory(own: Directory | null, alerts: string[]): Promise<MonitorReport> {
+    if (own) await this.checkStrangerView(own, alerts);
+    const identityKey = own?.identityKey ?? this.state.pins[this.address];
+    // Keys this account rotated or recovered through are its own; only keys off the chain are alarming.
+    const ownKeys = own ? cardKeyHistory(own.card).keys.map((entry) => entry.key) : [identityKey];
+    const policy = await this.resolver.policy(splitAddress(this.address).domain);
+    const log = this.trustedLog(policy);
+    const entry = await this.directoryEntry(this.address);
+    // An owner always gets its own entry; an unlisted answer here means its server is hiding it from it.
+    if (entry.status === 'unlisted') throw new TransparencyError(`${this.address}'s own server answered that it is unlisted`);
+    const index = entry.status === 'enrolled' ? verifyDirectoryEntry(entry, policy).index : verifyNotEnrolled(entry, policy);
+    const { history, head } = (await this.transparency(log, 'history', { index, domain: splitAddress(this.address).domain })) as {
+      history: { leaf: LogLeaf; proof: InclusionProof }[];
+      head: TreeHead;
+    };
+    await this.checkTreeHead(log, head);
+    for (const { leaf, proof } of history) {
+      verifyLeaf(log, leaf, proof, head);
+      checkLeafDomain(leaf, splitAddress(this.address).domain);
+      if (leaf.kind === 'unbound') alerts.push(`${leaf.ts}: ${this.address} was unbound from its identity key`);
+      else if (!ownKeys.includes(leaf.identityKey ?? '')) alerts.push(`${leaf.ts}: ${this.address} was bound to an identity key you don't hold`);
+    }
+    if (!own?.view) return { alerts, newClients: [] };
+    const newClients = own.view.members
+      .filter((member) => !this.state.knownOwnClients.includes(member.clientId))
+      .map((member) => ({ clientId: member.clientId, kind: member.kind, label: own?.log?.clients.get(member.clientId)?.label }));
+    this.state.knownOwnClients = own.view.members.map((member) => member.clientId);
+    return { alerts, newClients };
+  }
+
+  private async process(item: MailItem): Promise<SignetEvent[]> {
+    switch (item.kind) {
+      case 'request':
+        return this.onRequest(item.payload as SealedRequest);
+      case 'welcome':
+        return this.onWelcome(item.payload as WelcomePayload);
+      case 'commit':
+        return this.onCommit(item.payload as MlsPayload);
+      case 'message':
+        return this.onMessage(item.payload as MlsPayload);
+      case 'legacy': {
+        const sealed = item.payload as SealedLegacyMail;
+        // No copy means the recipient's policy kept this client out (humans-only mail to an agent).
+        return hasLegacyCopy(this.keys, sealed) ? [{ kind: 'legacy', mail: await this.onLegacy(sealed) }] : [];
+      }
+      case 'bounce': {
+        const bounce = item.payload as { id: string; to: string[]; reason: string };
+        return [{ kind: 'bounce', ...bounce }];
+      }
+    }
+  }
+
+  private async onRequest(sealed: SealedRequest): Promise<SignetEvent[]> {
+    if (!myCopy(this.keys, sealed)) return [];
+    const request = await openRequest(this.keys, sealed, (address) => this.require(address));
+    // Keep the view the sender presented, so accepting can add their clients without a directory grant.
+    this.state.views[request.body.from] = request.body.senderView;
+    this.directories.delete(request.body.from);
+    const admission = await decideAdmission(this.state.admission, this.address, request, (address) => this.require(address));
+    return [{ kind: 'request', request, admission }];
+  }
+
+  /** Join only if every member of the group is a current client in its owner's contact view. */
+  private async onWelcome(payload: WelcomePayload): Promise<SignetEvent[]> {
+    if (!payload.for.includes(joinerTag(this.keys.cert.clientId))) return [];
+    if (this.state.threads.includes(payload.thread)) return [];
+    const preview = this.mls.peekWelcome(payload.welcome);
+    if (preview.thread !== payload.thread) throw new Error('welcome is for a different thread than it claims');
+    const humansOnly = payload.humansOnly === true;
+    for (const member of preview.members) {
+      const { member: current } = await this.checkMember(member);
+      if (humansOnly && !current.humansOnly) throw new Error(`humans-only thread includes ${member.principal}'s agent, which its owner hasn't allowed`);
+    }
+    const { thread, members } = this.mls.join(payload.welcome);
+    const meta: ThreadMeta = { humansOnly, ...(payload.linkedTo ? { linkedTo: payload.linkedTo } : {}) };
+    this.state.threads.push(thread);
+    this.state.threadMeta[thread] = meta;
+    if (payload.linkedTo && this.state.threads.includes(payload.linkedTo)) this.state.siblings[payload.linkedTo] = thread;
+    await this.registerCurrentToken(thread);
+    return [{ kind: 'joined', thread, epoch: this.mls.epoch(thread), members, participants: await this.toParticipants(members), ...meta }];
+  }
+
+  /** Apply a commit only if its sender and every client it adds are current in their owners' views. */
+  private async onCommit(payload: MlsPayload): Promise<SignetEvent[]> {
+    if (!this.state.threads.includes(payload.thread)) return [];
+    const preview = this.mls.previewCommit(payload.thread, payload.mls);
+    if (!preview.selfRemoved) {
+      await this.checkMember(preview.sender);
+      for (const member of preview.added) {
+        const { member: current } = await this.checkMember(member);
+        if (this.isHumansOnly(payload.thread) && !current.humansOnly) {
+          throw new Error(`refusing a commit that adds ${member.principal}'s agent to a humans-only thread`);
+        }
+      }
+    }
+    const applied = this.mls.applyCommit(payload.thread, payload.mls);
+    if (applied.selfRemoved || !this.mls.isActive(payload.thread)) {
+      this.state.threads = this.state.threads.filter((thread) => thread !== payload.thread);
+      await this.registerTokens([], this.state.tokens[payload.thread] ?? []);
+      delete this.state.tokens[payload.thread];
+      return [{ kind: 'removed', thread: payload.thread }];
+    }
+    await this.registerCurrentToken(payload.thread);
+    const members = this.mls.members(payload.thread);
+    return [
+      {
+        kind: 'rekeyed',
+        thread: payload.thread,
+        epoch: this.mls.epoch(payload.thread),
+        members,
+        participants: await this.toParticipants(members),
+        ...(this.state.threadMeta[payload.thread] ?? { humansOnly: false }),
+      },
+    ];
+  }
+
+  private async onMessage(payload: MlsPayload): Promise<SignetEvent[]> {
+    if (!this.state.threads.includes(payload.thread)) return [];
+    const { sender, plaintext } = this.mls.decrypt(payload.thread, payload.mls);
+    const { directory, member } = await this.checkMember(sender);
+    const message = JSON.parse(plaintext.toString('utf8')) as SignedMessage;
+    verifyMessage(message, payload.thread, directory, member, this.address);
+    if (message.body.profile?.label) this.state.labels[member.clientId] = message.body.profile.label.slice(0, 64);
+    const events: SignetEvent[] = [{ kind: 'message', thread: payload.thread, message, sender: this.summary(directory, member) }];
+    for (const intent of message.body.intents) {
+      if (intent.name.startsWith('session.end')) delete this.state.liveSessions[intent.args.sessionId as string];
+      if (intent.name.startsWith('handoff.human')) {
+        this.handOff(payload.thread, message.body.from, intent.args.reason as string);
+        if (message.body.from === this.address) events.push({ kind: 'handoff', thread: payload.thread, by: message.body.from, reason: intent.args.reason as string });
+      }
+    }
+    // A human from the account that was handed the thread has replied: agents may carry on.
+    const handedTo = this.state.needsHuman[payload.thread];
+    if (handedTo && member.kind === 'device' && message.body.from === handedTo.by && !message.body.intents.some((i) => i.name.startsWith('handoff.human'))) {
+      delete this.state.needsHuman[payload.thread];
+    }
+    return events;
+  }
+
+  private async onLegacy(sealed: SealedLegacyMail): Promise<LegacyMail> {
+    const parsed = await simpleParser(await openLegacyMail(this.keys, sealed));
+    const from = parsed.from?.value[0]?.address ?? sealed.envelopeFrom;
+    const to = (Array.isArray(parsed.to) ? parsed.to : parsed.to ? [parsed.to] : []).flatMap((group) => group.value.map((entry) => entry.address ?? ''));
+    const signet = await this.checkSignetHeader({ from, to, subject: parsed.subject ?? '' }, parsed.headers.get(SIGNET_HEADER.toLowerCase())?.toString());
+    const lookalike = lookalikeOf(splitAddress(from).domain, knownDomains(this.state.admission, this.address)) ?? undefined;
+    const trusted = sealed.auth.dmarc === 'pass' && isTrusted(this.state.admission, this.address, from) !== null;
+    return {
+      from,
+      subject: parsed.subject ?? '',
+      text: parsed.text ?? '',
+      date: parsed.date?.toISOString() ?? null,
+      auth: sealed.auth,
+      tier: trusted && !lookalike ? 'inbox' : 'request',
+      signet,
+      ...(lookalike ? { lookalike } : {}),
+      humansOnly: parsed.headers.get(AUDIENCE_HEADER.toLowerCase())?.toString().trim().toLowerCase() === 'humans',
+      attachments: parsed.attachments.map((a) => ({ filename: a.filename ?? 'attachment', contentType: a.contentType, size: a.size })),
+    };
+  }
+
+  private summary(directory: Directory, member: ViewMember): ClientSummary {
+    const label = this.state.labels[member.clientId] ?? directory.log?.clients.get(member.clientId)?.label;
+    return { clientId: member.clientId, kind: member.kind, ...(label ? { label } : {}) };
+  }
+
+  private async toParticipants(members: Member[]): Promise<Participant[]> {
+    const people = new Map<string, Participant>();
+    for (const member of members) {
+      const directory = await this.cachedLookup(member.principal).catch(() => null);
+      const current = viewMember(directory?.view, member.clientId);
+      const person = people.get(member.principal) ?? { principal: member.principal, clients: [] };
+      person.clients.push(directory && current ? this.summary(directory, current) : { clientId: member.clientId, kind: 'device' });
+      people.set(member.principal, person);
+    }
+    // Yourself last, so the list reads as "who you're talking to".
+    return [...people.values()].sort((a, b) => Number(a.principal === this.address) - Number(b.principal === this.address));
+  }
+
+  private async checkMember(member: Member): Promise<{ directory: Directory; member: ViewMember }> {
+    const directory = await this.require(member.principal);
+    const current = viewMember(directory.view, member.clientId);
+    if (!current || current.sigKey !== member.signatureKey) throw new Error(`${member.principal}/${member.clientId} is not a current client`);
+    return { directory, member: current };
+  }
+
+  private cachedLookup(address: string): Promise<Directory | null> {
+    const who = normalizeAddress(address);
+    let pending = this.directories.get(who);
+    if (!pending) {
+      pending = this.fetchDirectory(who);
+      this.directories.set(who, pending);
+      pending.catch(() => this.directories.delete(who));
+    }
+    return pending;
+  }
+
+  private async fetchDirectory(who: string): Promise<Directory | null> {
+    const policy = await this.resolver.policy(splitAddress(who).domain);
+    const log = this.trustedLog(policy);
+    let entry = await this.directoryEntry(who);
+    const pinned = this.state.pins[who];
+
+    let fromCard = false;
+    if (entry.status === 'unlisted') {
+      // Nothing to check against the log: the answer is the same whether or not the address exists.
+      verifyUnlisted(entry, policy);
+      fromCard = this.state.contactCards[who] !== undefined;
+      entry = await this.resolveUnlisted(who);
+    }
+
+    if (entry.status === 'not-enrolled') {
+      const index = verifyNotEnrolled(entry, policy);
+      const latest = await this.latestLeaf(log, index, splitAddress(who).domain);
+      if (latest.leaf?.kind === 'bound') throw new TransparencyError(`${who} is enrolled according to the log, but its server says it is not`);
+      if (pinned) {
+        if (latest.leaf?.kind !== 'unbound') throw new IdentityChangedError(who, pinned, null);
+        delete this.state.pins[who];
+      }
+      return null;
+    }
+
+    try {
+      return await this.acceptEnrolled(who, entry, policy, log);
+    } catch (error) {
+      if (fromCard && error instanceof TransparencyError) throw new HiddenAddressError(who, 'your contact card for it is out of date');
+      throw error;
+    }
+  }
+
+  /**
+   * An "unlisted" answer, seen through the home server. Use the person's contact card if we hold one.
+   * Otherwise ask again anonymously: a domain hiding the address from servers would have to hide it there
+   * too, where the owner checks (see `monitor`). Refuse the intake for addresses we already know are on Signet.
+   */
+  private async resolveUnlisted(who: string): Promise<EnrolledEntry> {
+    const card = this.state.contactCards[who];
+    if (card) return card;
+    const domain = splitAddress(who).domain;
+    const anonymous = await this.anonymousEntry(who).catch(() => null);
+    if (anonymous?.status === 'enrolled') {
+      this.state.directoryAlerts.push({ kind: 'directory-alert', principal: who, alert: `${domain} told your server ${who} is unlisted, but shows it to anonymous lookups` });
+      return anonymous;
+    }
+    if (anonymous?.status === 'not-enrolled') throw new HiddenAddressError(who, 'its domain gives anonymous lookups a different answer');
+    if (this.state.pins[who]) throw new HiddenAddressError(who, 'you have its key pinned');
+    if (this.state.knownOnSignet[who]) throw new HiddenAddressError(who, 'it sent you email with an authenticated Signet header');
+    throw new UnlistedAddressError(who);
+  }
+
+  /**
+   * A directory read as a stranger would see it: no signature, and through the OHTTP relay when one is
+   * configured, so the domain sees neither this client nor its server.
+   */
+  private async anonymousEntry(who: string): Promise<DirectoryEntry> {
+    const { local, domain } = splitAddress(who);
+    const policy = await this.resolver.policy(domain);
+    const path = `/v0/directory/${encodeURIComponent(local)}`;
+    if (!this.ohttpRelay || !policy.ohttp) return (await this.getJson(`${policy.server}${path}`)) as DirectoryEntry;
+    const inner = encodeRequest({ method: 'GET', scheme: 'https', authority: new URL(policy.server).host, path, headers: [], body: Buffer.alloc(0) });
+    const { message, pending } = await encapsulateRequest(policy.ohttp.keys, inner);
+    const relayed = await this.fetchImpl(`${this.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}`, {
+      method: 'POST',
+      headers: { 'content-type': OHTTP_REQUEST_TYPE },
+      body: message,
+    });
+    if (!relayed.ok) throw new Error(`relay refused: ${relayed.status} ${await relayed.text()}`);
+    const response = decodeResponse(decapsulateResponse(pending, Buffer.from(await relayed.arrayBuffer())));
+    if (response.status !== 200) throw new Error(`anonymous lookup failed: ${response.status}`);
+    return JSON.parse(Buffer.from(response.body).toString('utf8')) as DirectoryEntry;
+  }
+
+  /** This account's own entry as a contact card, to hand out as a link or QR code. */
+  async contactCard(): Promise<string> {
+    const entry = await this.directoryEntry(this.address);
+    if (entry.status !== 'enrolled') throw new Error(`${this.address} is not enrolled`);
+    const { status, principal, binding, card, vrf } = entry;
+    return contactCardLink({ status, principal, binding, card, vrf });
+  }
+
+  /** Check someone's contact card against the log and keep it, so they stay reachable directly. */
+  async importContactCard(link: string): Promise<Directory> {
+    const card = parseContactCard(link);
+    const who = normalizeAddress(card.principal);
+    const policy = await this.resolver.policy(splitAddress(who).domain);
+    const directory = await this.acceptEnrolled(who, card, policy, this.trustedLog(policy));
+    this.state.contactCards[who] = card;
+    return directory;
+  }
+
+  /** Check an enrolled entry against the domain key, the VRF and the log's latest leaf, then pin it. */
+  private async acceptEnrolled(who: string, entry: EnrolledEntry | ContactCard, policy: DomainPolicy, log: TrustedLog): Promise<Directory> {
+    const pinned = this.state.pins[who];
+    const verified = verifyDirectoryEntry(entry, policy);
+    const { leaf } = await this.latestLeaf(log, verified.index, splitAddress(who).domain);
+    const shown = 'view' in entry ? entry.view : undefined;
+    const viewMatches = !shown || leaf?.viewHash === viewHash(shown);
+    if (!leaf || leaf.kind !== 'bound' || leaf.identityKey !== verified.identityKey || leaf.cardHash !== cardHash(entry.card) || !viewMatches) {
+      throw new TransparencyError(`directory entry for ${who} does not match the transparency log`);
+    }
+    if (pinned && pinned !== verified.identityKey) {
+      // Follow the chain on the card from the key we pinned. Anything else is a rebinding by the domain.
+      const how = keyChangeSince(cardKeyHistory(verified.card), pinned);
+      if (!how) throw new IdentityChangedError(who, pinned, verified.identityKey);
+      if (who !== this.address || how === 'recovered') this.state.keyChanges.push({ kind: 'key-changed', principal: who, how, from: pinned, to: verified.identityKey });
+    }
+    this.state.pins[who] = verified.identityKey;
+    const directory: Directory = { ...verified, viewHash: leaf.viewHash };
+    if (shown) {
+      this.state.views[who] = shown;
+    } else {
+      // A view the person presented earlier still counts while it's the one the log holds.
+      const presented = this.state.views[who];
+      if (presented && viewHash(presented) === leaf.viewHash) directory.view = verifyView(presented, who, verified.identityKey);
+    }
+    return directory;
+  }
+
+  private async latestLeaf(log: TrustedLog, index: string, domain: string): Promise<LatestLeaf> {
+    const latest = (await this.transparency(log, 'latest', { index, domain })) as LatestLeaf;
+    checkLeafDomain(latest.leaf, domain);
+    await this.checkTreeHead(log, latest.head);
+    if (latest.leaf && latest.proof) verifyLeaf(log, latest.leaf, latest.proof, latest.head);
+    return latest;
+  }
+
+  /**
+   * Where a request to `address` is sealed: its own request keys, or for an unlisted (or nonexistent)
+   * address, the domain's intake key. The intake can read the request; the thread after it is end to end.
+   */
+  private async recipientFor(address: string): Promise<{ principal: string; card: Pick<Directory['card'], 'requestKeys' | 'humanKeys'> }> {
+    try {
+      return await this.require(address);
+    } catch (error) {
+      if (!(error instanceof UnlistedAddressError)) throw error;
+      const policy = await this.resolver.policy(splitAddress(error.principal).domain);
+      if (!policy.intake) throw error;
+      return { principal: error.principal, card: { requestKeys: [policy.intake], humanKeys: [policy.intake] } };
+    }
+  }
+
+  private async require(address: string): Promise<Directory> {
+    const directory = await this.cachedLookup(address);
+    if (!directory) throw new Error(`${address} is not enrolled in Signet`);
+    return directory;
+  }
+
+  /** This account's own signed contact view, which it presents in requests and introductions. */
+  private async ownView(): Promise<SignedView> {
+    await this.require(this.address);
+    const view = this.state.views[this.address];
+    if (!view) throw new Error('home server did not return this account’s contact view');
+    return view;
+  }
+
+  /** Let these people's servers fetch this account's contact view from now on. */
+  private async releaseView(to: string[]): Promise<void> {
+    const others = to.filter((address) => normalizeAddress(address) !== this.address);
+    if (others.length > 0) await this.call('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
+  }
+
+  private trustedLog(policy: DomainPolicy): TrustedLog {
+    const log = this.options.trustedLogs.find((candidate) => candidate.url === policy.log.url && candidate.key === policy.log.key);
+    if (!log) throw new TransparencyError(`${policy.domain} writes to a transparency log this client does not trust`);
+    return log;
+  }
+
+  private async directoryEntry(who: string): Promise<DirectoryEntry> {
+    if (!this.direct) return (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(who)}`)) as DirectoryEntry;
+    const { local, domain } = splitAddress(who);
+    const { server } = await this.resolver.policy(domain);
+    return (await this.getJson(`${server}/v0/directory/${encodeURIComponent(local)}`)) as DirectoryEntry;
+  }
+
+  /** Log queries go through the home server, which authenticates to the log as its domain. */
+  private transparency(log: TrustedLog, op: 'latest' | 'history' | 'consistency', params: Record<string, string | number>): Promise<unknown> {
+    const values = Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)]));
+    if (this.direct) {
+      const query = new URLSearchParams(op === 'consistency' ? values : { key: values.index, domain: values.domain });
+      return this.getJson(`${log.url}/v0/${op}?${query.toString()}`);
+    }
+    return this.call('GET', `/v0/transparency/${op}?${new URLSearchParams({ log: log.url, ...values }).toString()}`);
+  }
+
+  /** Every tree head must extend the last one this client saw from that log, or the log has forked. */
+  private async checkTreeHead(log: TrustedLog, head: TreeHead): Promise<void> {
+    if (!verifyTreeHead(log.key, head)) throw new TransparencyError('tree head is not signed by the log');
+    const previous = this.state.treeHeads[log.url];
+    if (previous && previous.size === head.size && previous.root !== head.root) {
+      throw new TransparencyError('log forked: two different trees of the same size');
+    }
+    if (previous && previous.size < head.size) {
+      const { path } = (await this.transparency(log, 'consistency', { first: previous.size, second: head.size })) as { path: string[] };
+      if (!verifyConsistency(previous.size, head.size, fromB64u(previous.root), fromB64u(head.root), path)) {
+        throw new TransparencyError('log forked: the new tree head does not extend the last one seen');
+      }
+    }
+    if (!previous || previous.size < head.size) this.state.treeHeads[log.url] = head;
+  }
+
+  private async claim(principal: string, members: ViewMember[]): Promise<Addition[]> {
+    if (members.length === 0) return [];
+    const { packages } = (await this.call('POST', '/v0/claim', { address: principal, clients: members.map((member) => member.clientId) })) as {
+      packages: ClaimedKeyPackage[];
+    };
+    return packages.flatMap((claimed) => {
+      const member = members.find((candidate) => candidate.clientId === claimed.clientId);
+      return member ? [{ cert: { principal, clientId: member.clientId, sigKey: member.sigKey }, claimed }] : [];
+    });
+  }
+
+  private async topUpKeyPackages(): Promise<void> {
+    if (!this.keys.cert.scopes.some((scope) => scope === 'read:*')) return;
+    const target = this.options.keyPackageTarget ?? 5;
+    const { count, lastResort } = (await this.call('GET', '/v0/keypackages/count')) as { count: number; lastResort: boolean };
+    const packages = Array.from({ length: Math.max(0, target - count) }, () => ({ kpId: randomId('kp'), keyPackage: this.mls.keyPackage(false) }));
+    const fallback = lastResort ? undefined : { kpId: randomId('kp'), keyPackage: this.mls.keyPackage(true) };
+    if (packages.length > 0 || fallback) await this.call('POST', '/v0/keypackages', { packages, lastResort: fallback });
+  }
+
+  /** One token bound to the recipient's domain, blinded so neither the issuer nor this client's server can link it. */
+  private async privacyPassToken(policy: DomainPolicy): Promise<string> {
+    if (!policy.privacyPass) throw new Error(`${policy.domain} does not accept anonymous requests`);
+    const issuer = (await this.call('GET', '/v0/issuer')) as IssuerKey;
+    if (issuer.name !== policy.privacyPass.issuer) {
+      throw new Error(`${policy.domain} accepts tokens from ${policy.privacyPass.issuer}; this server attests for ${issuer.name}`);
+    }
+    const pending = blindTokenRequest(issuer, policy.domain);
+    const { signatures } = (await this.call('POST', '/v0/tokens', { blinded: [pending.blinded] })) as { signatures: string[] };
+    return finalizeToken(pending, signatures[0]);
+  }
+
+  /** The current epoch's delivery token: an exporter secret only current members can derive. */
+  private deliveryToken(thread: string): string {
+    return b64u(this.mls.exportSecret(thread, DELIVERY_LABEL));
+  }
+
+  private async registerCurrentToken(thread: string): Promise<void> {
+    const hash = deliveryTokenHash(this.deliveryToken(thread), this.address);
+    const registered = this.state.tokens[thread] ?? [];
+    if (registered.includes(hash)) return;
+    registered.push(hash);
+    const expired = registered.length > TOKEN_EPOCHS_KEPT ? registered.splice(0, registered.length - TOKEN_EPOCHS_KEPT) : [];
+    this.state.tokens[thread] = registered;
+    await this.registerTokens([hash], expired);
+  }
+
+  private async registerTokens(add: string[], remove: string[]): Promise<void> {
+    if (add.length === 0 && remove.length === 0) return;
+    const { released = 0 } = (await this.call('POST', '/v0/delivery-tokens', { add, remove })) as { released?: number };
+    this.released += released;
+  }
+
+  private async upload(file: FileInput): Promise<AttachmentRef> {
+    const { blob, ref } = sealAttachment(file);
+    const { url } = (await this.call('POST', '/v0/blobs', blob)) as { url: string };
+    return { ...ref, url };
+  }
+
+  private thread(thread: string): string {
+    if (!this.state.threads.includes(thread)) throw new Error(`not a member of thread ${thread}`);
+    return thread;
+  }
+
+  private principalsOf(people: { principal: string }[]): string[] {
+    return unique(people.map((person) => person.principal));
+  }
+
+  /** With a token the delivery is sealed; with an anonymous token the request carries no sender. */
+  private async submit(to: string[], kind: MailKind, payload: unknown, token?: string, anonymousToken?: string): Promise<void> {
+    const { id } = (await this.call('POST', '/v0/submit', { to, kind, payload, token, anonymousToken })) as { id: string };
+    this.state.sentIds = [...this.state.sentIds, id].slice(-SENT_IDS_KEPT);
+  }
+
+  private async getJson(url: string): Promise<unknown> {
+    const response = await this.fetchImpl(url);
+    if (!response.ok) throw new Error(`GET ${url} failed: ${response.status} ${await response.text()}`);
+    return response.json();
+  }
+
+  /**
+   * Open a pairing slot on the home server so a new client can enroll with a code (see enrollment.ts).
+   * Returns the code to show, and this side's channel. Only a device can do this.
+   */
+  async openPairing(): Promise<{ code: string; channel: PairingChannel; expires: string }> {
+    const { slot, expires } = (await this.call('POST', '/v0/pairing', {})) as { slot: string; expires: string };
+    const { server } = await this.resolver.policy(splitAddress(this.address).domain);
+    const auth = (method: string, path: string, body: string) => clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, body);
+    return { code: pairingCode(slot, newPairingSecret()), channel: new HttpPairingChannel(server, slot, 'a', auth, this.fetchImpl), expires };
+  }
+
+  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+    const { server } = await this.resolver.policy(splitAddress(this.address).domain);
+    const binary = body instanceof Uint8Array;
+    const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
+    const headers = {
+      ...clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, payload),
+      ...(body === undefined ? {} : { 'content-type': binary ? 'application/octet-stream' : 'application/json' }),
+    };
+    const response = await this.fetchImpl(`${server}${path}`, { method, headers, body: body === undefined ? undefined : payload });
+    if (!response.ok) throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
+    return response.json();
+  }
+}
+
+/**
+ * Every device is gone and so is the identity key: prove the recovery key to the home server and get the
+ * last published log back, to sign a recovery entry onto with `Identity.recover`.
+ */
+export async function fetchRecoverableLog(server: string, principal: string, recovery: KeyPair, fetchImpl: typeof fetch = fetch): Promise<LogEntry[]> {
+  const local = splitAddress(principal).local;
+  const response = await fetchImpl(`${server}/v0/recovery/${encodeURIComponent(local)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(recoveryProof(principal, recovery)),
+  });
+  if (!response.ok) throw new Error(`recovery refused: ${response.status} ${await response.text()}`);
+  return ((await response.json()) as { entries: LogEntry[] }).entries;
+}
+
+/**
+ * After the identity holder approved this client's enrollment request (from a QR code or link), fetch
+ * its certificate from the home server: the client can already authenticate with its new key, and its
+ * owner access returns the log the certificate is in.
+ */
+export async function fetchApprovedCert(resolver: Resolver, pending: PendingClient, fetchImpl: typeof fetch = fetch): Promise<ClientKeys> {
+  const { principal, clientId } = pending.request.body;
+  const { server } = await resolver.policy(splitAddress(principal).domain);
+  const path = `/v0/lookup?address=${encodeURIComponent(principal)}`;
+  const response = await fetchImpl(`${server}${path}`, { headers: clientAuthHeaders(principal, clientId, pending.signing, 'GET', path, '') });
+  if (response.status === 401) throw new EnrollmentError('not approved yet');
+  if (!response.ok) throw new Error(`lookup failed: ${response.status} ${await response.text()}`);
+  const entry = (await response.json()) as DirectoryEntry;
+  const cert = entry.status === 'enrolled' && entry.log ? replayLog(entry.log).clients.get(clientId) : undefined;
+  if (!cert) throw new EnrollmentError('not approved yet');
+  return completeEnrollment(pending, cert);
+}
+
+/** The new client's side of pairing with a code: find the address's home server and pair through it. */
+export async function joinPairing(
+  resolver: Resolver,
+  principal: string,
+  code: string,
+  options: { kind: ClientKind; label: string; scopes: string[]; limits?: Record<string, number> },
+  onRequest?: (fingerprint: string) => void,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ClientKeys> {
+  const { server } = await resolver.policy(splitAddress(principal).domain);
+  const channel = new HttpPairingChannel(server, parsePairingCode(code).slot, 'b', undefined, fetchImpl);
+  return pairAsNewClient(channel, principal, code, options, onRequest);
+}

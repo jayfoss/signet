@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "esModuleInterop": true,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "es2022",
+    "lib": [
+      "es2023",
+      "dom"
+    ],
+    "types": [
+      "node"
+    ],
+    "sourceMap": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@signet/lib": [
+        "packages/lib/src/index.ts"
+      ],
+      "@signet/server/*": [
+        "packages/server/src/*"
+      ]
+    }
+  },
+  "exclude": [
+    "node_modules"
+  ]
+}

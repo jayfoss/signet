@@ -1,0 +1,13 @@
+{
+  "name": "@signet/server",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@signet/lib": "workspace:*",
+    "mailauth": "^8.0.6",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^10.5.0",
+    "smtp-server": "^3.21.4"
+  }
+}

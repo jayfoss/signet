@@ -1,0 +1,29 @@
+{
+  "name": "signet",
+  "private": true,
+  "packageManager": "pnpm@9.1.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build:mls": "pnpm --filter @signet/mls build",
+    "test": "jest",
+    "typecheck": "tsc --noEmit -p packages/lib/tsconfig.spec.json && tsc --noEmit -p packages/server/tsconfig.spec.json && tsc --noEmit -p packages/server/tsconfig.app.json && tsc --noEmit -p packages/client/tsconfig.spec.json",
+    "server": "ts-node -r tsconfig-paths/register --project packages/server/tsconfig.app.json packages/server/src/main.ts",
+    "cli": "ts-node -r tsconfig-paths/register --project packages/client/tsconfig.app.json packages/client/src/main.ts",
+    "demo": "ts-node -r tsconfig-paths/register --project packages/server/tsconfig.app.json packages/server/scripts/demo.ts",
+    "disclosure-demo": "ts-node -r tsconfig-paths/register --project packages/server/tsconfig.app.json packages/server/scripts/disclosure-demo.ts"
+  },
+  "devDependencies": {
+    "@types/jest": "30.0.0",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "24.12.3",
+    "@types/nodemailer": "^8.0.2",
+    "@types/smtp-server": "^3.5.13",
+    "jest": "30.3.0",
+    "ts-jest": "29.4.9",
+    "ts-node": "10.9.1",
+    "tsconfig-paths": "4.2.0",
+    "typescript": "5.5.3"
+  }
+}

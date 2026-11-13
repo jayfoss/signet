@@ -119,8 +119,11 @@ Foss                    Expires 15 May 2027                     [Page 2]
 Experimental           Signet Protocol, Version 0          November 2026
 
       5.3.  Log Leaves .............................................. 43
+         5.3.1.  Domain Key Leaves ................................. 44
       5.4.  Merkle Tree and Proofs .................................. 44
       5.5.  Signed Tree Heads ....................................... 45
+         5.5.1.  Witnesses and Cosignatures ....................... 45
+         5.5.2.  Freshness ........................................ 45
       5.6.  Log Service ............................................. 45
       5.7.  Proxied Log Queries ..................................... 47
       5.8.  Verifying a Lookup ...................................... 47
@@ -2592,9 +2595,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |                |          | the leaf.               |
    +-------------+----------------+----------+-------------------------+
    | kind        | string         | yes      | bound (the address is   |
-   |             |                |          | bound to identityKey)   |
-   |             |                |          | or unbound (the address |
-   |             |                |          | was released).          |
+   |             |                |          | bound to identityKey),  |
+   |             |                |          | unbound (the address    |
+   |             |                |          | was released) or        |
+   |             |                |          | domain-key (Section     |
+   |             |                |          | 5.3.1).                 |
    +-------------+----------------+----------+-------------------------+
    | identityKey | string or null | yes      | The bound identity key, |
    |             |                |          | or null for unbound.    |
@@ -2618,6 +2623,25 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    The leaf's bytes are UTF-8(JCS(leaf)). The leaf hash is SHA-256(0x00
    || leafBytes), as in Section 2.1.1 of [RFC9162].
+
+5.3.1.  Domain Key Leaves
+
+   A domain also records its own domain key in the log. The leaf is
+
+      { "v": 0, "index": "b64u SHA-256(UTF-8(\"signet0 domain-key|\" ||
+        domain))", "domain": "example.net", "kind": "domain-key",
+        "domainKey": "b64u Ed25519 public key",
+        "ts": "2026-11-11T09:30:00.000Z" }
+
+   The index is not a VRF output, because a domain's name is public.
+   The leaf has only the fields shown.
+   A domain MUST append a domain-key leaf before it first publishes a
+   policy, and again before it publishes a policy with a different
+   domainKey. A log MUST accept the first domain-key leaf it sees for a
+   domain from the domain-authenticated caller, and MUST refuse a later
+   one whose domainKey differs unless the append carries a rotation
+   object that Section 6.5 would accept, naming the previous logged
+   key. Other rules for leaves (Section 5.3) apply.
 
 5.4.  Merkle Tree and Proofs
 
@@ -2670,6 +2694,44 @@ Experimental           Signet Protocol, Version 0          November 2026
    sig is the log key's Ed25519 signature over {"type": "tree-head",
    size, root, ts}. The log's public key is published with its URL in
    each domain policy that uses it (Section 6.2).
+
+5.5.1.  Witnesses and Cosignatures
+
+   A witness is an independent party that checks that a log only ever
+   appends. It holds an Ed25519 key and, for each log it watches, the
+   last head it signed. A cosignature is
+   {"witness": "b64u key", "sig": "b64u"}, where sig is the witness's
+   signature over UTF-8(JCS({"type": "tree-head-cosign", "log": L,
+   "size": size, "root": root, "ts": ts})) and L is the log's public
+   key. A signed tree head MAY carry them in a field cosigs, which is
+   not part of what the log signs.
+
+   A witness cosigns a head only if the log's signature verifies and a
+   consistency proof (Section 5.6) shows it extends the last head the
+   witness signed for that log, or the witness has none. It never signs
+   two heads of one size with different roots. A log operator collects
+   cosignatures and serves them with the head.
+
+   A client is configured with a set of trusted witnesses and a
+   threshold k, both set by the client and never by a domain policy. A
+   client MUST refuse a head that does not carry valid cosignatures
+   from at least k distinct trusted witnesses. A deployment SHOULD use
+   at least three witnesses run by parties independent of the log and
+   of each other, and k of at least 2. A client with no witnesses
+   configured uses the log's signature alone, as version 0 did, and
+   SHOULD tell the user that the log is unwitnessed.
+
+   Witnesses make a split view detectable: to show two clients two
+   different histories, a log needs k witnesses that sign both, or
+   needs to keep one client away from the witnesses.
+
+5.5.2.  Freshness
+
+   A log MUST sign a new head at least once every hour, whether or not
+   anything was appended. A client MUST refuse a head whose ts is more
+   than 24 hours before the client's clock, and a cosignature whose ts
+   is more than 24 hours old. A client MAY be configured with a shorter
+   bound.
 
 5.6.  Log Service
 
@@ -2840,10 +2902,12 @@ Experimental           Signet Protocol, Version 0          November 2026
 
         1.  The tree head signature verifies with the trusted log key.
 
-        2.  The tree head is consistent with the last one this client
+        2.  The tree head is fresh (Section 5.5.2) and carries the
+            cosignatures the client requires (Section 5.5.1).
+        3.  The tree head is consistent with the last one this client
             saw from that log (Section 5.8.1).
 
-        3.  If a leaf is returned, the proof's treeSize equals the
+        4.  If a leaf is returned, the proof's treeSize equals the
             head's size and the inclusion proof verifies against the
             head's root.
 
@@ -2874,8 +2938,7 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A client MUST also check that the leaf's domain equals D.
 
-   A client SHOULD reject a signed tree head older than a bound it is
-   configured with, so that a log cannot keep it on a stale view.
+
 
 5.8.1.  Tree Head Consistency
 
@@ -2927,16 +2990,25 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A client is configured with a set of trusted logs, each a URL and an
    Ed25519 key. It MUST refuse addresses whose domain policy names any
-   other log. Version 0 trusts the log for "latest leaf" answers: a log
-   that withholds a newer leaf can make a client accept a stale entry,
-   until the owner's monitoring sees the newer leaf.
+   other log. A log that withholds a newer leaf can make a client
+   accept a stale entry until the owner's monitoring sees the newer
+   leaf. The
+   freshness bound (Section 5.5.2) limits how long that can last, and
+   witnesses (Section 5.5.1) stop it showing different clients
+   different histories.
 
 5.11.  Open Issues
 
-   *  *One operator.* Version 0 assumes a single log per domain and no
-      gossip between clients or monitors. A deployment SHOULD run at
-      least two independent log operators and have clients compare tree
-      heads.
+   *  *Witnesses are configured, not discovered.* There is no registry
+      of witnesses and no protocol for clients to exchange heads. A
+      client with no witnesses configured gets the version 0 guarantee:
+      one log operator, trusted not to fork. A log that serves
+      different heads to different clients is caught only if k
+      witnesses see both.
+
+   *  *Withholding is bounded, not prevented.* A log or a network
+      attacker can still serve a head up to 24 hours old. A leaf
+      appended in that time is invisible to the client until then.
 
 6.  Discovery
 
@@ -3165,8 +3237,16 @@ Experimental           Signet Protocol, Version 0          November 2026
    client keeps the cached policy as above and SHOULD report that the
    domain key changed without proof.
 
-   A client with no cached policy, or one that has expired, trusts the
-   first domainKey it sees, as before. A domain that loses its key
+   A client with no cached policy, or one that has expired, MUST check
+   the domainKey of a policy against the log the policy names, before
+   it uses the policy for anything other than fetching that log: it
+   fetches the latest domain-key leaf for the domain (Section 5.3.1)
+   with an inclusion proof against a fresh head carrying the
+   cosignatures it requires (Sections 5.5.1 and 5.5.2), and requires
+   the leaf's domainKey to equal the policy's. A policy that fails is a failed
+   fetch for that host. The log is the one in the policy, so this
+   catches an attacker who can substitute a policy but not one who also
+   controls that log and the witnesses. A domain that loses its key
    therefore cannot rotate with proof; clients accept the new key once
    their cached policies expire, which is at most maxAge seconds. A
    domain SHOULD keep rotation in the policy until every cached policy
@@ -3200,17 +3280,13 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 6.7.  Open Issues
 
-   *  *The domain key is pinned only after first use.* Section 6.5 makes
-      a client reject a new domainKey that lacks a signature from the
-      old one while its cached policy lasts. A client with no cached
-      policy, or an expired one, still trusts the first key it sees. An
-      attacker who can obtain a valid certificate for the policy host
-      and answer its DNS at that moment can substitute a domain key and
-      then sign legacy-mail attestations and server-to-server calls
-      for that client. Pinned identity keys and the transparency log
-      still catch a substituted identity key (Section 5.8). Logging
-      domain policies in the transparency log would close this and is
-      not specified.
+   *  *First use depends on the client's trusted logs.* Section 6.5
+      checks a new domainKey against the domain-key leaf in the log the
+      policy names. A client refuses a policy that names a log it does
+      not trust (Section 5.10), so an attacker who substitutes the
+      policy cannot name a log of its own against such a client. A
+      client configured to trust any log the policy names, or with no
+      witnesses, gets only the log operator's word.
 
    *  *Hosting needs dk.* A server or replica URL outside the domain is
       accepted only with dk and serverSig (Section 6.4). That removes
@@ -3222,6 +3298,7 @@ Experimental           Signet Protocol, Version 0          November 2026
       domain key cannot prove a change. Clients accept the new key
       once their cached policies expire, so an outage lasts up to
       maxAge.
+
 
 6.8.  Clustered Homes
 

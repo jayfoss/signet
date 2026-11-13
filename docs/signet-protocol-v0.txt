@@ -5109,6 +5109,18 @@ Experimental           Signet Protocol, Version 0          November 2026
    report the thread as forked and MUST NOT send further messages in it
    until it has rejoined by a new welcome.
 
+   Welcomes.  A welcome that is sent with a commit carries two more
+   fields: commit, the hex SHA-256 of that commit, and epoch, the epoch
+   the commit makes. A client that receives two welcomes for one thread
+   within 5 minutes of its first, joins by the one at the later epoch
+   or, at the same epoch, with the smaller commit hash. If that is the
+   second, it goes back to before its join and takes it. A client that
+   has just joined and then receives a commit it cannot apply ignores
+   it, because the welcome of the winning commit settles which group it
+   is in. A member whose commit lost recomputes at its next sync
+   (step 4), and a member that its lost commit would have added
+   receives the welcome of the new commit.
+
    A member can choose its commit to have a small hash, for example by
    varying its key package choices or proposal order, and so win a
    race. This lets a member decide between two valid commits at the
@@ -5202,7 +5214,8 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  *Commit ordering.* MLS needs the delivery service to order commits
       within an epoch. Signet version 0 has none, so Section 8.8 uses a
       deterministic tie-break (smallest commit hash wins) with a
-      5-minute rollback window. This converges only if every member
+      5-minute rollback window, and a new member follows the welcome
+      of the winning commit. This converges only if every member
       receives every commit inside that window. A member that is
       offline longer than the window can end on a losing commit, and
       messages sent in the losing epoch are lost to it. A fork that

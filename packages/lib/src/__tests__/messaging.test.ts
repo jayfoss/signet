@@ -45,6 +45,11 @@ describe('HPKE', () => {
     const sealed = await seal(clerk.cert.agreeKey, utf8('hello'), 'one');
 
     expect((await open(clerk.agreement, sealed, 'one')).toString()).toBe('hello');
+    // Every sealed payload is padded to a multiple of 1024 bytes, so its size says little (Section 7.3).
+    const sizes = await Promise.all(['a', 'a'.repeat(900), 'a'.repeat(1100)].map(async (text) => Buffer.from((await seal(clerk.cert.agreeKey, utf8(text), 'one')).ct, 'base64url').length));
+    expect(sizes[0]).toBe(sizes[1]);
+    expect(sizes[2]).toBeGreaterThan(sizes[1]);
+    expect(sizes.map((size) => (size - 16) % 1024)).toEqual([0, 0, 0]);
     await expect(open(clerk.agreement, sealed, 'two')).rejects.toThrow();
   });
 });
@@ -249,5 +254,22 @@ describe('agent authority', () => {
     if (!phone) throw new Error('phone is not in the view');
 
     expect(() => verifyMessage(message, 't', directoryOf(jerzy), phone, 'jerzy@beta.test')).toThrow('does not match');
+  });
+});
+
+describe('padded plaintext (Section 7.3)', () => {
+  const { padPlaintext, unpadPlaintext } = jest.requireActual('../crypto') as typeof import('../crypto');
+
+  it('round-trips and refuses a length it cannot hold or padding that is not zero', () => {
+    const padded = padPlaintext(Buffer.from('hello'));
+    expect(padded.length).toBe(1024);
+    expect(unpadPlaintext(padded).toString()).toBe('hello');
+    const tooLong = Buffer.from(padded);
+    tooLong.writeUInt32BE(5000, 0);
+    expect(() => unpadPlaintext(tooLong)).toThrow('larger than itself');
+    const dirty = Buffer.from(padded);
+    dirty[1000] = 1;
+    expect(() => unpadPlaintext(dirty)).toThrow('non-zero padding');
+    expect(() => unpadPlaintext(padded.subarray(0, 1000))).toThrow('not padded');
   });
 });

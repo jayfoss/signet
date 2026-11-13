@@ -4,6 +4,7 @@
  * the credentials a welcome or commit carries, Signet checks each against its owner's log, and only
  * then is the change applied.
  */
+import { createHash } from 'node:crypto';
 import { b64u, canonicalJson, fromB64u, utf8 } from './encoding';
 import type { ClientKeys } from './identity';
 import type { NativeMe, NativeMember } from './native';
@@ -54,6 +55,35 @@ export interface CommitPreview {
   removed: number[];
   selfRemoved: boolean;
 }
+
+/**
+ * What applying one change to a session's state altered: each storage key it touched, with the value it had
+ * before (null if it was new). Applying an undo puts those keys back, and leaves everything else, including
+ * other threads, as it is (Section 8.8).
+ */
+export type StateUndo = Record<string, string | null>;
+
+const entriesOf = (state: string): Record<string, string> => (state === '' ? {} : (JSON.parse(state) as Record<string, string>));
+
+function diffUndo(before: string, after: string): StateUndo {
+  const old = entriesOf(before);
+  const next = entriesOf(after);
+  const undo: StateUndo = {};
+  for (const key of new Set([...Object.keys(old), ...Object.keys(next)])) if (old[key] !== next[key]) undo[key] = old[key] ?? null;
+  return undo;
+}
+
+function undone(state: string, undo: StateUndo): string {
+  const entries = entriesOf(state);
+  for (const [key, value] of Object.entries(undo)) {
+    if (value === null) delete entries[key];
+    else entries[key] = value;
+  }
+  return JSON.stringify(entries);
+}
+
+/** SHA-256 of the MLSMessage bytes as submitted: the number competing commits are ordered by (Section 8.8). */
+export const commitHash = (mls: string): Buffer => createHash('sha256').update(fromB64u(mls)).digest();
 
 const identityOf = (who: MemberIdentity): string => b64u(utf8(canonicalJson({ principal: who.principal, clientId: who.clientId })));
 
@@ -119,6 +149,42 @@ export class MlsSession {
     const { state, commit, welcome } = native().commit(this.state, groupIdOf(thread), this.me, removeLeaves, additions.map((a) => a.claimed.keyPackage));
     this.state = state;
     return { commit, welcome, joiners: additions.map(({ cert }) => ({ principal: cert.principal, clientId: cert.clientId })) };
+  }
+
+  /** `commit`, and the undo that takes it back. */
+  commitUndoable(thread: string, removeLeaves: number[], additions: Addition[]): ReturnType<MlsSession['commit']> & { undo: StateUndo } {
+    const before = this.state;
+    const result = this.commit(thread, removeLeaves, additions);
+    return { ...result, undo: diffUndo(before, this.state) };
+  }
+
+  /** `applyCommit`, and the undo that takes it back. */
+  applyCommitUndoable(thread: string, message: string): CommitPreview & { undo: StateUndo } {
+    const before = this.state;
+    const applied = this.applyCommit(thread, message);
+    return { ...applied, undo: diffUndo(before, this.state) };
+  }
+
+  /** `join`, and the undo that takes it back. */
+  joinUndoable(welcome: string): ReturnType<MlsSession['join']> & { undo: StateUndo } {
+    const before = this.state;
+    const result = this.join(welcome);
+    return { ...result, undo: diffUndo(before, this.state) };
+  }
+
+  /** What a commit would do if the state were as it was before `undo`; throws if it is not a commit for that epoch. */
+  previewCommitBefore(thread: string, message: string, undo: StateUndo): CommitPreview {
+    return new MlsSession(this.keys, undone(this.state, undo)).previewCommit(thread, message);
+  }
+
+  /** `peekWelcome` as if the state were as it was before `undo`, for a welcome to a group this session has already joined. */
+  peekWelcomeBefore(welcome: string, undo: StateUndo): ReturnType<MlsSession['peekWelcome']> {
+    return new MlsSession(this.keys, undone(this.state, undo)).peekWelcome(welcome);
+  }
+
+  /** Put the state back as it was before the change `undo` belongs to. */
+  rollback(undo: StateUndo): void {
+    this.state = undone(this.state, undo);
   }
 
   /** Decrypt a welcome and list who's in the group, without joining. */

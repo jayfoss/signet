@@ -85,7 +85,7 @@ import {
   signReceipt,
 } from '@signet/lib';
 import { Cluster } from './cluster';
-import type { ClusterOptions } from './cluster';
+import type { ClusterMember, ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
 import { DomainKeyLogger } from './domain-key-log';
 import { HttpError, JsonServer, header, json } from './http';
@@ -393,6 +393,22 @@ export class SignetServer implements LegacyInbox {
       privacyPass: this.options.issuer ? { issuer: this.options.issuer.key.name } : undefined,
       intake: this.intakeKey ? { keyId: requestKeyId(this.intakeKey.publicKey), agreeKey: this.intakeKey.publicKey } : undefined,
     };
+  }
+
+  /**
+   * Add a replica to this home's cluster, or remove one (Section 6.8.6 step 10). Primary only, and one change at a time.
+   * The operator also publishes the new replica in the DNS record's host list; `policy.replicas` follows the cluster.
+   */
+  async addReplica(member: ClusterMember): Promise<void> {
+    await (this.cluster ?? this.noCluster()).addMember(member);
+  }
+
+  async removeReplica(id: string): Promise<void> {
+    await (this.cluster ?? this.noCluster()).removeMember(id);
+  }
+
+  private noCluster(): never {
+    throw new HttpError(409, 'this home does not run as a cluster');
   }
 
   /** `serverSig` for a policy whose server or replicas are outside the domain, which needs the domain key (Section 6.4). */

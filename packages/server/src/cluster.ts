@@ -131,6 +131,7 @@ export class Cluster {
     private readonly options: ClusterOptions,
     private readonly factory?: () => SnapshotStore,
   ) {
+    this.currentMembers = options.members;
     for (const member of options.members) this.members.set(member.id, member);
     const self = this.members.get(options.id);
     if (!self) throw new Error(`${options.id} is not one of the cluster's members`);
@@ -145,6 +146,8 @@ export class Cluster {
     this.raft = new RaftNode<Batch>({
       id: options.id,
       peers: options.members.filter((member) => member.id !== options.id).map((member) => member.id),
+      members: options.members.map((member) => ({ ...member })),
+      onConfig: (list) => this.adoptMembers(list as unknown as ClusterMember[]),
       witness: self.role === 'witness',
       rejoin: options.rejoin,
       storage,
@@ -158,15 +161,60 @@ export class Cluster {
       snapshotEvery: options.snapshotEvery ?? 1000,
       onRole: (role, _term, previous) => this.onRole(role, previous),
     });
+    // A restart may have found a newer membership entry in the log than the one it was configured with.
+    this.adoptMembers(this.raft.members as unknown as ClusterMember[]);
   }
 
   get id(): string {
     return this.options.id;
   }
 
+  /** The voters now: the newest membership entry in the log, committed or not (Section 6.8.6 step 10). */
+  private currentMembers: ClusterMember[];
+
+  private adoptMembers(list: ClusterMember[]): void {
+    this.currentMembers = list;
+    // Keep an address a joining replica was given before it voted, so it can still be reached while it is a learner.
+    for (const id of [...this.members.keys()]) if (!list.some((member) => member.id === id) && !this.joining.has(id)) this.members.delete(id);
+    for (const member of list) this.members.set(member.id, member);
+  }
+
+  private readonly joining = new Set<string>();
+
+  /**
+   * Add a replica (primary only): it is told the log as a learner that does not vote, and becomes a voter by a
+   * membership entry once it holds everything committed. Add replicas one at a time.
+   */
+  async addMember(member: ClusterMember, timeoutMs = 15_000): Promise<void> {
+    this.requirePrimary();
+    if (this.currentMembers.some((known) => known.id === member.id)) throw new Error(`${member.id} is already a member`);
+    this.members.set(member.id, member);
+    this.joining.add(member.id);
+    try {
+      this.raft.addLearner(member.id);
+      const deadline = Date.now() + timeoutMs;
+      while (!this.raft.learnerCaughtUp(member.id)) {
+        if (Date.now() > deadline) throw new Error(`${member.id} did not catch up in time`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await this.raft.waitCommitted(this.raft.proposeConfig([...this.currentMembers, member] as never));
+    } catch (error) {
+      if (!this.currentMembers.some((known) => known.id === member.id)) this.members.delete(member.id);
+      throw error;
+    } finally {
+      this.joining.delete(member.id);
+    }
+  }
+
+  /** Remove a replica (primary only). A primary that removes itself stops being primary once the change commits. */
+  async removeMember(id: string): Promise<void> {
+    this.requirePrimary();
+    await this.raft.waitCommitted(this.raft.proposeConfig(this.currentMembers.filter((member) => member.id !== id) as never));
+  }
+
   /** The base URLs of the homes, in the order the policy lists them: members order, witnesses left out. */
   get homes(): string[] {
-    return this.options.members.filter((member) => member.role === 'home').map((member) => member.url);
+    return this.currentMembers.filter((member) => member.role === 'home').map((member) => member.url);
   }
 
   get selfUrl(): string {
@@ -237,7 +285,7 @@ export class Cluster {
   async putBlob(id: string, data: Buffer): Promise<void> {
     const store = this.blobs as BlobStore;
     store.put(id, data);
-    const others = this.options.members.filter((member) => member.role === 'home' && member.id !== this.options.id);
+    const others = this.currentMembers.filter((member) => member.role === 'home' && member.id !== this.options.id);
     if (others.length === 0) return;
     const sent = await Promise.allSettled(others.map((member) => this.blobCall(member, 'POST', id, data)));
     if (!sent.some((outcome) => outcome.status === 'fulfilled')) throw new HttpError(503, 'could not keep the attachment on a second replica', { 'retry-after': '1' });
@@ -246,7 +294,7 @@ export class Cluster {
   /** Remove an attachment here and at the other replicas that hold a copy (Section 8.9). */
   async deleteBlob(id: string): Promise<void> {
     (this.blobs as BlobStore | undefined)?.delete(id);
-    const others = this.options.members.filter((member) => member.role === 'home' && member.id !== this.options.id);
+    const others = this.currentMembers.filter((member) => member.role === 'home' && member.id !== this.options.id);
     await Promise.allSettled(others.map((member) => this.blobCall(member, 'DELETE', id)));
   }
 
@@ -261,7 +309,7 @@ export class Cluster {
     const store = this.blobs as BlobStore;
     const here = store.get(id);
     if (here) return here;
-    for (const member of this.options.members.filter((candidate) => candidate.role === 'home' && candidate.id !== this.options.id)) {
+    for (const member of this.currentMembers.filter((candidate) => candidate.role === 'home' && candidate.id !== this.options.id)) {
       try {
         const data = await this.blobCall(member, 'GET', id);
         if (data) {

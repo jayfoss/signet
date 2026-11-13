@@ -38,8 +38,8 @@ import type { AttestedFields, LegacyAuth, SealedLegacyMail } from './legacy';
 import { AUDIENCE_HEADER, SIGNET_HEADER, hasLegacyCopy, hashBody, isHumansOnly, openLegacyMail, parseSignetHeader, verifyAttestation } from './legacy';
 import type { MessageFields, SignedMessage } from './message';
 import { composeMessage, verifyMessage } from './message';
-import type { Addition, ClaimedKeyPackage, Joiner, Member } from './mls';
-import { MlsSession } from './mls';
+import type { Addition, ClaimedKeyPackage, CommitPreview, Joiner, Member, StateUndo } from './mls';
+import { MlsSession, commitHash } from './mls';
 import type { AgentCard } from './live';
 import { LIVE_LABEL, LiveSession, agentCardHash, newSessionId, tokensMatch } from './live';
 import type { IssuerKey } from './privacypass';
@@ -122,7 +122,7 @@ export interface Participant {
 export type SignetEvent =
   | { kind: 'request'; request: SignedRequest; admission: AdmissionDecision }
   | {
-      kind: 'joined' | 'rekeyed';
+      kind: 'joined' | 'rekeyed' | 'fork-resolved';
       thread: string;
       epoch: number;
       members: Member[];
@@ -195,6 +195,12 @@ export interface ClientSnapshot {
   treeHeads: Record<string, TreeHead>;
   /** The domain key already checked against the domain's log, by domain (Section 6.5). */
   domainKeys: Record<string, string>;
+  /** The latest commit applied in each thread, with the undo for it, kept briefly in case a competing one arrives (Section 8.8). */
+  lastCommit: Record<string, { hash: string; undo: StateUndo; at: number; own: boolean; joined?: boolean }>;
+  /** Messages that could not be read yet, kept until the winning commit may arrive (Section 8.8). */
+  held: { item: MailItem; at: number }[];
+  /** Threads where this client's own commit lost, to be recomputed against the winner. */
+  rekeyAgain: string[];
   knownOwnClients: string[];
   /** Grants this agent holds from its owner. */
   grants: Grant[];
@@ -278,6 +284,9 @@ interface WelcomePayload {
   for: string[];
   humansOnly?: boolean;
   linkedTo?: string;
+  /** For a welcome that comes with a commit: the hex SHA-256 of that commit and the epoch it makes (Section 8.8). */
+  commit?: string;
+  epoch?: number;
 }
 
 interface MlsPayload {
@@ -302,6 +311,9 @@ const emptySnapshot = (): ClientSnapshot => ({
   sentIds: [],
   treeHeads: {},
   domainKeys: {},
+  lastCommit: {},
+  held: [],
+  rekeyAgain: [],
   knownOwnClients: [],
   grants: [],
   views: {},
@@ -326,16 +338,23 @@ const WATCH_KEPT = 500;
 const WATCH_MAX_AGE_MS = 24 * 3_600_000;
 
 const joinerTag = (clientId: string): string => sha256(`signet joiner ${clientId}`);
-const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }): WelcomePayload => ({
+const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }, commit?: { hash: string; epoch: number }): WelcomePayload => ({
   thread,
   welcome,
   for: joiners.map((joiner) => joinerTag(joiner.clientId)),
+  ...(commit ? { commit: commit.hash, epoch: commit.epoch } : {}),
   ...(meta.humansOnly ? { humansOnly: true } : {}),
   ...(meta.linkedTo ? { linkedTo: meta.linkedTo } : {}),
 });
 
 /** Who may be in a thread: readers, and in a humans-only thread only devices and agents their owner opted in. */
 const eligible = (member: ViewMember, humansOnly: boolean): boolean => member.reads && (!humansOnly || member.humansOnly);
+
+/** How long a client keeps the means to take back its latest commit, and messages it cannot read yet (Section 8.8). */
+const FORK_WINDOW_MS = 5 * 60_000;
+
+/** A thread message that cannot be decrypted yet, perhaps because the commit it follows has not arrived. */
+class NotReadableYet extends Error {}
 
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const unique = (values: string[]) => [...new Set(values)];
@@ -822,10 +841,11 @@ export class SignetClient {
     }
     if (removed.length === 0 && additions.length === 0) return { removed: [], added: [] };
     const token = this.deliveryToken(id);
-    const result = this.mls.commit(id, removed.map((member) => member.leafIndex), additions);
+    const result = this.mls.commitUndoable(id, removed.map((member) => member.leafIndex), additions);
+    this.state.lastCommit[id] = { hash: commitHash(result.commit).toString('hex'), undo: result.undo, at: Date.now(), own: true };
     await this.submit(principals, 'commit', { thread: id, mls: result.commit } satisfies MlsPayload, token);
     if (result.welcome) {
-      await this.submit(this.principalsOf(result.joiners), 'welcome', welcomeFor(id, result.welcome, result.joiners, this.state.threadMeta[id]), token);
+      await this.submit(this.principalsOf(result.joiners), 'welcome', welcomeFor(id, result.welcome, result.joiners, this.state.threadMeta[id], { hash: commitHash(result.commit).toString('hex'), epoch: this.mls.epoch(id) }), token);
     }
     await this.registerCurrentToken(id);
     return { removed, added: result.joiners };
@@ -975,7 +995,8 @@ export class SignetClient {
           try {
             events.push(...(await this.process(item)));
           } catch (error) {
-            events.push({ kind: 'error', item, error: describe(error) });
+            if (error instanceof NotReadableYet) this.state.held.push({ item, at: Date.now() });
+            else events.push({ kind: 'error', item, error: describe(error) });
           }
         }
       }
@@ -983,6 +1004,11 @@ export class SignetClient {
       if (this.released === 0) break;
     }
     await this.acknowledgeMailboxes();
+    events.push(...this.expireHeld());
+    // A commit of ours that lost to another is recomputed against the winning epoch (Section 8.8 step 4).
+    for (const thread of this.state.rekeyAgain.splice(0)) {
+      if (this.state.threads.includes(thread)) await this.rekey(thread).catch(() => undefined);
+    }
     events.push(...(await this.retryUnconfirmed()));
     events.push(...(await this.laggingHomes(lastAnswered)));
     await this.topUpKeyPackages();
@@ -1120,15 +1146,30 @@ export class SignetClient {
   /** Join only if every member of the group is a current client in its owner's contact view. */
   private async onWelcome(payload: WelcomePayload): Promise<SignetEvent[]> {
     if (!payload.for.includes(joinerTag(this.keys.cert.clientId))) return [];
-    if (this.state.threads.includes(payload.thread)) return [];
-    const preview = this.mls.peekWelcome(payload.welcome);
+    let replaces = false;
+    if (this.state.threads.includes(payload.thread)) {
+      // A second welcome for a thread this client just joined: two commits competed. Keep the one that won (Section 8.8).
+      const held = this.state.lastCommit[payload.thread];
+      if (!held?.joined || payload.commit === undefined || payload.epoch === undefined || Date.now() - held.at > FORK_WINDOW_MS) return [];
+      const wins = payload.epoch > this.mls.epoch(payload.thread) || (payload.epoch === this.mls.epoch(payload.thread) && Buffer.compare(Buffer.from(payload.commit, 'hex'), Buffer.from(held.hash, 'hex')) < 0);
+      if (!wins) return [];
+      replaces = true;
+    }
+    const taken = this.state.lastCommit[payload.thread];
+    const preview = replaces && taken ? this.mls.peekWelcomeBefore(payload.welcome, taken.undo) : this.mls.peekWelcome(payload.welcome);
     if (preview.thread !== payload.thread) throw new Error('welcome is for a different thread than it claims');
     const humansOnly = payload.humansOnly === true;
     for (const member of preview.members) {
       const { member: current } = await this.checkMember(member);
       if (humansOnly && !current.humansOnly) throw new Error(`humans-only thread includes ${member.principal}'s agent, which its owner hasn't allowed`);
     }
-    const { thread, members } = this.mls.join(payload.welcome);
+    if (replaces && taken) {
+      this.mls.rollback(taken.undo);
+      this.state.threads = this.state.threads.filter((known) => known !== payload.thread);
+      delete this.state.lastCommit[payload.thread];
+    }
+    const { thread, members, undo } = this.mls.joinUndoable(payload.welcome);
+    if (payload.commit !== undefined) this.state.lastCommit[thread] = { hash: payload.commit, undo, at: Date.now(), own: false, joined: true };
     const meta: ThreadMeta = { humansOnly, ...(payload.linkedTo ? { linkedTo: payload.linkedTo } : {}) };
     this.state.threads.push(thread);
     this.state.threadMeta[thread] = meta;
@@ -1140,7 +1181,25 @@ export class SignetClient {
   /** Apply a commit only if its sender and every client it adds are current in their owners' views. */
   private async onCommit(payload: MlsPayload): Promise<SignetEvent[]> {
     if (!this.state.threads.includes(payload.thread)) return [];
-    const preview = this.mls.previewCommit(payload.thread, payload.mls);
+    // Two members can commit from the same epoch: the smaller hash wins, and the client that applied the other
+    // goes back to before it (Section 8.8). A commit that is not for the current epoch is looked at as if it were.
+    const last = this.state.lastCommit[payload.thread];
+    let preview: CommitPreview;
+    let supersedes = false;
+    try {
+      preview = this.mls.previewCommit(payload.thread, payload.mls);
+    } catch (error) {
+      if (!last || Date.now() - last.at > FORK_WINDOW_MS) throw error;
+      // A client that just joined has nothing from before its welcome to compare with: the other commit's welcome settles it.
+      if (last.joined) return [];
+      try {
+        preview = this.mls.previewCommitBefore(payload.thread, payload.mls, last.undo);
+      } catch {
+        throw error;
+      }
+      if (Buffer.compare(commitHash(payload.mls), Buffer.from(last.hash, 'hex')) >= 0) return [];
+      supersedes = true;
+    }
     if (!preview.selfRemoved) {
       await this.checkMember(preview.sender);
       for (const member of preview.added) {
@@ -1150,7 +1209,13 @@ export class SignetClient {
         }
       }
     }
-    const applied = this.mls.applyCommit(payload.thread, payload.mls);
+    if (supersedes && last) {
+      this.mls.rollback(last.undo);
+      delete this.state.lastCommit[payload.thread];
+      if (last.own) this.state.rekeyAgain.push(payload.thread);
+    }
+    const applied = this.mls.applyCommitUndoable(payload.thread, payload.mls);
+    this.state.lastCommit[payload.thread] = { hash: commitHash(payload.mls).toString('hex'), undo: applied.undo, at: Date.now(), own: false };
     if (applied.selfRemoved || !this.mls.isActive(payload.thread)) {
       this.state.threads = this.state.threads.filter((thread) => thread !== payload.thread);
       await this.registerTokens([], this.state.tokens[payload.thread] ?? []);
@@ -1159,24 +1224,57 @@ export class SignetClient {
     }
     await this.registerCurrentToken(payload.thread);
     const members = this.mls.members(payload.thread);
-    return [
-      {
-        kind: 'rekeyed',
-        thread: payload.thread,
-        epoch: this.mls.epoch(payload.thread),
-        members,
-        participants: await this.toParticipants(members),
-        ...(this.state.threadMeta[payload.thread] ?? { humansOnly: false }),
-      },
-    ];
+    const base = { thread: payload.thread, epoch: this.mls.epoch(payload.thread), members, participants: await this.toParticipants(members), ...(this.state.threadMeta[payload.thread] ?? { humansOnly: false }) };
+    return [...(supersedes ? [{ kind: 'fork-resolved' as const, ...base }] : []), { kind: 'rekeyed', ...base }, ...(await this.retryHeld(payload.thread))];
+  }
+
+  /** Messages that could not be read before this commit may be readable now (Section 8.8 step 3). */
+  private async retryHeld(thread: string): Promise<SignetEvent[]> {
+    const events: SignetEvent[] = [];
+    const waiting = this.state.held;
+    this.state.held = [];
+    for (const entry of waiting) {
+      if ((entry.item.payload as MlsPayload).thread !== thread) {
+        this.state.held.push(entry);
+        continue;
+      }
+      try {
+        events.push(...(await this.process(entry.item)));
+      } catch (error) {
+        if (error instanceof NotReadableYet) this.state.held.push(entry);
+        else events.push({ kind: 'error', item: entry.item, error: describe(error) });
+      }
+    }
+    return events;
+  }
+
+  /** Held messages that no commit has made readable in the window are reported as errors (Section 8.8 step 5). */
+  private expireHeld(): SignetEvent[] {
+    const now = Date.now();
+    const expired = this.state.held.filter((entry) => now - entry.at > FORK_WINDOW_MS);
+    this.state.held = this.state.held.filter((entry) => now - entry.at <= FORK_WINDOW_MS);
+    for (const thread of Object.keys(this.state.lastCommit)) if (now - this.state.lastCommit[thread].at > FORK_WINDOW_MS) delete this.state.lastCommit[thread];
+    return expired.map((entry) => ({ kind: 'error' as const, item: entry.item, error: 'could not be decrypted: no commit arrived that makes it readable' }));
   }
 
   private async onMessage(payload: MlsPayload): Promise<SignetEvent[]> {
     if (!this.state.threads.includes(payload.thread)) return [];
-    const { sender, plaintext } = this.mls.decrypt(payload.thread, payload.mls);
+    let decrypted: ReturnType<MlsSession['decrypt']>;
+    try {
+      decrypted = this.mls.decrypt(payload.thread, payload.mls);
+    } catch (error) {
+      // It may be for an epoch whose commit has not reached this client yet (Section 8.8 step 5).
+      throw new NotReadableYet(error instanceof Error ? error.message : String(error));
+    }
+    const { sender, plaintext } = decrypted;
     const { directory, member } = await this.checkMember(sender);
     const message = JSON.parse(plaintext.toString('utf8')) as SignedMessage;
     verifyMessage(message, payload.thread, directory, member, this.address);
+    // Once a thread is handed to an account's human, that account's agents and tools may only hand off again (Section 12.6).
+    const held = this.state.needsHuman[payload.thread];
+    if (held && member.kind !== 'device' && message.body.from === held.by && !(message.body.intents.length > 0 && message.body.intents.every((intent) => intent.name.startsWith('handoff.human')))) {
+      throw new Error(`${held.by} handed this thread to a human, so its agents may not send in it`);
+    }
     if (message.body.profile?.label) this.state.labels[member.clientId] = message.body.profile.label.slice(0, 64);
     const events: SignetEvent[] = [{ kind: 'message', thread: payload.thread, message, sender: this.summary(directory, member) }];
     for (const intent of message.body.intents) {
@@ -1466,15 +1564,11 @@ export class SignetClient {
     return (await this.getJson(`${server}/v0/directory/${encodeURIComponent(local)}`)) as DirectoryEntry;
   }
 
-  private ownLogEntries?: LogEntry[];
-
+  /** Proof for a lookup of `target`. The log is fetched each time: a cached copy would not match the card once a client is enrolled. */
   private async requesterProof(target: string): Promise<string> {
-    if (!this.ownLogEntries) {
-      const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
-      if (!own.log) throw new Error('home server did not return this account’s log');
-      this.ownLogEntries = own.log;
-    }
-    return signRequesterProof(this.keys, this.address, this.ownLogEntries, target);
+    const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
+    if (!own.log) throw new Error('home server did not return this account’s log');
+    return signRequesterProof(this.keys, this.address, own.log, target);
   }
 
   /** Log queries go through the home server, which authenticates to the log as its domain. */

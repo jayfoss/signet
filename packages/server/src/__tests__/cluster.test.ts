@@ -79,6 +79,9 @@ async function world(options: { snapshotEvery?: number } = {}) {
   await jerzyClient.ready();
 
   return {
+    resolver,
+    log,
+    shared,
     homes,
     members,
     aliceKeys,
@@ -216,6 +219,34 @@ describe('a domain with two homes and a witness', () => {
     const events = await aliceClient.sync();
     expect(kinds(events)).toEqual(['request']);
     expect(events[0].kind === 'request' && events[0].request.body.subject).toBe('Second');
+  });
+
+  it('adds a third home to a running cluster, which then holds the same state, and removes it again', async () => {
+    const port = await freePort();
+    const h3Member: ClusterMember = { id: 'h3', url: `http://127.0.0.1:${port}`, role: 'home' };
+    const h3 = new SignetServer({
+      domain: 'alpha.test',
+      domainKey: w.alphaKey,
+      resolver: w.resolver,
+      log: w.log,
+      openEnrollment: true,
+      ...w.shared,
+      // The new replica knows the old ones and waits to be caught up before it votes.
+      cluster: { id: 'h3', members: [...w.members, h3Member], electionMs: T, volatileLog: true, rejoin: true },
+    });
+    await h3.listen(port);
+    try {
+      await w.jerzyClient.sendRequest('alice@alpha.test', { subject: 'Before h3', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+      await w.primary().addReplica(h3Member);
+      await until(() => h3.store.userLocals().includes('alice') && h3.store.mailbox('alice').length === 1);
+      expect(w.primary().policy.replicas).toEqual([w.members[0].url, w.members[1].url, h3Member.url]);
+      // Another change in a row is fine once the last one has committed.
+      await w.primary().removeReplica('h3');
+      expect(w.primary().policy.replicas).toEqual([w.members[0].url, w.members[1].url]);
+      expect(kinds(await w.aliceClient.sync())).toEqual(['request']);
+    } finally {
+      await h3.close();
+    }
   });
 
   it('does not acknowledge a change it could not commit, and forgets it', async () => {

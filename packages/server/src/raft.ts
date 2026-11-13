@@ -1,8 +1,8 @@
 /**
  * The Raft algorithm (Ongaro and Ousterhout, 2014) in the profile of Section 6.8.6: leader election with
  * terms and a pre-vote round, log replication, commit by majority, a no-op entry for each new leader, a
- * leader that steps down when it hasn't heard from a majority for one election timeout, and snapshots that
- * compact the log. There is no membership change.
+ * leader that steps down when it hasn't heard from a majority for one election timeout, snapshots that
+ * compact the log, and membership changes one replica at a time (Raft dissertation, Section 4.1).
  *
  * The node does no I/O of its own. The host gives it a transport, durable storage, a clock and an
  * `apply` function, and calls `tick` often (every tenth of the election timeout is plenty).
@@ -13,10 +13,18 @@
 
 export type Role = 'follower' | 'candidate' | 'leader';
 
-/** `data` is null for the no-op a new leader appends. */
+/** A voter. Raft reads only `id`; the host keeps the rest (an address, a role) with it. */
+export interface RaftMember {
+  id: string;
+  [key: string]: unknown;
+}
+
+/** `data` is null for the no-op a new leader appends and for a membership entry, which carries `config`. */
 export interface RaftEntry<T = unknown> {
   term: number;
   data: T | null;
+  /** The complete list of voters from this entry on. A replica uses the newest one in its log, committed or not. */
+  config?: RaftMember[];
 }
 
 /** The state machine as of `index`, replacing every entry up to and including it. `data` is null for a witness. */
@@ -24,6 +32,8 @@ export interface RaftSnapshot {
   index: number;
   term: number;
   data: unknown;
+  /** The voters as of `index`. */
+  config?: RaftMember[];
 }
 
 export interface RaftStorage<T = unknown> {
@@ -104,6 +114,7 @@ export interface SnapshotRequest {
   index: number;
   snapshotTerm: number;
   data: unknown;
+  config?: RaftMember[];
 }
 
 export interface SnapshotResponse {
@@ -132,8 +143,12 @@ export class OverwrittenError extends Error {
 
 export interface RaftOptions<T> {
   id: string;
-  /** Every other voter, witnesses included. */
+  /** Every other voter, witnesses included, as of the start; later changes come from the log. */
   peers: string[];
+  /** The voters, with whatever the host wants to keep about them, as of the start. Defaults to this replica and `peers`. */
+  members?: RaftMember[];
+  /** Called when the voters change: a membership entry is added to the log, or one is rolled back or compacted. */
+  onConfig?: (members: RaftMember[]) => void;
   /** A witness keeps the log and votes. It never stands for election and never applies entries. */
   witness?: boolean;
   /**
@@ -185,7 +200,11 @@ export class RaftNode<T = unknown> {
   private snapshotIndex = 0;
   private snapshotTerm = 0;
   private snapshotData: unknown = null;
-  private readonly peers: string[];
+  private peers: string[];
+  private memberList: RaftMember[];
+  private snapshotConfig?: RaftMember[];
+  /** Non-voting replicas the leader is catching up before they are added. */
+  private readonly learners = new Set<string>();
   private readonly witness: boolean;
   private readonly electionMs: number;
   private readonly now: () => number;
@@ -205,7 +224,8 @@ export class RaftNode<T = unknown> {
 
   constructor(private readonly options: RaftOptions<T>) {
     this.id = options.id;
-    this.peers = options.peers;
+    this.peers = [...options.peers];
+    this.memberList = options.members ?? [{ id: options.id }, ...options.peers.map((id) => ({ id }))];
     this.witness = options.witness ?? false;
     this.electionMs = options.electionMs ?? 1000;
     this.now = options.now ?? Date.now;
@@ -219,10 +239,90 @@ export class RaftNode<T = unknown> {
       this.snapshotIndex = saved.snapshot.index;
       this.snapshotTerm = saved.snapshot.term;
       this.snapshotData = saved.snapshot.data;
+      this.snapshotConfig = saved.snapshot.config;
       this.commitIndex = this.lastApplied = saved.snapshot.index;
       if (!this.witness) options.restore?.(saved.snapshot.data);
     }
+    this.initialMembers = this.memberList;
+    this.recomputeConfig(false);
     this.resetElection();
+  }
+
+  private readonly initialMembers: RaftMember[];
+
+  /** Who votes now. */
+  get members(): RaftMember[] {
+    return this.memberList;
+  }
+
+  private get voting(): boolean {
+    return this.memberList.some((member) => member.id === this.id);
+  }
+
+  /** The voters as of the newest membership entry in the log, or the snapshot's, or the start. Uncommitted entries count. */
+  private configAt(index: number): RaftMember[] {
+    for (let i = Math.min(index, this.lastIndex); i > this.snapshotIndex; i--) {
+      const config = this.entryAt(i)?.config;
+      if (config) return config;
+    }
+    return this.snapshotConfig ?? this.initialMembers;
+  }
+
+  private recomputeConfig(notify = true): void {
+    const members = this.configAt(this.lastIndex);
+    const same = members.length === this.memberList.length && members.every((member, i) => member.id === this.memberList[i].id && JSON.stringify(member) === JSON.stringify(this.memberList[i]));
+    this.memberList = members;
+    this.peers = members.map((member) => member.id).filter((id) => id !== this.id);
+    if (this.role === 'leader') {
+      for (const peer of this.peers) {
+        if (!this.nextIndex.has(peer)) this.nextIndex.set(peer, this.lastIndex + 1);
+        if (!this.matchIndex.has(peer)) this.matchIndex.set(peer, 0);
+        if (!this.lastAck.has(peer)) this.lastAck.set(peer, this.now());
+        this.learners.delete(peer);
+      }
+    }
+    if (notify && !same) this.options.onConfig?.(members);
+  }
+
+  /** The replicas the leader sends to: voters, and learners it is catching up. */
+  private get targets(): string[] {
+    return [...this.peers, ...[...this.learners].filter((id) => !this.peers.includes(id))];
+  }
+
+  /** Leader only: start replicating to a replica that does not vote yet, so it can catch up before it is added. */
+  addLearner(id: string): void {
+    if (this.role !== 'leader') throw new NotLeaderError();
+    if (id === this.id || this.peers.includes(id)) return;
+    this.learners.add(id);
+    this.nextIndex.set(id, this.lastIndex + 1);
+    this.matchIndex.set(id, 0);
+    this.broadcast();
+  }
+
+  /** Whether a learner holds everything the leader has committed. */
+  learnerCaughtUp(id: string): boolean {
+    return this.role === 'leader' && (this.matchIndex.get(id) ?? 0) >= this.commitIndex && this.commitIndex >= this.noopIndex;
+  }
+
+  /**
+   * Leader only: change the voters by exactly one replica (Section 6.8.6 step 10). Only one change may be in the
+   * log uncommitted at a time, and a replica being added must have caught up as a learner first.
+   */
+  proposeConfig(members: RaftMember[]): number {
+    if (this.role !== 'leader') throw new NotLeaderError();
+    for (let i = this.lastIndex; i > this.commitIndex && i > this.snapshotIndex; i--) {
+      if (this.entryAt(i)?.config) throw new Error('a membership change is already in progress');
+    }
+    const now = new Set(this.memberList.map((member) => member.id));
+    const next = new Set(members.map((member) => member.id));
+    const added = [...next].filter((id) => !now.has(id));
+    const removed = [...now].filter((id) => !next.has(id));
+    if (next.size !== members.length || added.length + removed.length !== 1) throw new Error('a membership change adds or removes exactly one replica');
+    if (added.length === 1 && !this.learnerCaughtUp(added[0])) throw new Error(`${added[0]} has not caught up yet`);
+    const index = this.appendLocal({ term: this.term_, data: null, config: members.map((member) => ({ ...member })) });
+    this.recomputeConfig();
+    this.broadcast();
+    return index;
   }
 
   get term(): number {
@@ -238,9 +338,9 @@ export class RaftNode<T = unknown> {
     return this.snapshotIndex;
   }
 
-  /** Voters needed for a decision: more than half of everyone. */
+  /** Voters needed for a decision: more than half of everyone now voting. */
   get majority(): number {
-    return Math.floor((this.peers.length + 1) / 2) + 1;
+    return Math.floor(this.memberList.length / 2) + 1;
   }
 
   entryAt(index: number): RaftEntry<T> | undefined {
@@ -260,7 +360,7 @@ export class RaftNode<T = unknown> {
   /** The leader heard from a majority within the last election timeout, counting itself. */
   hasLease(now = this.now()): boolean {
     if (this.role !== 'leader') return false;
-    const times = [now, ...this.peers.map((peer) => this.lastAck.get(peer) ?? 0)].sort((a, b) => b - a);
+    const times = [...(this.voting ? [now] : []), ...this.peers.map((peer) => this.lastAck.get(peer) ?? 0)].sort((a, b) => b - a);
     return now - times[this.majority - 1] < this.electionMs;
   }
 
@@ -280,7 +380,7 @@ export class RaftNode<T = unknown> {
       if (now >= this.nextHeartbeat) this.broadcast();
       return;
     }
-    if (this.witness || !this.caughtUp) return;
+    if (this.witness || !this.caughtUp || !this.voting) return;
     if (now >= this.electionDeadline) this.startPreVote();
   }
 
@@ -354,7 +454,11 @@ export class RaftNode<T = unknown> {
       added.push(entry);
       this.log.push(entry);
     }
-    if (added.length > 0) this.options.storage.replaceFrom(from, added);
+    if (added.length > 0) {
+      this.options.storage.replaceFrom(from, added);
+      // A membership entry takes effect when it is in the log, and goes with it if the log is cut back.
+      this.recomputeConfig();
+    }
     const last = request.prevIndex + request.entries.length;
     if (request.commit > this.commitIndex) {
       this.commitIndex = Math.max(this.commitIndex, Math.min(request.commit, last));
@@ -374,11 +478,13 @@ export class RaftNode<T = unknown> {
     this.resetElection();
     // Already past it: nothing to take.
     if (request.index <= this.commitIndex) return { term: this.term_, matchIndex: this.commitIndex };
-    this.options.storage.saveSnapshot({ index: request.index, term: request.snapshotTerm, data: request.data }, []);
+    this.options.storage.saveSnapshot({ index: request.index, term: request.snapshotTerm, data: request.data, config: request.config }, []);
     this.log = [];
     this.snapshotIndex = request.index;
     this.snapshotTerm = request.snapshotTerm;
     this.snapshotData = request.data;
+    this.snapshotConfig = request.config;
+    this.recomputeConfig();
     this.commitIndex = this.lastApplied = request.index;
     if (!this.witness) this.options.restore?.(request.data);
     this.settle();
@@ -468,6 +574,7 @@ export class RaftNode<T = unknown> {
     this.role = 'leader';
     this.leaderId = this.id;
     this.inflight.clear();
+    this.learners.clear();
     for (const peer of this.peers) {
       this.nextIndex.set(peer, this.lastIndex + 1);
       this.matchIndex.set(peer, 0);
@@ -493,7 +600,7 @@ export class RaftNode<T = unknown> {
 
   private broadcast(): void {
     this.nextHeartbeat = this.now() + this.electionMs / 5;
-    for (const peer of this.peers) this.replicate(peer);
+    for (const peer of this.targets) this.replicate(peer);
     this.advanceCommit();
   }
 
@@ -535,7 +642,7 @@ export class RaftNode<T = unknown> {
   private sendSnapshot(peer: string): void {
     const term = this.term_;
     this.inflight.add(peer);
-    this.options.transport.installSnapshot(peer, { term, leader: this.id, index: this.snapshotIndex, snapshotTerm: this.snapshotTerm, data: this.snapshotData }).then(
+    this.options.transport.installSnapshot(peer, { term, leader: this.id, index: this.snapshotIndex, snapshotTerm: this.snapshotTerm, data: this.snapshotData, config: this.snapshotConfig }).then(
       (response) => {
         this.inflight.delete(peer);
         if (response.term > this.term_) {
@@ -559,7 +666,7 @@ export class RaftNode<T = unknown> {
     if (this.role !== 'leader') return;
     for (let n = this.lastIndex; n > this.commitIndex; n--) {
       if (this.termAt(n) !== this.term_) break;
-      const holders = 1 + this.peers.filter((peer) => (this.matchIndex.get(peer) ?? 0) >= n).length;
+      const holders = (this.voting ? 1 : 0) + this.peers.filter((peer) => (this.matchIndex.get(peer) ?? 0) >= n).length;
       if (holders >= this.majority) {
         this.commitIndex = n;
         this.applyCommitted();
@@ -574,6 +681,8 @@ export class RaftNode<T = unknown> {
       this.lastApplied++;
       const entry = this.entryAt(this.lastApplied) as RaftEntry<T>;
       if (!this.witness) this.options.apply(this.lastApplied, entry);
+      // A leader that has just committed its own removal stops leading (Section 6.8.6 step 10).
+      if (entry.config && this.role === 'leader' && !this.voting && this.lastApplied >= this.commitIndex) this.stepDown(this.term_);
     }
     if (this.options.snapshotEvery && this.lastApplied - this.snapshotIndex >= this.options.snapshotEvery) this.compact();
   }
@@ -587,11 +696,13 @@ export class RaftNode<T = unknown> {
     const index = this.lastApplied;
     const term = this.termAt(index);
     const remaining = this.log.slice(index - this.snapshotIndex);
-    this.options.storage.saveSnapshot({ index, term, data }, remaining);
+    const config = this.configAt(index);
+    this.options.storage.saveSnapshot({ index, term, data, config }, remaining);
     this.log = remaining;
     this.snapshotIndex = index;
     this.snapshotTerm = term;
     this.snapshotData = data;
+    this.snapshotConfig = config;
   }
 
   private settle(): void {

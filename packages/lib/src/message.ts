@@ -1,6 +1,7 @@
 import type { AttachmentRef } from './attachments';
 import type { Directory, Grant, ViewMember } from './cards';
 import { randomId, signJson, verifyJson } from './crypto';
+import { MAX_HTML_BYTES } from './html';
 import type { ClientKeys } from './identity';
 import type { Intent } from './intents';
 import { checkIntentAuthority, verifyIntentAuthority } from './intents';
@@ -20,6 +21,8 @@ export interface MessageBody {
   ts: string;
   subject: string;
   text: string;
+  /** An html alternative to `text`, shown only after `sanitizeHtml` (Section 8.4.1). */
+  html?: string;
   intents: Intent[];
   attachments: AttachmentRef[];
   /** Grants this agent relies on; each names the one counterparty allowed to see it. */
@@ -38,6 +41,7 @@ export interface SignedMessage {
 export interface MessageFields {
   subject: string;
   text: string;
+  html?: string;
   inReplyTo?: string;
   intents?: Intent[];
   attachments?: AttachmentRef[];
@@ -59,6 +63,7 @@ export function composeMessage(me: ClientKeys, thread: string, fields: MessageFi
     ts: now.toISOString(),
     subject: fields.subject,
     text: fields.text,
+    html: fields.html,
     intents,
     attachments: fields.attachments ?? [],
     grants: fields.grants?.length ? fields.grants : undefined,
@@ -84,5 +89,6 @@ export function verifyMessage(
   if (body.thread !== thread) throw new Error('message belongs to another thread');
   if (body.from !== sender.principal || body.fromClient !== member.clientId) throw new Error('message sender does not match its client');
   if (!verifyJson(member.sigKey, body, message.sig)) throw new Error('message is not signed by an active client');
+  if (body.html !== undefined && (typeof body.html !== 'string' || Buffer.byteLength(body.html) > MAX_HTML_BYTES)) throw new Error(`a message's html is at most ${MAX_HTML_BYTES} bytes`);
   for (const intent of body.intents) verifyIntentAuthority(intent, member, sender, receiver, body.grants ?? [], now);
 }

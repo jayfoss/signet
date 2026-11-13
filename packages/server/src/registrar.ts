@@ -45,6 +45,7 @@ export interface AttestRequest {
   to: string[];
   subject: string;
   bodyHash: string;
+  htmlHash?: string;
   audience?: 'humans';
   /** The home's URL, which the header carries as a hint. */
   server: string;
@@ -107,7 +108,7 @@ export class LocalRegistrar implements Registrar {
   }
 
   /** Sign the attestation only for mail one of the user's own clients asked for, as the account log the registrar bound shows it. */
-  async attest({ principal, to, subject, bodyHash, audience, server, proof }: AttestRequest): Promise<string> {
+  async attest({ principal, to, subject, bodyHash, htmlHash, audience, server, proof }: AttestRequest): Promise<string> {
     const known = this.logs.get(principal);
     if (!known) throw new HttpError(404, `${principal} is not bound`);
     const state = replayLog(known.entries);
@@ -117,11 +118,12 @@ export class LocalRegistrar implements Registrar {
     const signed = verifyClientAuth(cert.sigKey, proof.headers['signet-sig'], proof.headers['signet-ts'], proof.headers['signet-nonce'], proof.method, proof.path, proof.body);
     if (!signed) throw new HttpError(401, 'the client signature does not verify');
     if (!this.proofs.firstUse(proof.headers['signet-sig'])) throw new HttpError(401, 'this request was already used');
-    const asked = JSON.parse(proof.body) as { to?: string[]; subject?: string; text?: string; bodyHash?: string; humansOnly?: boolean };
+    const asked = JSON.parse(proof.body) as { to?: string[]; subject?: string; text?: string; html?: string; bodyHash?: string; htmlHash?: string; humansOnly?: boolean };
     // /v0/legacy/send names the text itself; /v0/legacy/attest names its hash.
     const askedHash = asked.bodyHash ?? (typeof asked.text === 'string' ? hashBody(asked.text) : undefined);
-    if (!Array.isArray(asked.to) || !sameSet(asked.to, to) || asked.subject !== subject || askedHash !== bodyHash || (asked.humansOnly ? 'humans' : undefined) !== audience) throw new HttpError(403, 'the client asked for different mail');
-    return attestedSignetHeader(this.options.domainKey, server, state.identityKey, { from: principal, to, subject, bodyHash, audience });
+    const askedHtmlHash = asked.htmlHash ?? (typeof asked.html === 'string' ? hashBody(asked.html) : undefined);
+    if (!Array.isArray(asked.to) || !sameSet(asked.to, to) || asked.subject !== subject || askedHash !== bodyHash || askedHtmlHash !== htmlHash || (asked.humansOnly ? 'humans' : undefined) !== audience) throw new HttpError(403, 'the client asked for different mail');
+    return attestedSignetHeader(this.options.domainKey, server, state.identityKey, { from: principal, to, subject, bodyHash, htmlHash, audience });
   }
 
   private async append(principal: string, kind: LogLeaf['kind'], identityKey: string | null, publication: Publication | null): Promise<void> {

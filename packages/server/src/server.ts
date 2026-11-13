@@ -55,6 +55,7 @@ import {
   signServerUrls,
   underDomain,
   hashBody,
+  MAX_HTML_BYTES,
   hasScope,
   cardHash,
   generateVrfKey,
@@ -915,8 +916,8 @@ export class SignetServer implements LegacyInbox {
     }
     if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request), request);
     if (method === 'POST' && path === '/v0/legacy/attest') {
-      const { to, subject, bodyHash, humansOnly } = json<{ to: string[]; subject: string; bodyHash: string; humansOnly?: boolean }>(request);
-      return { header: await this.attestHeader(client, to, subject, request, bodyHash, humansOnly ? 'humans' : undefined) };
+      const { to, subject, bodyHash, htmlHash, humansOnly } = json<{ to: string[]; subject: string; bodyHash: string; htmlHash?: string; humansOnly?: boolean }>(request);
+      return { header: await this.attestHeader(client, to, subject, request, bodyHash, humansOnly ? 'humans' : undefined, htmlHash) };
     }
     if (method === 'GET' && path === '/v0/issuer') {
       if (!this.options.issuer) throw new HttpError(501, 'this server has no Privacy Pass issuer');
@@ -1491,28 +1492,30 @@ export class SignetServer implements LegacyInbox {
    * Vouch, with the domain key, that this user is sending plain email with this From, To and Subject.
    * Used for mail this server sends and for mail the client sends itself (Gmail mode).
    */
-  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest, bodyHash: string, audience?: 'humans'): Promise<string> {
+  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest, bodyHash: string, audience?: 'humans', htmlHash?: string): Promise<string> {
     if (!hasScope(client, 'send')) throw new HttpError(403, `${client.label} may not send`);
     const user = this.store.user(splitAddress(client.principal).local);
     if (!user) throw new HttpError(404, 'sender is not enrolled');
     if (!Array.isArray(to) || to.length === 0 || typeof subject !== 'string') throw new HttpError(400, 'to and subject are required');
     if (typeof bodyHash !== 'string' || !bodyHash.startsWith('sha256:')) throw new HttpError(400, 'bodyHash must be a sha256: hash of the message body');
+    if (htmlHash !== undefined && (typeof htmlHash !== 'string' || !htmlHash.startsWith('sha256:'))) throw new HttpError(400, 'htmlHash must be a sha256: hash of the html part');
     // Without the domain key, the registrar attests, shown the client's own signed request.
     if (!this.options.domainKey && this.options.registrar) {
       const names = ['signet-principal', 'signet-client', 'signet-ts', 'signet-nonce', 'signet-sig'];
       const headers = Object.fromEntries(names.map((name) => [name, header(request.headers, name)]));
-      return this.options.registrar.attest({ principal: client.principal, to, subject, bodyHash, audience, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
+      return this.options.registrar.attest({ principal: client.principal, to, subject, bodyHash, htmlHash, audience, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
     }
-    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject, bodyHash, audience });
+    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject, bodyHash, htmlHash, audience });
   }
 
   private async sendLegacy(
     client: ClientCert,
-    mail: { to: string[]; subject: string; text: string; humansOnly?: boolean; attachments?: { filename: string; contentType: string; content: string }[] },
+    mail: { to: string[]; subject: string; text: string; html?: string; humansOnly?: boolean; attachments?: { filename: string; contentType: string; content: string }[] },
     request: HttpRequest,
   ): Promise<{ messageId: string }> {
     if (!hasScope(client, 'send')) throw new HttpError(403, `${client.label} may not send`);
     if (!this.options.outbound) throw new HttpError(501, 'this server does not send plain email');
+    if (mail.html !== undefined && (typeof mail.html !== 'string' || Buffer.byteLength(mail.html) > MAX_HTML_BYTES)) throw new HttpError(400, `html is at most ${MAX_HTML_BYTES} bytes`);
     const user = this.store.user(splitAddress(client.principal).local);
     if (!user) throw new HttpError(404, 'sender is not enrolled');
     const messageId = await this.options.outbound.send({
@@ -1520,7 +1523,8 @@ export class SignetServer implements LegacyInbox {
       to: mail.to,
       subject: mail.subject,
       text: mail.text,
-      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request, hashBody(mail.text), mail.humansOnly ? 'humans' : undefined), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
+      ...(mail.html === undefined ? {} : { html: mail.html }),
+      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request, hashBody(mail.text), mail.humansOnly ? 'humans' : undefined, mail.html === undefined ? undefined : hashBody(mail.html)), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
       attachments: mail.attachments ?? [],
     });
     return { messageId };

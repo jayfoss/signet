@@ -178,7 +178,7 @@ export class Testbed {
   }
 
   /** Send plain email into a Signet domain over SMTP, the way Gmail would. */
-  async sendPlainEmail(mail: { from: string; to: string; subject: string; text: string; headers?: Record<string, string> }): Promise<void> {
+  async sendPlainEmail(mail: { from: string; to: string; subject: string; text: string; html?: string; headers?: Record<string, string> }): Promise<void> {
     const inbound = this.inbound.get(splitAddress(mail.to).domain);
     if (!inbound) throw new Error(`no SMTP listener for ${mail.to}`);
     await createTransport({ host: '127.0.0.1', port: inbound.port, secure: false, ignoreTLS: true }).sendMail(mail);

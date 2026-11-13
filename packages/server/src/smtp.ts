@@ -108,6 +108,8 @@ export interface OutgoingMail {
   to: string[];
   subject: string;
   text: string;
+  /** An html alternative: the message goes out as multipart/alternative. */
+  html?: string;
   headers: Record<string, string>;
   attachments: { filename: string; contentType: string; content: string }[];
 }
@@ -124,6 +126,7 @@ export class OutboundSmtp {
       from: mail.from,
       subject: mail.subject,
       text: mail.text,
+      ...(mail.html === undefined ? {} : { html: mail.html }),
       headers: mail.headers,
       attachments: mail.attachments.map((a) => ({ filename: a.filename, contentType: a.contentType, content: Buffer.from(a.content, 'base64') })),
     };

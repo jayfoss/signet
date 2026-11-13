@@ -10,6 +10,7 @@ export * from './encoding';
 export * from './enrollment';
 export * from './gmail';
 export * from './homes';
+export * from './html';
 export * from './policy';
 export * from './requester';
 export * from './identity';

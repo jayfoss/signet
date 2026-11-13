@@ -71,17 +71,17 @@ Table of Contents
    Status of This Memo ............................................... 1
    Copyright Notice .................................................. 1
    1.  Introduction .................................................. 5
-      1.1.  Goals .................................................... 5
+      1.1.  Goals .................................................... 6
       1.2.  Non-goals ................................................ 6
-      1.3.  Requirements Language .................................... 6
-      1.4.  Conventions .............................................. 6
+      1.3.  Requirements Language .................................... 7
+      1.4.  Conventions .............................................. 7
       1.5.  Terminology .............................................. 7
-   2.  Protocol Overview ............................................. 9
+   2.  Protocol Overview ............................................ 10
       2.1.  Accounts and Clients .................................... 10
       2.2.  Domains, Directory and Log .............................. 11
       2.3.  Three Tiers of Visibility ............................... 11
       2.4.  First Contact and Conversations ......................... 11
-      2.5.  Metadata Protection ..................................... 11
+      2.5.  Metadata Protection ..................................... 12
       2.6.  Components and Calls .................................... 12
       2.7.  Message Path ............................................ 13
    3.  Identities, Clients and the Account Log ...................... 14
@@ -90,184 +90,184 @@ Table of Contents
       3.3.  Identity Key ............................................ 15
       3.4.  Client Certificates ..................................... 15
       3.5.  Account Log ............................................. 20
-      3.6.  Identity Key Changes .................................... 23
-      3.7.  Replaying the Log ....................................... 24
-      3.8.  Following Key Changes ................................... 25
-      3.9.  Recovery ................................................ 26
-      3.10.  Publication ............................................ 28
-      3.11.  Client Requests to the Home Server ..................... 29
-      3.12.  Open Issues ............................................ 31
-   4.  Directory .................................................... 31
-      4.1.  Visibility Tiers ........................................ 31
-      4.2.  Domain Binding .......................................... 31
-      4.3.  Public Card ............................................. 32
-      4.4.  Contact View ............................................ 35
-      4.5.  Directory Entries ....................................... 37
-      4.6.  Domain Authentication ................................... 38
-      4.7.  Remote Lookup ........................................... 38
-      4.8.  Releasing the Contact View .............................. 39
-      4.9.  Lookups by Own Clients .................................. 39
-      4.10.  Limits ................................................. 40
-      4.11.  Unlisted Addresses ..................................... 40
-      4.12.  Open Issues ............................................ 42
-   5.  Key Transparency ............................................. 43
-      5.1.  Overview ................................................ 43
-      5.2.  VRF Index ............................................... 43
+      3.6.  Identity Key Changes .................................... 21
+      3.7.  Replaying the Log ....................................... 23
+      3.8.  Following Key Changes ................................... 24
+      3.9.  Recovery ................................................ 25
+      3.10.  Publication ............................................ 27
+      3.11.  Client Requests to the Home Server ..................... 28
+      3.12.  Open Issues ............................................ 29
+   4.  Directory .................................................... 29
+      4.1.  Visibility Tiers ........................................ 29
+      4.2.  Domain Binding .......................................... 30
+      4.3.  Public Card ............................................. 31
+      4.4.  Contact View ............................................ 33
+      4.5.  Directory Entries ....................................... 34
+      4.6.  Domain Authentication ................................... 35
+      4.7.  Remote Lookup ........................................... 36
+      4.8.  Releasing the Contact View .............................. 37
+      4.9.  Lookups by Own Clients .................................. 37
+      4.10.  Limits ................................................. 38
+      4.11.  Unlisted Addresses ..................................... 38
+      4.12.  Open Issues ............................................ 40
+   5.  Key Transparency ............................................. 40
+      5.1.  Overview ................................................ 40
+      5.2.  VRF Index ............................................... 41
 
 Foss                    Expires 15 May 2027                     [Page 2]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-      5.3.  Log Leaves .............................................. 43
-         5.3.1.  Domain Key Leaves ................................. 44
-      5.4.  Merkle Tree and Proofs .................................. 44
-      5.5.  Signed Tree Heads ....................................... 45
-         5.5.1.  Witnesses and Cosignatures ....................... 45
-         5.5.2.  Freshness ........................................ 45
-      5.6.  Log Service ............................................. 45
-      5.7.  Proxied Log Queries ..................................... 47
-      5.8.  Verifying a Lookup ...................................... 47
-      5.9.  Monitoring .............................................. 49
-      5.10.  Log Trust .............................................. 50
-      5.11.  Open Issues ............................................ 50
-   6.  Discovery .................................................... 50
-      6.1.  Overview ................................................ 50
-      6.2.  Domain Policy ........................................... 50
+      5.3.  Log Leaves .............................................. 41
+         5.3.1.  Domain Key Leaves .................................. 42
+      5.4.  Merkle Tree and Proofs .................................. 43
+      5.5.  Signed Tree Heads ....................................... 43
+         5.5.1.  Witnesses and Cosignatures ......................... 43
+         5.5.2.  Freshness .......................................... 44
+      5.6.  Log Service ............................................. 44
+      5.7.  Proxied Log Queries ..................................... 46
+      5.8.  Verifying a Lookup ...................................... 46
+      5.9.  Monitoring .............................................. 48
+      5.10.  Log Trust .............................................. 48
+      5.11.  Open Issues ............................................ 49
+   6.  Discovery .................................................... 49
+      6.1.  Overview ................................................ 49
+      6.2.  Domain Policy ........................................... 49
       6.3.  DNS Record .............................................. 51
-      6.4.  Fetching the Policy ..................................... 52
+      6.4.  Fetching the Policy ..................................... 51
       6.5.  Caching and Downgrade Resistance ........................ 52
       6.6.  Running Alongside Existing Mail ......................... 53
       6.7.  Open Issues ............................................. 53
-      6.8.  Clustered Homes ........................................ 53
-         6.8.1.  Overview .......................................... 53
-         6.8.2.  Replicas and Roles ................................ 53
-         6.8.3.  Policy and Discovery .............................. 54
-         6.8.4.  Choosing a Replica ................................. 54
-         6.8.5.  Replicated State .................................. 55
-         6.8.6.  Election and Replication .......................... 55
-         6.8.7.  Failure Behaviour ................................. 56
-         6.8.8.  Replica Recovery .................................. 57
-         6.8.9.  Security Considerations ........................... 57
-         6.8.10.  Open Issues ...................................... 57
-      6.9.  Multi-Operator Domains ................................ 58
-         6.9.1.  Overview .......................................... 58
-         6.9.2.  The Operators Statement ........................... 59
-         6.9.3.  Home Keys and Server Calls ........................ 60
-         6.9.4.  What the Domain Owner Keeps ....................... 60
-         6.9.5.  Delivery to Many Homes ............................ 61
-         6.9.6.  Reading and Registering ........................... 62
-         6.9.7.  Security Considerations and Open Issues ........... 62
-   7.  Requests and Admission ....................................... 53
-      7.1.  Overview ................................................ 53
-      7.2.  Request Body ............................................ 54
-      7.3.  Sealing ................................................. 55
-      7.4.  Sending ................................................. 57
-      7.5.  Opening and Verifying ................................... 57
-      7.6.  Introductions ........................................... 58
-      7.7.  Admission ............................................... 60
-      7.8.  Lookalike Domains ....................................... 60
-      7.9.  Shared Contacts ......................................... 61
-      7.10.  Errors ................................................. 61
-      7.11.  Requests Through a Domain Intake ....................... 62
-      7.12.  Open Issues ............................................ 63
-   8.  Threads and Messages ......................................... 63
-      8.1.  Overview ................................................ 63
-      8.2.  MLS Profile ............................................. 64
-      8.3.  Key Packages ............................................ 64
-      8.4.  Message Body ............................................ 65
-      8.5.  Starting a Thread ....................................... 68
-      8.6.  Welcomes ................................................ 68
-      8.7.  Sending and Receiving Messages .......................... 69
-      8.8.  Membership Changes ...................................... 70
-      8.9.  Attachments ............................................. 71
-      8.10.  Client State ........................................... 72
-      8.11.  Open Issues ............................................ 72
-   9.  Intents and Grants ........................................... 72
-      9.1.  Overview ................................................ 73
-      9.2.  Intent Format ........................................... 73
-      9.3.  Core Intents ............................................ 73
-      9.4.  Sender-Side Authority ................................... 77
-      9.5.  Receiver-Side Authority ................................. 77
-      9.6.  Grants .................................................. 78
-      9.7.  Errors .................................................. 80
-      9.8.  Open Issues ............................................. 80
-   10.  Delivery and Metadata Protection ............................ 81
-      10.1.  Overview ............................................... 81
-      10.2.  Submission ............................................. 82
+      6.8.  Clustered Homes ......................................... 54
+         6.8.1.  Overview ........................................... 54
+         6.8.2.  Replicas and Roles ................................. 54
+         6.8.3.  Policy and Discovery ............................... 55
+         6.8.4.  Choosing a Replica ................................. 55
+         6.8.5.  Replicated State ................................... 56
+         6.8.6.  Election and Replication ........................... 57
+         6.8.7.  Failure Behaviour .................................. 59
+         6.8.8.  Replica Recovery ................................... 59
+         6.8.9.  Security Considerations ............................ 59
+         6.8.10.  Open Issues ....................................... 60
+      6.9.  Multi-Operator Domains .................................. 60
+         6.9.1.  Overview ........................................... 60
+         6.9.2.  The Operators Statement ............................ 61
+         6.9.3.  Home Keys and Server Calls ......................... 62
+         6.9.4.  What the Domain Owner Keeps ........................ 63
+         6.9.5.  Delivery to Many Homes ............................. 64
+         6.9.6.  Reading and Registering ............................ 66
+         6.9.7.  Security Considerations and Open Issues ............ 66
+   7.  Requests and Admission ....................................... 67
+      7.1.  Overview ................................................ 67
+      7.2.  Request Body ............................................ 67
+      7.3.  Sealing ................................................. 69
+      7.4.  Sending ................................................. 70
+      7.5.  Opening and Verifying ................................... 71
+      7.6.  Introductions ........................................... 71
+      7.7.  Admission ............................................... 72
+      7.8.  Lookalike Domains ....................................... 73
+      7.9.  Shared Contacts ......................................... 74
+      7.10.  Errors ................................................. 75
+      7.11.  Requests Through a Domain Intake ....................... 76
+      7.12.  Open Issues ............................................ 76
+   8.  Threads and Messages ......................................... 77
+      8.1.  Overview ................................................ 77
 
 Foss                    Expires 15 May 2027                     [Page 3]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-      10.3.  Delivery Tokens ........................................ 84
-      10.4.  Oblivious HTTP ......................................... 85
-      10.5.  Anonymous Requests ..................................... 87
-      10.6.  Relaying and Retries ................................... 88
-      10.7.  Mailbox ................................................ 89
-      10.8.  Open Issues ............................................ 89
-   11.  Humans-only Mail and Escrow ................................. 90
-      11.1.  Principle .............................................. 90
-      11.2.  Humans-only Requests ................................... 90
-      11.3.  Audience Policy ........................................ 90
-      11.4.  Humans-only Threads .................................... 91
-      11.5.  Escrow ................................................. 91
-      11.6.  Humans-only Plain Email ................................ 92
-      11.7.  Open Issues ............................................ 92
-   12.  Live Sessions and Handoff ................................... 92
-      12.1.  Overview ............................................... 92
-      12.2.  Offering a Session ..................................... 93
-      12.3.  Session Token .......................................... 94
-      12.4.  Host Gateway ........................................... 94
-      12.5.  Joining and Ending ..................................... 95
-      12.6.  Handoff to a Human ..................................... 95
-      12.7.  Open Issues ............................................ 96
-   13.  Interoperability with Email ................................. 96
-      13.1.  Overview ............................................... 96
-      13.2.  Outbound Plain Email ................................... 96
-      13.3.  Inbound Plain Email .................................... 98
-      13.4.  Reading Plain Email .................................... 99
-      13.5.  Checking a Signet Header .............................. 100
-      13.6.  Gmail Mode ............................................ 100
-      13.7.  Choosing Between Signet and Email ..................... 101
-      13.8.  Outbound Transport .................................... 101
-      13.9.  Open Issues ........................................... 101
-   14.  Security Considerations .................................... 101
-      14.1.  Threat Model .......................................... 101
-      14.2.  What a Home Server Can and Cannot Do .................. 102
-      14.3.  Trust on First Use .................................... 102
-      14.4.  Identity Key Loss and Compromise ...................... 102
-      14.5.  Client Compromise and Revocation ...................... 103
-      14.6.  Transparency Log ...................................... 103
-      14.7.  Signatures and Canonicalization ....................... 104
-      14.8.  Replay ................................................ 104
-      14.9.  Agents and Authority .................................. 104
-      14.10.  Spoofing ............................................. 105
-      14.11.  Denial of Service .................................... 105
-      14.12.  Implementation Status ................................ 105
-   15.  Privacy Considerations ..................................... 105
-      15.1.  What Each Party Learns ................................ 105
-      15.2.  Directory Enumeration ................................. 107
-      15.3.  What the Card Reveals ................................. 107
-      15.4.  Requester Hashes ...................................... 107
-      15.5.  Metadata That Still Shows ............................. 107
-      15.6.  Contacts and Labels ................................... 108
-      15.7.  Escrow ................................................ 108
-      15.8.  Retention ............................................. 108
+      8.2.  MLS Profile ............................................. 77
+      8.3.  Key Packages ............................................ 78
+      8.4.  Message Body ............................................ 79
+      8.5.  Starting a Thread ....................................... 81
+      8.6.  Welcomes ................................................ 81
+      8.7.  Sending and Receiving Messages .......................... 82
+      8.8.  Membership Changes ...................................... 83
+      8.9.  Attachments ............................................. 85
+      8.10.  Client State ........................................... 86
+      8.11.  Open Issues ............................................ 86
+   9.  Intents and Grants ........................................... 86
+      9.1.  Overview ................................................ 86
+      9.2.  Intent Format ........................................... 87
+      9.3.  Core Intents ............................................ 87
+      9.4.  Sender-Side Authority ................................... 90
+      9.5.  Receiver-Side Authority ................................. 91
+      9.6.  Grants .................................................. 91
+      9.7.  Errors .................................................. 93
+      9.8.  Open Issues ............................................. 94
+   10.  Delivery and Metadata Protection ............................ 94
+      10.1.  Overview ............................................... 94
+      10.2.  Submission ............................................. 95
+      10.3.  Delivery Tokens ........................................ 97
+      10.4.  Oblivious HTTP ......................................... 98
+      10.5.  Anonymous Requests ..................................... 99
+      10.6.  Relaying and Retries .................................. 101
+      10.7.  Mailbox ............................................... 101
+      10.8.  Open Issues ........................................... 102
+   11.  Humans-only Mail and Escrow ................................ 103
+      11.1.  Principle ............................................. 103
+      11.2.  Humans-only Requests .................................. 103
+      11.3.  Audience Policy ....................................... 103
+      11.4.  Humans-only Threads ................................... 104
+      11.5.  Escrow ................................................ 104
+      11.6.  Humans-only Plain Email ............................... 105
+      11.7.  Open Issues ........................................... 105
+   12.  Live Sessions and Handoff .................................. 106
+      12.1.  Overview .............................................. 106
+      12.2.  Offering a Session .................................... 106
+      12.3.  Session Token ......................................... 107
+      12.4.  Host Gateway .......................................... 107
+      12.5.  Joining and Ending .................................... 108
+      12.6.  Handoff to a Human .................................... 108
+      12.7.  Open Issues ........................................... 109
+   13.  Interoperability with Email ................................ 109
+      13.1.  Overview .............................................. 109
+      13.2.  Outbound Plain Email .................................. 110
+      13.3.  Inbound Plain Email ................................... 111
+      13.4.  Reading Plain Email ................................... 112
+      13.5.  Checking a Signet Header .............................. 113
+      13.6.  Gmail Mode ............................................ 113
+      13.7.  Choosing Between Signet and Email ..................... 114
+      13.8.  Outbound Transport .................................... 114
+      13.9.  Open Issues ........................................... 114
 
 Foss                    Expires 15 May 2027                     [Page 4]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-   16.  IANA Considerations ........................................ 108
-      16.1.  Well-Known URI ........................................ 108
-      16.2.  Underscored DNS Node Name ............................. 108
-      16.3.  Message Header Fields ................................. 109
-      16.4.  Signet Intent Names ................................... 109
-      16.5.  Values Used Without Registration ...................... 109
-   17.  References ................................................. 109
-      17.1.  Normative References .................................. 109
-      17.2.  Informative References ................................ 111
-   Author's Address ................................................ 111
+   14.  Security Considerations .................................... 114
+      14.1.  Threat Model .......................................... 114
+      14.2.  What a Home Server Can and Cannot Do .................. 115
+      14.3.  Trust on First Use .................................... 115
+      14.4.  Identity Key Loss and Compromise ...................... 115
+      14.5.  Client Compromise and Revocation ...................... 116
+      14.6.  Transparency Log ...................................... 116
+      14.7.  Signatures and Canonicalization ....................... 116
+      14.8.  Replay ................................................ 117
+      14.9.  Agents and Authority .................................. 117
+      14.10.  Spoofing ............................................. 118
+      14.11.  Denial of Service .................................... 118
+      14.12.  Implementation Status ................................ 118
+   15.  Privacy Considerations ..................................... 118
+      15.1.  What Each Party Learns ................................ 118
+      15.2.  Directory Enumeration ................................. 119
+      15.3.  What the Card Reveals ................................. 120
+      15.4.  Requester Hashes ...................................... 120
+      15.5.  Metadata That Still Shows ............................. 120
+      15.6.  Contacts and Labels ................................... 120
+      15.7.  Escrow ................................................ 121
+      15.8.  Retention ............................................. 121
+   16.  IANA Considerations ........................................ 121
+      16.1.  Well-Known URI ........................................ 121
+      16.2.  Underscored DNS Node Name ............................. 121
+      16.3.  Message Header Fields ................................. 121
+      16.4.  Signet Intent Names ................................... 122
+      16.5.  Values Used Without Registration ...................... 122
+   17.  References ................................................. 122
+      17.1.  Normative References .................................. 122
+      17.2.  Informative References ................................ 124
+   Author's Address ................................................ 124
 
 1.  Introduction
 
@@ -288,6 +288,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    happen in end-to-end encrypted groups. Messages can carry structured
    intents, and an agent's authority to make them is stated in signed
    grants that only the counterparty sees.
+
+
+Foss                    Expires 15 May 2027                     [Page 5]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 1.1.  Goals
 
@@ -312,11 +317,6 @@ Experimental           Signet Protocol, Version 0          November 2026
        recipient's own clients, not its server, decide who is admitted.
 
    5.  Treat agents as first-class, bounded clients. Agents have their
-
-Foss                    Expires 15 May 2027                     [Page 5]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
        own keys and certificates. What they may do is set by private
        scopes and limits, and by per-counterparty grants that the
        counterparty can verify.
@@ -349,6 +349,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  Hide all metadata. Servers still see thread-epoch linkage, timing
       and sizes (Section 15).
 
+Foss                    Expires 15 May 2027                     [Page 6]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    *  Replace the transport, storage or user interface of any mail
       system.
 
@@ -370,12 +374,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  Public keys are raw keys in b64u: 32 bytes for Ed25519 [RFC8032]
       and X25519 [RFC7748].
-
-
-Foss                    Expires 15 May 2027                     [Page 6]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  A hash written as a string has the form sha256: followed by the
       b64u SHA-256 digest of the input.
 
@@ -408,6 +406,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                    | owner of an identity key. Addresses are      |
    |                    | compared after lowercasing the local part    |
    |                    | and the domain.                              |
+
+Foss                    Expires 15 May 2027                     [Page 7]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    +--------------------+----------------------------------------------+
    | Identity key       | An Ed25519 key that signs the principal's    |
    |                    | account log, public card, contact view and   |
@@ -430,11 +433,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                    | owner.                                       |
    +--------------------+----------------------------------------------+
    | Agent              | A software client that acts for the owner    |
-
-Foss                    Expires 15 May 2027                     [Page 7]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    |                    | within scopes and limits. Also called an     |
    |                    | assistant.                                   |
    +--------------------+----------------------------------------------+
@@ -467,6 +465,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | Home server        | The Signet server for a domain. A client     |
    |                    | talks only to its own home server.           |
    +--------------------+----------------------------------------------+
+
+Foss                    Expires 15 May 2027                     [Page 8]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | Transparency log   | An append-only Merkle tree [RFC9162] of      |
    |                    | directory changes, run by a log operator.    |
    +--------------------+----------------------------------------------+
@@ -489,11 +492,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------------------+----------------------------------------------+
    | Intent             | A typed, machine-readable action carried in  |
    |                    | a request or message, such as                |
-
-Foss                    Expires 15 May 2027                     [Page 8]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    |                    | schedule.propose.                            |
    +--------------------+----------------------------------------------+
    | Scope              | A string in a client certificate that limits |
@@ -526,6 +524,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                    | tokens.                                      |
    +--------------------+----------------------------------------------+
    | Live session       | An Agent2Agent (A2A) session that two agents |
+
+Foss                    Expires 15 May 2027                     [Page 9]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                    | in a thread use for fast exchanges.          |
    +--------------------+----------------------------------------------+
    | Legacy mail        | Plain Internet mail [RFC5322] sent over SMTP |
@@ -535,24 +538,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 2.  Protocol Overview
 
    This section is informative. Sections 3 to 13 are normative.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                     [Page 9]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
     +------------------+                         +------------------+
     | Alice's clients  |                         | Bob's clients    |
     | device, agent,   |                         | device, agent,   |
@@ -598,6 +583,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A Signet account is an address, such as alice@example.com, and an
    identity key. The identity key signs an account log. The log lists
+
+Foss                    Expires 15 May 2027                    [Page 10]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    the account's clients. Each client has its own Ed25519 signing key
    and X25519 agreement key, a kind (device, agent, tool or org-escrow),
    private scopes and limits, and an expiry. The identity key signs only
@@ -606,12 +596,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    The identity key can be rotated, and it can be replaced once through
    a recovery key if it is lost (Section 3.6).
-
-
-Foss                    Expires 15 May 2027                    [Page 10]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 2.2.  Domains, Directory and Log
 
    A domain announces Signet support with a _signet TXT record and
@@ -658,6 +642,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    inside it are signed JSON bodies carried as MLS application messages.
    Clients join a group, and apply a commit, only after checking every
    member against its owner's contact view as recorded in the
+
+Foss                    Expires 15 May 2027                    [Page 11]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    transparency log.
 
 2.5.  Metadata Protection
@@ -666,11 +655,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    lookups, key-package claims and log queries on the client's behalf,
    signed as its domain, and names the requester only by a hash. Thread
    traffic carries no sender: the recipient's server accepts it on a
-
-Foss                    Expires 15 May 2027                    [Page 11]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    delivery token derived from the MLS exporter. First-contact requests
    can be anonymous with a Privacy Pass token. Sealed and anonymous
    deliveries can be sent through an Oblivious HTTP relay.
@@ -717,19 +701,17 @@ Experimental           Signet Protocol, Version 0          November 2026
 
       *  → Privacy Pass issuer, signed as its domain: POST /v0/issue.
 
+
+Foss                    Expires 15 May 2027                    [Page 12]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       *  → SMTP: outbound relay or recipient MX; inbound SMTP listener.
 
       *  → resolver, to fetch other domains' policies and domain keys.
 
    *  *Transparency log* → resolver, to fetch the domain key that signed
       an append or query.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 12]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  *Privacy Pass issuer* → resolver, to fetch the domain key of the
       attesting home server.
 
@@ -778,17 +760,17 @@ Experimental           Signet Protocol, Version 0          November 2026
         forwards it to the issuer, signed as example.com. Alice's client
         unblinds the signature.
 
+
+Foss                    Expires 15 May 2027                    [Page 13]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    7.   Alice's client builds the request, signs it with its client key,
         checks the 8192-byte limit, and seals one copy to each request
         key on Bob's card with HPKE.
 
    8.   Alice's client submits it (POST /v0/submit) with the Privacy
         Pass token and no sender. Alice's server encapsulates POST
-
-Foss                    Expires 15 May 2027                    [Page 13]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
         /v0/deliver-anonymous with Bob's OHTTP key and sends it through
         the relay. The relay forwards it to Bob's gateway.
 
@@ -838,16 +820,13 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  key links of type rotate and set-recovery (Section 3.6);
 
-   *  the public card and the contact view (Sections 4.3 and 4.4);
-
-   *  grants (Section 9.6).
-
-
-
 Foss                    Expires 15 May 2027                    [Page 14]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
+   *  the public card and the contact view (Sections 4.3 and 4.4);
+
+   *  grants (Section 9.6).
    The recovery key MUST be used to sign only recover key links, the log
    entries that carry them, and recovery proofs (Section 3.9).
 
@@ -896,19 +875,13 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A client is any key holder the identity key has approved. Each client
    has a client certificate, carried in an add-client log entry.
-
-
-
-
-
-
+      {
+        "v": 0,
 
 Foss                    Expires 15 May 2027                    [Page 15]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-      {
-        "v": 0,
         "principal": "alice@example.com",
         "clientId": "c_9f3kQm2vTq1xYb0aLcd8",
         "kind": "agent",
@@ -960,15 +933,14 @@ Experimental           Signet Protocol, Version 0          November 2026
    +-----------+----------+----------+---------------------------------+
    | expires   | string   | yes      | End of validity.                |
    +-----------+----------+----------+---------------------------------+
+3.4.1.  Client Kinds
 
+   +============+=====================+===============+================+
 
 Foss                    Expires 15 May 2027                    [Page 16]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-3.4.1.  Client Kinds
-
-   +============+=====================+===============+================+
    | Kind       | Meaning             | Shown to      | Default        |
    |            |                     | contacts as   | lifetime       |
    +============+=====================+===============+================+
@@ -1004,27 +976,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    intent:schedule.* covers intent:schedule.propose.
 
    Version 0 defines these scopes:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 17]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=============+=====================================================+
    | Scope       | Meaning                                             |
    +=============+=====================================================+
@@ -1044,6 +995,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    +-------------+-----------------------------------------------------+
 
    Devices are not limited by intent: scopes. All clients, devices
+
+Foss                    Expires 15 May 2027                    [Page 17]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    included, need send to submit and read:* to read.
 
 3.4.3.  Active Clients
@@ -1064,26 +1020,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    A client's private keys MUST be generated on that client and MUST NOT
    leave it (Section 3.3). The client gets its certificate by sending an
    enrollment request to the holder of the identity key:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 18]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       {
         "body": {
           "v": 0,
@@ -1119,6 +1055,10 @@ Experimental           Signet Protocol, Version 0          November 2026
        request's clientId, sigKey and agreeKey, and publish (Section
        3.10).
 
+Foss                    Expires 15 May 2027                    [Page 18]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    The fingerprint is computed over the SHA-256 digest of the canonical
    JSON of body: each of its first 16 bytes, reduced modulo 32, picks a
    character of the Crockford base32 alphabet, written in four groups of
@@ -1138,11 +1078,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    server never sees.
 
    1.  A device of the account opens a slot with POST /v0/pairing
-
-Foss                    Expires 15 May 2027                    [Page 19]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
        (client-authenticated; device clients only). The server returns
        the slot and an expiry 10 minutes later, and the device shows the
        code.
@@ -1176,6 +1111,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    messages and ciphertext, it can neither learn the code nor substitute
    keys, and an attacker gets one guess at a 40-bit secret per slot.
 
+
+Foss                    Expires 15 May 2027                    [Page 19]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
 3.5.  Account Log
 
    The account log is an ordered list of entries. Each entry is signed
@@ -1189,19 +1129,6 @@ Experimental           Signet Protocol, Version 0          November 2026
           "clientId": "c_9f3kQm2vTq1xYb0aLcd8" },
         "sig": "q3fN…"
       }
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 20]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=======+================+==========+===============================+
    | Field | Type           | Required | Meaning                       |
    +=======+================+==========+===============================+
@@ -1232,35 +1159,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    rely on ts for ordering; seq and prev define the order.
 
 3.5.1.  Entry Bodies
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 21]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=====================+==========================+==================+
    | type                | Other fields             | Effect           |
    +=====================+==========================+==================+
@@ -1272,6 +1170,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                     |                          | MUST be entry 0  |
    |                     |                          | and MUST NOT     |
    |                     |                          | appear           |
+
+Foss                    Expires 15 May 2027                    [Page 20]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                     |                          | elsewhere.       |
    +---------------------+--------------------------+------------------+
    | key-change          | change (SignedKeyLink)   | Changes the      |
@@ -1312,14 +1215,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    An Intake object has clientId (string), intents (string[]) and
    exclusive (boolean).
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 22]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 3.6.  Identity Key Changes
 
    An identity key change is stated as a key link, signed separately
@@ -1334,6 +1229,11 @@ Experimental           Signet Protocol, Version 0          November 2026
           "to": "Qm1xY2t0b2tlbi10by1rZXktZXhhbXBsZS0wMg",
           "ts": "2026-11-11T09:30:00.000Z"
         },
+
+Foss                    Expires 15 May 2027                    [Page 21]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
         "sig": "Lx7v…"
       }
 
@@ -1374,11 +1274,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       it are signed by to.
 
    *  *set-recovery*: names a recovery key, replacing any earlier one.
-
-Foss                    Expires 15 May 2027                    [Page 23]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       sig MUST be made by the current identity key, as MUST the log
       entry. The private recovery key SHOULD be stored offline. The
       reference implementation returns it to the caller and does not
@@ -1393,6 +1288,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    A key link applies to a state (principal, identityKey, recoveryKey)
    as follows. Any failed check is an error, and the whole log or chain
    is rejected.
+
+Foss                    Expires 15 May 2027                    [Page 22]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    1.  If link.principal is not the state's principal, or link.from is
        not the state's identity key, fail ("changes a key that isn't
@@ -1433,11 +1332,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A verifier replays a log to check it and to compute its state. The
    state has: principal, identity key, head, clients (by id), revoked
-
-Foss                    Expires 15 May 2027                    [Page 24]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    client ids, intake, revoked grant ids, agents that read humans-only
    mail, key chain and recovery key.
 
@@ -1451,6 +1345,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
        1.  If entry.seq != i or entry.prev != prev, fail ("out of
            order").
+
+
+Foss                    Expires 15 May 2027                    [Page 23]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
        2.  If the body is a key-change whose link type is recover, the
            signer is the current recovery key. Otherwise the signer is
@@ -1491,12 +1390,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    The key history of a card is computed from card.principal,
    card.keyChain (empty if absent) and card.identityKey:
-
-
-Foss                    Expires 15 May 2027                    [Page 25]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    1.  Start a state with the principal, the identity key equal to
        keyChain[0].link.from (or card.identityKey if the chain is
        empty), and no recovery key. Start the key list with that key.
@@ -1511,6 +1404,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    A card whose key history fails MUST be rejected.
 
    Given a key history and a pinned key P:
+
+
+Foss                    Expires 15 May 2027                    [Page 24]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    *  If P is not in the key list, the change is not explained by the
       chain. The client MUST treat it as an identity change (Section
@@ -1547,15 +1445,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    Recovery is for an owner who has lost the identity key, and possibly
    every device, but holds the recovery key.
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 26]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 3.9.1.  Recovery Proof
 
    To obtain the stored log, the owner proves possession of the recovery
@@ -1575,6 +1464,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    server:
 
    1.  finds the account for {local} (lowercased);
+
+Foss                    Expires 15 May 2027                    [Page 25]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    2.  replays the stored log;
 
@@ -1609,12 +1502,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    5.  The owner signs a new card and contact view with the new identity
        key and publishes them (Section 3.10.2).
-
-
-Foss                    Expires 15 May 2027                    [Page 27]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    After recovery:
 
    *  Existing client certificates remain. The owner SHOULD review them
@@ -1631,6 +1518,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    thief rotates the key before the owner recovers, recovery still works
    as long as the thief has not also replaced the recovery key, because
    recover applies to whatever identity key is current.
+
+
+Foss                    Expires 15 May 2027                    [Page 26]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 3.10.  Publication
 
@@ -1667,13 +1559,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       Content-Type: application/json
 
       <Publication>
-
-
-
-Foss                    Expires 15 May 2027                    [Page 28]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    The route needs no client authentication: everything in it is signed.
    The home server:
 
@@ -1693,6 +1578,11 @@ Experimental           Signet Protocol, Version 0          November 2026
        returns 502 and stores nothing;
 
    6.  if the replayed identity key differs from the bound key, makes a
+
+Foss                    Expires 15 May 2027                    [Page 27]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        new domain binding for the new key (Section 4.2);
 
    7.  stores the log, card and view.
@@ -1723,16 +1613,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A client authenticates every call to its own home server with four
    headers:
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 29]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +==================+================================================+
    | Header           | Value                                          |
    +==================+================================================+
@@ -1757,6 +1637,11 @@ Experimental           Signet Protocol, Version 0          November 2026
         "method": "POST",
         "path": "/v0/submit",
         "ts": "2026-11-11T09:30:00.000Z",
+
+Foss                    Expires 15 May 2027                    [Page 28]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
         "body": "sha256:47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
       }
 
@@ -1785,13 +1670,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    arrive up to 5 minutes early or late) and refuses a repeat. It checks
    this only after the signature verifies, so nobody can fill the cache
    with junk.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 30]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    The server MUST replay the stored log for each authentication, or
    keep a replayed state that it updates when the log changes, so that a
    revoked or expired client is refused at once.
@@ -1818,6 +1696,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | Public card  | Anyone who looks the    | Identity key, log head,  |
    |              | address up              | request keys, human      |
    |              |                         | keys, intake agent, key  |
+
+Foss                    Expires 15 May 2027                    [Page 29]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |              |                         | chain. No labels, scopes |
    |              |                         | or limits, and no client |
    |              |                         | ids except the intake's. |
@@ -1844,13 +1727,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    The domain binding is the domain's statement that an address belongs
    to an identity key.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 31]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       {
         "principal": "alice@example.com",
         "identityKey": "Qm1xY2t0b2tlbi10by1rZXktZXhhbXBsZS0wMg",
@@ -1878,38 +1754,12 @@ Experimental           Signet Protocol, Version 0          November 2026
    by the identity key. Every binding change is recorded in the
    transparency log (Section 5).
 
-4.3.  Public Card
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 32]
+Foss                    Expires 15 May 2027                    [Page 30]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
+4.3.  Public Card
       {
         "card": {
           "v": 0,
@@ -1938,37 +1788,6 @@ Experimental           Signet Protocol, Version 0          November 2026
         },
         "sig": "kP2q…"
       }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 33]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=============+=================+==========+========================+
    | Field       | Type            | Required | Meaning                |
    +=============+=================+==========+========================+
@@ -1994,6 +1813,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |                 |          | (Section 11.2).        |
    +-------------+-----------------+----------+------------------------+
    | intake      | object          | no       | The intake agent:      |
+
+Foss                    Expires 15 May 2027                    [Page 31]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |             |                 |          | clientId, agreeKey,    |
    |             |                 |          | and the intents it     |
    |             |                 |          | answers for strangers. |
@@ -2027,11 +1851,6 @@ Experimental           Signet Protocol, Version 0          November 2026
        the front set is [intakeCert]. Otherwise the front set is every
        active client whose scopes cover admit, plus intakeCert if it
        exists.
-
-Foss                    Expires 15 May 2027                    [Page 34]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    4.  requestKeys lists the front set, followed by every active
        org-escrow client not already in it. Each escrow client's entry
        has escrow: true, including one that is also in the front set.
@@ -2051,6 +1870,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    card.identityKey equal the expected values, the signature verifies
    with that identity key, and the card's key history (Section 3.8) ends
    at card.identityKey.
+
+
+Foss                    Expires 15 May 2027                    [Page 32]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 4.3.1.  Intake Agent
 
@@ -2086,12 +1910,6 @@ Experimental           Signet Protocol, Version 0          November 2026
         },
         "sig": "Uu1w…"
       }
-
-
-Foss                    Expires 15 May 2027                    [Page 35]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +===============+==============+==========+=========================+
    | Field         | Type         | Required | Meaning                 |
    +===============+==============+==========+=========================+
@@ -2112,6 +1930,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | revokedGrants | string[]     | yes      | Ids of every revoked    |
    |               |              |          | grant.                  |
    +---------------+--------------+----------+-------------------------+
+
+Foss                    Expires 15 May 2027                    [Page 33]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | sig (outer)   | string       | yes      | Identity key signature  |
    |               |              |          | over view.              |
    +---------------+--------------+----------+-------------------------+
@@ -2146,11 +1969,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    object.
 
    A verifier MUST reject a view unless view.principal and
-
-Foss                    Expires 15 May 2027                    [Page 36]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    view.identityKey equal the expected values and the signature
    verifies. A member whose expires has passed MUST be treated as
    absent.
@@ -2170,6 +1988,11 @@ Experimental           Signet Protocol, Version 0          November 2026
         "vrf": { "index": "b64u 64-byte VRF output",
           "proof": "b64u 80-byte VRF proof" }
       }
+
+
+Foss                    Expires 15 May 2027                    [Page 34]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    +===========+===============+==========+============================+
    | Field     | Type          | Required | Meaning                    |
@@ -2205,11 +2028,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       }
 
    sig is the domain key's signature over {status, principal, ts}. A
-
-Foss                    Expires 15 May 2027                    [Page 37]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    server MUST return a not-enrolled entry, with a valid VRF proof, for
    an address that was never enrolled, for one that was unenrolled, and
    for a local part that does not exist. These cases MUST be
@@ -2230,6 +2048,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    +---------------+---------------------------------------------------+
    | signet-sig    | The domain key's signature over the object below. |
    +---------------+---------------------------------------------------+
+
+Foss                    Expires 15 May 2027                    [Page 35]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | signet-nonce  | 16 random bytes, b64u, fresh for every call.      |
    |               | Covered by the signature as the nonce field of    |
    |               | the signed object.                                |
@@ -2264,13 +2087,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    made, as a requester hash:
 
       requesterHash(address) = sha256("{domain}|{local}@{domain}")
-
-
-
-Foss                    Expires 15 May 2027                    [Page 38]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    where the address is lowercased and the hash is computed over the
    UTF-8 string and written in sha256: form. The hash is the same at
    every address, so a server can limit one user's lookups. Calls
@@ -2291,6 +2107,11 @@ Experimental           Signet Protocol, Version 0          November 2026
        calling domain is scanning (step 6).
 
    2.  Choose counters: for an authenticated call, one per calling
+
+Foss                    Expires 15 May 2027                    [Page 36]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        domain and one per (domain, requester); for an anonymous call,
        one per source IP address. If any counter has reached its daily
        limit (Section 4.10), refuse with 429.
@@ -2341,14 +2162,14 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    1.  If the address is on its own domain: for the client's own
        address, returns the entry at owner level (with view and log);
-
-Foss                    Expires 15 May 2027                    [Page 39]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
        otherwise returns the entry at contact level if colleagues may
        see views (the default) or the owner released the view to the
        client's requester hash, else at public level.
+
+
+Foss                    Expires 15 May 2027                    [Page 37]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    2.  Otherwise resolves the address's domain (Section 6), calls that
        domain's GET /v0/directory/{local} with domain authentication and
@@ -2399,17 +2220,16 @@ Experimental           Signet Protocol, Version 0          November 2026
    *Domain intake.* A domain that runs an intake publishes its HPKE key
    in the policy (Section 6.2). keyId is computed as for a request key
    (Section 4.3). The home server holds the private key.
-
-
-Foss                    Expires 15 May 2027                    [Page 40]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       "intake": { "keyId": "sha256:…",
         "agreeKey": "<X25519 public key, b64u>" }
 
    *Opting out.* A principal becomes unlisted with a set-listing log
    entry (Section 3), and lists itself again with "unlisted": false. A
+
+Foss                    Expires 15 May 2027                    [Page 38]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    home server whose domain has no intake MUST reject a publication
    whose log leaves the principal unlisted, with HTTP 409.
 
@@ -2459,16 +2279,16 @@ Experimental           Signet Protocol, Version 0          November 2026
    1.  *Cross-check.* A client that receives an unlisted entry through
        its home server MUST repeat the lookup anonymously: GET
        /v0/directory/{local}, unsigned, through an Oblivious HTTP relay
-
-Foss                    Expires 15 May 2027                    [Page 41]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
        when it has one (the gateway answers these lookups with the
        public entry, on the same per-source budget as any unsigned
        lookup). If the anonymous answer is an enrolled entry, the client
        MUST verify it as usual, use it instead of the intake, and report
        the inconsistency to the person. If it is a not-enrolled answer,
+
+Foss                    Expires 15 May 2027                    [Page 39]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        the client MUST NOT send through the intake.
 
    2.  *Owner check.* A principal's own clients SHOULD make the same
@@ -2523,6 +2343,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    Every change to a directory entry is appended to a transparency log:
    an append-only Merkle tree with the hashing and proofs of Section 2.1
+
+Foss                    Expires 15 May 2027                    [Page 40]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    of [RFC9162]. Each leaf commits to an address's identity key, card
    hash and view hash at the time of the change. Leaves are filed under
    the address's VRF index, so the log does not reveal which addresses
@@ -2562,18 +2387,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    checked against the test vectors of [RFC9381].
 
 5.3.  Log Leaves
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 43]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       {
         "v": 0,
         "index": "b64u VRF output",
@@ -2589,6 +2402,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | Field       | Type           | Required | Meaning                 |
    +=============+================+==========+=========================+
    | v           | number         | yes      | MUST be 0.              |
+
+Foss                    Expires 15 May 2027                    [Page 41]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    +-------------+----------------+----------+-------------------------+
    | index       | string         | yes      | The address's VRF       |
    |             |                |          | index.                  |
@@ -2643,17 +2461,17 @@ Experimental           Signet Protocol, Version 0          November 2026
    domain from the domain-authenticated caller, and MUST refuse a later
    one whose domainKey differs unless the append carries a rotation
    object that Section 6.5 would accept, naming the previous logged
+
+Foss                    Expires 15 May 2027                    [Page 42]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    key. Other rules for leaves (Section 5.3) apply.
 
 5.4.  Merkle Tree and Proofs
 
    The tree, inclusion proofs and consistency proofs follow Section 2.1
    of [RFC9162] with SHA-256:
-
-Foss                    Expires 15 May 2027                    [Page 44]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  The root of an empty tree is SHA-256("").
 
    *  An interior node is SHA-256(0x01 || left || right).
@@ -2702,6 +2520,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    A witness is an independent party that checks that a log only ever
    appends. It holds an Ed25519 key and, for each log it watches, the
    last head it signed. A cosignature is
+
+Foss                    Expires 15 May 2027                    [Page 43]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    {"witness": "b64u key", "sig": "b64u"}, where sig is the witness's
    signature over UTF-8(JCS({"type": "tree-head-cosign", "log": L,
    "size": size, "root": root, "ts": ts})) and L is the log's public
@@ -2746,11 +2569,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    | GET /v0/tree-head                  | None           | The current |
    |                                    |                | signed tree |
    |                                    |                | head.       |
-
-Foss                    Expires 15 May 2027                    [Page 45]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +------------------------------------+----------------+-------------+
    | GET /v0/latest?key={index}         | Domain, or     | {leaf,      |
    |                                    | per-IP budget  | proof,      |
@@ -2761,6 +2579,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                                    |                | inclusion   |
    |                                    |                | proof in    |
    |                                    |                | the tree of |
+
+Foss                    Expires 15 May 2027                    [Page 44]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                                    |                | size        |
    |                                    |                | head.size,  |
    |                                    |                | and the     |
@@ -2805,11 +2628,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    On POST /v0/append, the log MUST authenticate the calling domain
    (Section 4.6) and MUST refuse with 403 a leaf whose v is not 0 or
    whose domain is not the calling domain. The reference log limits
-
-Foss                    Expires 15 May 2027                    [Page 46]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    request bodies to 64 KiB.
 
    The log MUST file leaves by (domain, index), so that one domain
@@ -2820,6 +2638,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    Per-address queries (latest and history) are counted per day. A
    domain-authenticated query counts against the calling domain
    (reference default 50000) and against (domain, requester) (reference
+
+Foss                    Expires 15 May 2027                    [Page 45]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    default 1000). Any other query counts against the source IP address
    (reference default 20). A query over budget is refused with 429. Tree
    heads and consistency proofs are not limited.
@@ -2864,11 +2687,6 @@ Experimental           Signet Protocol, Version 0          November 2026
             (Section 5.2), giving the index.
 
         2.  Fetch the latest leaf at the index and verify it (step 7).
-
-Foss                    Expires 15 May 2027                    [Page 47]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
         3.  If the latest leaf is bound, fail: the log says the address
             is enrolled.
 
@@ -2879,6 +2697,10 @@ Experimental           Signet Protocol, Version 0          November 2026
         5.  Return "not enrolled".
 
    5.   Otherwise verify the entry:
+
+Foss                    Expires 15 May 2027                    [Page 46]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
         1.  The principal's domain is D.
 
@@ -2925,11 +2747,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    10.  Pin binding.identityKey for A.
 
    11.  Remember the leaf's viewHash as the address's current view hash.
-
-Foss                    Expires 15 May 2027                    [Page 48]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
         If no view was returned, a view the address presented earlier
         (in a request or introduction) MAY be used while its hash equals
         this value.
@@ -2937,6 +2754,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    An identity change MUST stop the client from sending to or accepting
    messages from the address until a person confirms the change. The
    reference client raises IdentityChangedError.
+
+
+Foss                    Expires 15 May 2027                    [Page 47]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    A client MUST also check that the leaf's domain equals D.
 
@@ -2982,12 +2804,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    5.  Report every active client in the contact view that this client
        has not seen before, with its kind and label, so the owner can
        confirm it.
-
-
-Foss                    Expires 15 May 2027                    [Page 49]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 5.10.  Log Trust
 
    A client is configured with a set of trusted logs, each a URL and an
@@ -2998,6 +2814,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    freshness bound (Section 5.5.2) limits how long that can last, and
    witnesses (Section 5.5.1) stop it showing different clients
    different histories.
+
+Foss                    Expires 15 May 2027                    [Page 48]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 5.11.  Open Issues
 
@@ -3040,22 +2860,6 @@ Experimental           Signet Protocol, Version 0          November 2026
           "keys": "b64u key configuration" },
         "privacyPass": { "issuer": "issuer.example.org" }
       }
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 50]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=============+========+==========+=================================+
    | Field       | Type   | Required | Meaning                         |
    +=============+========+==========+=================================+
@@ -3068,6 +2872,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | server      | string | yes      | Base URL of the domain's home   |
    |             |        |          | server. All home-server routes  |
    |             |        |          | in this document are relative   |
+
+Foss                    Expires 15 May 2027                    [Page 49]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |             |        |          | to it.                          |
    +-------------+--------+----------+---------------------------------+
    | replicas    | array  | no       | Base URLs of the home's         |
@@ -3123,6 +2932,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |        |          | be unlisted (Section 4.11).     |
    +-------------+--------+----------+---------------------------------+
 
+Foss                    Expires 15 May 2027                    [Page 50]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    A policy is not signed. Its authenticity rests on the DNS record and
    on the HTTPS connection to the policy host.
 
@@ -3131,11 +2944,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    A domain announces Signet with a TXT record at _signet.<domain>:
 
       _signet.example.net.  IN TXT  "v=signet0; host=signet.example.net"
-
-Foss                    Expires 15 May 2027                    [Page 51]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    A client parses the TXT records as follows:
 
    1.  Join the character-strings of each TXT record into one string.
@@ -3182,6 +2990,10 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    3.  The first host that succeeds gives the policy.
 
+Foss                    Expires 15 May 2027                    [Page 51]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    4.  If every host fails, the domain does not support Signet.
 
    A home server MUST serve its policy at GET /.well-known/signet.json.
@@ -3215,11 +3027,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    valid policy) and the client holds a cached policy for the domain
    that has not expired and has mode equal to enforce, the client MUST
    use the cached policy. This stops an attacker who can block DNS or
-
-Foss                    Expires 15 May 2027                    [Page 52]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    HTTPS from making a known Signet domain look like a plain email
    domain.
 
@@ -3240,6 +3047,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    domain key changed without proof.
 
    A client with no cached policy, or one that has expired, MUST check
+
+Foss                    Expires 15 May 2027                    [Page 52]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    the domainKey of a policy against the log the policy names, before
    it uses the policy for anything other than fetching that log: it
    fetches the latest domain-key leaf for the domain (Section 5.3.1)
@@ -3294,6 +3106,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       accepted only with dk and serverSig (Section 6.4). That removes
       the policy host from the trust path, but an attacker who also
       controls the DNS record can set dk. A domain whose servers are
+
+Foss                    Expires 15 May 2027                    [Page 53]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       all under the domain is not affected.
 
    *  *No rotation without the old key.* A domain that has lost its
@@ -3348,6 +3165,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |         | of the home's state, serves the policy, votes, and    |
    |         | can become primary. Listed in the policy.             |
    +---------+-------------------------------------------------------+
+
+Foss                    Expires 15 May 2027                    [Page 54]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | witness | Keeps the replication log and votes. Does not apply   |
    |         | it, never becomes primary, serves only cluster calls, |
    |         | and is not listed in the policy.                      |
@@ -3402,6 +3224,11 @@ Experimental           Signet Protocol, Version 0          November 2026
        out, or gets a response of 500 or above.
 
    3.  When a replica answers 421, reads its Signet-Primary field. If
+
+Foss                    Expires 15 May 2027                    [Page 55]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        the value is the base URL of a replica in the policy, the caller
        sends the request there once. It MUST NOT use a URL that is not
        one of the policy's replicas.
@@ -3456,6 +3283,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    (Section 6.8.6). Effects outside the store, such as relaying a
    delivery or sending plain email, MAY happen before the commit. If
    the primary loses its place before the commit, the caller gets an
+
+Foss                    Expires 15 May 2027                    [Page 56]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    ambiguous failure (Section 6.8.4) and the uncommitted change is
    discarded.
 
@@ -3510,6 +3342,11 @@ Experimental           Signet Protocol, Version 0          November 2026
        answers for long. It relies on clocks that run at nearly the
        same rate; it does not rely on them agreeing.
 
+
+Foss                    Expires 15 May 2027                    [Page 57]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    7.  A primary MUST step down when it sees a higher term in any call
        or answer. Every answer a primary gives to a client includes the
        header Signet-Term with its term.
@@ -3562,6 +3399,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | /v0/cluster/        | { term, leader, index, snapshotTerm,      |
    | snapshot            | data } → { term, matchIndex }             |
    +---------------------+-------------------------------------------+
+
+
+Foss                    Expires 15 May 2027                    [Page 58]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 6.8.7.  Failure Behaviour
 
@@ -3617,6 +3459,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       cluster routes SHOULD NOT be reachable from the public Internet.
 
    *  *Replicas in the policy are trusted like server.* Section 6.7
+
+Foss                    Expires 15 May 2027                    [Page 59]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       already notes that server is unconstrained. replicas is the
       same, with more entries.
 
@@ -3671,6 +3518,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | message content     | encrypted to client keys. One exception:  |
    |                     | a domain with an intake shares the intake |
    |                     | key with every home, so each home can     |
+
+Foss                    Expires 15 May 2027                    [Page 60]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                     | open first-contact requests to unlisted   |
    |                     | addresses (Section 4.11).                 |
    +---------------------+-------------------------------------------+
@@ -3725,6 +3577,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |          |        | operator is removed: the owner signs a new  |
    |          |        | statement without it.                       |
    +----------+--------+---------------------------------------------+
+
+Foss                    Expires 15 May 2027                    [Page 61]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | homes    | array  | One to seven homes, in order of preference. |
    |          |        | url is the home's base URL and key the home |
    |          |        | key (Section 6.9.3). replicas, if present,  |
@@ -3778,6 +3635,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    Appending to a transparency log (Section 5.6) is not a home's
    power: a log accepts appends signed by the domain key only.
+
+
+Foss                    Expires 15 May 2027                    [Page 62]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    A home also signs the directory answers that say an address is not
    enrolled or is unlisted (Section 4). Such an answer carries home,
@@ -3834,6 +3696,10 @@ Experimental           Signet Protocol, Version 0          November 2026
       it must be one the log's own signatures allow. A home cannot
       swap in a different log or identity key.
 
+Foss                    Expires 15 May 2027                    [Page 63]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    *  It releases an address only when the owner's rule allows it.
       With no rule, no home can.
 
@@ -3888,6 +3754,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    the same envelope, with the same id, to another of its own homes.
    The id makes this safe.
 
+Foss                    Expires 15 May 2027                    [Page 64]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    The submitting home is not trusted to say that it delivered. Every
    home that stores a delivery for a recipient signs a receipt, and the
    submitting home passes the receipts back to the client:
@@ -3940,6 +3810,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    reports that the delivery is unconfirmed to its user and stops. A
    recipient home that already holds the id ignores the repeat and
    signs a receipt for it.
+
+
+Foss                    Expires 15 May 2027                    [Page 65]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 6.9.6.  Reading and Registering
 
@@ -3995,6 +3870,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       owner sets each home's limits knowing N. Dividing a limit by N
       would instead cut a legitimate sender to one Nth of it.
 
+
+Foss                    Expires 15 May 2027                    [Page 66]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    *  *Receipts show delivery, not reading.* A receipt says a home
       stored the delivery. It says nothing about whether the
       recipient's client has fetched it. A recipient domain whose
@@ -4020,11 +3900,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    request is small (at most 8192 bytes before sealing), says who the
    sender is, carries at most one typed intent and a short note, and is
    sealed end to end to the recipient's request keys. The recipient's
-
-Foss                    Expires 15 May 2027                    [Page 53]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    server sees the recipient, the size and, unless the request is
    anonymous, the sender. It never sees the content.
 
@@ -4054,6 +3929,11 @@ Experimental           Signet Protocol, Version 0          November 2026
           "ts": "2026-11-11T09:30:00.000Z"
         },
         "sig": "…"
+
+Foss                    Expires 15 May 2027                    [Page 67]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       }
 
    +==============+==============+==========+==========================+
@@ -4079,11 +3959,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------------+--------------+----------+--------------------------+
    | note         | string       | no       | At most 500 characters.  |
    +--------------+--------------+----------+--------------------------+
-
-Foss                    Expires 15 May 2027                    [Page 54]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    | introduction | Introduction | no       | Section 7.6.             |
    +--------------+--------------+----------+--------------------------+
    | grants       | Grant[]      | no       | Grants naming the        |
@@ -4113,6 +3988,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------------+--------------+----------+--------------------------+
    | sig (outer)  | string       | yes      | Signature over body by   |
    |              |              |          | the sigKey of            |
+
+Foss                    Expires 15 May 2027                    [Page 68]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |              |              |          | fromClient.              |
    +--------------+--------------+----------+--------------------------+
 
@@ -4136,13 +4016,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    requestKeys. If the list is empty, the sender MUST NOT send, and
    reports that the recipient has no client that can receive the
    request.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 55]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    Padding.  The plaintext that is sealed is a 4-byte big-endian length
    of the serialized signed request, the request, and zero bytes, so
    that the whole is a multiple of 1024 bytes. The receiver reads the
@@ -4174,6 +4047,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       {
         "from": "alice@example.com",
         "to": "bob@example.net",
+
+Foss                    Expires 15 May 2027                    [Page 69]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
         "copies": [
           { "clientId": "sha256:3n0B…", "sealed": { "enc": "b64u",
             "ct": "b64u" } }
@@ -4206,12 +4084,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    | copies[].sealed.ct  | string       | yes      | The HPKE          |
    |                     |              |          | ciphertext.       |
    +---------------------+--------------+----------+-------------------+
-
-
-Foss                    Expires 15 May 2027                    [Page 56]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 7.4.  Sending
 
    Before sending, the reference client:
@@ -4234,6 +4106,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    The recipient's home server applies two daily limits to signed
    requests from one sender to one recipient: 5 per sender address and
    100 per sender domain. Requests over either limit are listed as
+
+Foss                    Expires 15 May 2027                    [Page 70]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    rejected in the delivery result. Anonymous requests are limited to
    200 per recipient per day.
 
@@ -4265,12 +4142,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    7.  If there is an intent, check the sender's authority for it
        (Section 9.5), with the request's grants.
-
-
-Foss                    Expires 15 May 2027                    [Page 57]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    A client SHOULD keep the verified senderView, so that it can add the
    sender's clients to a thread while that view remains current (Section
    5.8, step 11).
@@ -4293,44 +4164,12 @@ Experimental           Signet Protocol, Version 0          November 2026
         "sig": "…",
         "introducerView": { "view": { "…": "…" }, "sig": "…" }
       }
+   +=======================+============+==========+===================+
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 58]
+Foss                    Expires 15 May 2027                    [Page 71]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-   +=======================+============+==========+===================+
    | Field                 | Type       | Required | Meaning           |
    +=======================+============+==========+===================+
    | body.type             | string     | yes      | MUST be intro.    |
@@ -4382,16 +4221,13 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    4.  introducerClient is an unexpired member of that view, and sig
        verifies with its sigKey.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 59]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 7.7.  Admission
 
    Each account has an admission policy:
+
+Foss                    Expires 15 May 2027                    [Page 72]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
       { "contacts": ["carol@example.org"],
         "trustedDomains": ["example.org"] }
@@ -4442,16 +4278,14 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  both are at least 6 characters long and their Levenshtein distance
       is at most 1.
-
-
-Foss                    Expires 15 May 2027                    [Page 60]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    skeleton(x) is computed by applying Unicode NFKC normalization,
    lowercasing, replacing every i with l, and then, in order: replacing
    rn with m, vv with w, 0 with o, 1 and | with l, 5 with s, and
    removing -.
+
+Foss                    Expires 15 May 2027                    [Page 73]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    A client MUST NOT admit a request from a lookalike domain on the
    strength of trust alone, and MUST NOT put legacy mail from a
@@ -4507,6 +4341,10 @@ Experimental           Signet Protocol, Version 0          November 2026
        encrypts its own lists, and PUTs epoch 1 with a wrap for every
        active client of the account.
 
+Foss                    Expires 15 May 2027                    [Page 74]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    2.  A client without the key that finds a wrap for itself opens it.
        One that finds none keeps its own lists and asks again at its
        next sync, which is after a client that has the key sees it.
@@ -4531,39 +4369,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    6.9.6).
 
 7.10.  Errors
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 61]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +========================+==================+=======================+
    | Condition              | Where            | Result                |
    +========================+==================+=======================+
@@ -4593,6 +4398,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | signed, or not current |                  |                       |
    | in the log             |                  |                       |
    +------------------------+------------------+-----------------------+
+
+Foss                    Expires 15 May 2027                    [Page 75]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | Signing client not an  | Recipient client | Rejected.             |
    | active member of the   |                  |                       |
    | sender's view          |                  |                       |
@@ -4617,12 +4427,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    On receiving a request with a copy for its intake keyId, the
    recipient's home server:
-
-
-Foss                    Expires 15 May 2027                    [Page 62]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    1.  MUST apply the same per-sender, per-domain and anonymous limits
        as for any request (Section 4.10).
 
@@ -4653,6 +4457,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  *The home server still sees that contacts change.* The contacts
       are encrypted (Section 7.9), but the home server sees the
       document's size, rounded up to 1024 bytes, when it changes, how
+
+Foss                    Expires 15 May 2027                    [Page 76]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       many clients hold the key, and who writes it.
 
    *  *A revoked client keeps the key it held.* Revoking a client makes
@@ -4684,13 +4493,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    only after it has checked every credential the welcome or commit
    carries against the owner's current contact view as recorded in the
    transparency log.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 63]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 8.2.  MLS Profile
 
    Signet version 0 uses MLS 1.0 [RFC9420] with:
@@ -4714,6 +4516,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  a group id of 16 random bytes.
 
    Commits carry only Add and Remove proposals, by value. Standalone
+
+Foss                    Expires 15 May 2027                    [Page 77]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    proposals are not used and MUST be rejected. Only commits from
    current members are accepted; external commits are not used.
 
@@ -4743,13 +4550,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    more than once, so draining a client's one-time packages cannot lock
    it out of new threads. The reference client keeps 5 one-time packages
    and one last-resort package and tops them up on every sync.
-
-
-
-Foss                    Expires 15 May 2027                    [Page 64]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    To add another person's clients, a client claims packages through its
    own home server:
 
@@ -4776,6 +4576,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    2.  refuses with 429 once the calling domain exceeds its daily claim
        limit;
 
+Foss                    Expires 15 May 2027                    [Page 78]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    3.  refuses with 404 if {local} is not enrolled;
 
    4.  for each requested client id that is active (Section 3.4.3),
@@ -4801,14 +4605,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    The plaintext of each MLS application message is a signed message
    body, serialized as JSON.
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 65]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       {
         "body": {
           "v": 0,
@@ -4831,49 +4627,17 @@ Experimental           Signet Protocol, Version 0          November 2026
         },
         "sig": "…"
       }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 66]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=============+=================+==========+========================+
    | Field       | Type            | Required | Meaning                |
    +=============+=================+==========+========================+
    | v           | number          | yes      | MUST be 0.             |
    +-------------+-----------------+----------+------------------------+
    | id          | string          | yes      | A random identifier.   |
+
+Foss                    Expires 15 May 2027                    [Page 79]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    +-------------+-----------------+----------+------------------------+
    | thread      | string          | yes      | The thread id. MUST    |
    |             |                 |          | equal the thread the   |
@@ -4921,18 +4685,17 @@ Experimental           Signet Protocol, Version 0          November 2026
    MLS already authenticates the sending leaf. The extra signature makes
    each message portable evidence of what that client said, which
    matters when an agent commits its principal to something.
-
-
-Foss                    Expires 15 May 2027                    [Page 67]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    A client SHOULD include only grants that name a participant of the
    thread and have not expired. A client MAY share its label; the
    reference client does so only when configured to. Receivers MUST NOT
    treat a shared label as authenticated beyond the client that signed
    it, and the reference client truncates stored labels to 64
    characters.
+
+
+Foss                    Expires 15 May 2027                    [Page 80]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 8.5.  Starting a Thread
 
@@ -4974,18 +4737,6 @@ Experimental           Signet Protocol, Version 0          November 2026
         "humansOnly": true,
         "linkedTo": "t_8xP0m0aL2vTq1xYb0aLcd"
       }
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 68]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +============+==========+==========+================================+
    | Field      | Type     | Required | Meaning                        |
    +============+==========+==========+================================+
@@ -5000,6 +4751,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |            |          |          | client ids.                    |
    +------------+----------+----------+--------------------------------+
    | humansOnly | boolean  | no       | True for a humans-only thread  |
+
+Foss                    Expires 15 May 2027                    [Page 81]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |            |          |          | (Section 11.4).                |
    +------------+----------+----------+--------------------------------+
    | linkedTo   | string   | no       | The ordinary thread a          |
@@ -5040,11 +4796,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    To send, a client builds and signs a message body (after checking its
    own authority for each intent, Section 9.4), encrypts the JSON as an
    MLS application message, and submits it with kind message to every
-
-Foss                    Expires 15 May 2027                    [Page 69]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    participant, sealed with the thread's current delivery token (Section
    10.3).
 
@@ -5059,6 +4810,11 @@ Experimental           Signet Protocol, Version 0          November 2026
        8.6 step 3.
 
    4.  Parses the body and verifies that body.thread equals the thread;
+
+Foss                    Expires 15 May 2027                    [Page 82]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        that body.from equals the sender's principal and body.fromClient
        the sender's client id; that sig verifies with the sender's
        sigKey; and that every intent passes the receiver-side authority
@@ -5099,11 +4855,6 @@ Experimental           Signet Protocol, Version 0          November 2026
        delivery token of the epoch before the commit.
 
    7.  Registers the new epoch's delivery-token hash.
-
-Foss                    Expires 15 May 2027                    [Page 70]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    Revoking a client in the account log does not by itself remove it
    from threads. A rekey by any member does. Clients SHOULD rekey
    threads when they learn that a participant's view has changed.
@@ -5118,6 +4869,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    3.  Unless the commit removes this client, checks the sender, and
        each added member, against their owners' views as in Section 8.6
        step 3. In a humans-only thread every added member MUST be
+
+Foss                    Expires 15 May 2027                    [Page 83]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        humansOnly. Any failure rejects the commit, and the group state
        is left unchanged.
 
@@ -5172,6 +4928,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    fields: commit, the hex SHA-256 of that commit, and epoch, the epoch
    the commit makes. A client that receives two welcomes for one thread
    within 5 minutes of its first, joins by the one at the later epoch
+
+Foss                    Expires 15 May 2027                    [Page 84]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    or, at the same epoch, with the smaller commit hash. If that is the
    second, it goes back to before its join and takes it. A client that
    has just joined and then receives a commit it cannot apply ignores
@@ -5205,23 +4966,6 @@ Experimental           Signet Protocol, Version 0          November 2026
        it can reach.
 
    3.  The sender puts an attachment reference in the message:
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 71]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +=========+========+==========+======================================+
    | Field   | Type   | Required | Meaning                              |
    +=========+========+==========+======================================+
@@ -5243,6 +4987,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    +---------+--------+----------+--------------------------------------+
    | digest  | string | yes      | SHA-256 of the ciphertext, in        |
    |         |        |          | sha256: form.                        |
+
+Foss                    Expires 15 May 2027                    [Page 85]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    +---------+--------+----------+--------------------------------------+
 
    Blob ids MUST be at least 16 random bytes in b64u after blob_. The
@@ -5293,17 +5042,15 @@ Experimental           Signet Protocol, Version 0          November 2026
       the message anyway.
 
 9.  Intents and Grants
-
-
-
-Foss                    Expires 15 May 2027                    [Page 72]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 9.1.  Overview
 
    An intent is a typed action carried in a request or a message, so
    that software can act on it without guessing from prose. Who may send
+
+Foss                    Expires 15 May 2027                    [Page 86]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    an intent is limited in two places:
 
    *  On the sending side, the owner's own clients enforce the sending
@@ -5345,20 +5092,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    In this table, "string" means a non-empty string, and "amount" means
    a finite number greater than zero. A receiver MUST reject a core
    intent whose arguments do not match.
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 73]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +==================+================+================+==============+
    | Name             | Required args  | Optional args  | Meaning      |
    +==================+================+================+==============+
@@ -5372,6 +5105,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | schedule.confirm | slot (string)  | location       | Confirms a   |
    |                  |                | (string)       | time.        |
    +------------------+----------------+----------------+--------------+
+
+Foss                    Expires 15 May 2027                    [Page 87]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | file.request     | description    | deadline       | Asks for a   |
    |                  | (string)       | (string)       | document.    |
    +------------------+----------------+----------------+--------------+
@@ -5413,12 +5151,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    Signet never moves money. Payment happens wherever the two parties
    already pay each other. pay.request carries the ask and pay.sent
    carries the receipt, each signed by the client that sent it.
-
-
-Foss                    Expires 15 May 2027                    [Page 74]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  pay.request.link, if present, is where the requester says payment
       can be made. A receiver MUST treat it as untrusted input. An agent
       MUST NOT pay through it unless its owner has separately authorised
@@ -5432,6 +5164,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       reference, or the payment system's own reference, in pay.sent.
 
    Both payment intents carry amountUsd, but neither commits anyone to
+
+Foss                    Expires 15 May 2027                    [Page 88]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    anything: one asks to be paid and the other reports a payment. They
    therefore have no _committed amount_ and are exempt from the amount
    limits in Sections 9.4 and 9.5. Every other intent with a numeric
@@ -5473,11 +5210,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    *Organisation claims.* A claim is a statement a domain signs with its
    domain key about one of its principals, for example team:corporate:
    {"body": {"type": "claim", "principal", "claim", "issued",
-
-Foss                    Expires 15 May 2027                    [Page 75]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    "expires"}, "sig"}. A principal's clients fetch their own claims,
    freshly signed, from GET /v0/claims (client-authenticated). A
    receiver MUST drop a claim that is not signed by the domain key in
@@ -5490,6 +5222,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  the requester, and the kind of client that sent it (from the
       requester's contact view);
+
+
+Foss                    Expires 15 May 2027                    [Page 89]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    *  the claims that verify;
 
@@ -5532,11 +5269,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    info.request and info.answer commit nobody, so a receiver accepts
    them from any agent in the thread without a grant (Section 9.5); the
    sender still needs the intent:info.* scope. Every request, card and
-
-Foss                    Expires 15 May 2027                    [Page 76]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    answer is a signed message, so who disclosed what, to which clients,
    and on whose approval can be shown later, and an escrow client in the
    thread keeps that record.
@@ -5550,6 +5282,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    2.  If the client is a device, allow it.
 
    3.  Let name be the intent name without its version. Unless name is
+
+Foss                    Expires 15 May 2027                    [Page 90]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        handoff.human, the client's scopes MUST cover intent:name
        (Section 3.4.2). Otherwise refuse.
 
@@ -5591,11 +5328,6 @@ Experimental           Signet Protocol, Version 0          November 2026
        intent's committed amount is greater than 0, reject with a limit
        error, because an intake agent cannot commit money; otherwise
        accept. An intake agent can therefore send pay.request.
-
-Foss                    Expires 15 May 2027                    [Page 77]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    6.  Otherwise reject: the agent has no grant to send this intent to
        this receiver.
 
@@ -5607,6 +5339,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    A grant gives one agent authority to send certain intents to one
    counterparty, with optional limits. Only that counterparty ever sees
    it: the agent presents it when it relies on it.
+
+
+Foss                    Expires 15 May 2027                    [Page 91]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 9.6.1.  Grant Format
 
@@ -5622,39 +5359,6 @@ Experimental           Signet Protocol, Version 0          November 2026
         "expires": "2026-12-11T09:30:00.000Z",
         "sig": "…"
       }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 78]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +==============+==========+==========+==============================+
    | Field        | Type     | Required | Meaning                      |
    +==============+==========+==========+==============================+
@@ -5694,6 +5398,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    request the grants that name the recipient, and in a message the
    unexpired grants that name a thread participant.
 
+
+Foss                    Expires 15 May 2027                    [Page 92]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
 9.6.2.  Grant Validation
 
    A grant g is valid for principal P, agent S, receiver R and intent
@@ -5709,11 +5418,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    5.  g.id is not in the revokedGrants of P's contact view, as far as
        the receiver knows it;
-
-Foss                    Expires 15 May 2027                    [Page 79]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    6.  some entry of g.intents equals name, or ends in * and is a prefix
        of name without the *;
 
@@ -5753,6 +5457,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | grant                       |          | is rejected.             |
    +-----------------------------+----------+--------------------------+
    | amountUsd above the grant's | Receiver | Limit error; the item is |
+
+Foss                    Expires 15 May 2027                    [Page 93]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | commit_usd, or above 0 from |          | rejected.                |
    | an intake                   |          |                          |
    +-----------------------------+----------+--------------------------+
@@ -5769,12 +5478,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  *Sub-agents.* There are no delegation chains: an agent cannot pass
       a narrower grant to another agent.
-
-
-Foss                    Expires 15 May 2027                    [Page 80]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 10.  Delivery and Metadata Protection
 
 10.1.  Overview
@@ -5809,35 +5512,15 @@ Experimental           Signet Protocol, Version 0          November 2026
    Sealed and anonymous deliveries MAY travel through an Oblivious HTTP
    relay, so that the recipient's server does not learn which server
    sent them either.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 81]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 Alice's         example.com       OHTTP           example.net
 client          home server       relay           gateway and server
   |                 |               |                 |
   | POST /v0/submit |               |                 |
+
+Foss                    Expires 15 May 2027                    [Page 94]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
   | MLS ciphertext, |               |                 |
   | delivery token  |               |                 |
   |---------------->|               |                 |
@@ -5873,26 +5556,6 @@ client          home server       relay           gateway and server
         "payload": { "thread": "t_…", "mls": "…" },
         "token": "b64u delivery token"
       }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 82]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +================+==========+==========+============================+
    | Field          | Type     | Required | Meaning                    |
    +================+==========+==========+============================+
@@ -5912,6 +5575,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                |          |          | for welcome, commit and    |
    |                |          |          | message.                   |
    +----------------+----------+----------+----------------------------+
+
+Foss                    Expires 15 May 2027                    [Page 95]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | anonymousToken | string   | no       | A Privacy Pass token.      |
    |                |          |          | Makes the delivery         |
    |                |          |          | anonymous. Only for        |
@@ -5944,14 +5612,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    unknown lists addresses that are not enrolled. rejected lists
    addresses refused for limits or unknown tokens. queued lists
    addresses whose domain could not be reached and will be retried.
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 83]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 10.2.1.  Signed Delivery
 
       POST /v0/deliver        (domain-authenticated)
@@ -5974,6 +5634,11 @@ Experimental           Signet Protocol, Version 0          November 2026
        registered, store the item in the mailbox with an empty from and
        sealed: true, otherwise park it (Section 10.3.3), or list the
        address as rejected if parking fails. Otherwise, for a request,
+
+Foss                    Expires 15 May 2027                    [Page 96]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        count it against the per-sender and per-sender-domain limits for
        this recipient (Section 4.10) and list the address as rejected if
        either is exceeded. Otherwise store the item with from set to the
@@ -6002,15 +5667,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    computed over the UTF-8 string and written in sha256: form. Binding
    the hash to the address means one member's registration does not
    authorise deliveries to another.
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 84]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 10.3.2.  Registration
 
       POST /v0/delivery-tokens        (client-authenticated)
@@ -6036,6 +5692,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    thread and registered its token. The recipient's server holds such an
    item for at most 24 hours, with at most 500 parked items per address,
    counting only unexpired ones.
+
+
+Foss                    Expires 15 May 2027                    [Page 97]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    When a hash is registered, every unexpired parked item with that hash
    is moved into the mailbox in arrival order. A client that registers a
@@ -6065,11 +5726,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    message is a known-length Binary HTTP message [RFC9292].
 
       POST /v0/ohttp        (Content-Type: message/ohttp-req)
-
-Foss                    Expires 15 May 2027                    [Page 85]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    The gateway:
 
    1.  refuses with 415 any other content type, and with 400 a request
@@ -6095,6 +5751,11 @@ Experimental           Signet Protocol, Version 0          November 2026
         message/ohttp-req)
 
    The relay:
+
+
+Foss                    Expires 15 May 2027                    [Page 98]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    1.  refuses with 404 any other route, with 415 any other content
        type, and with 400 a missing domain;
@@ -6126,11 +5787,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    policy's server, with a JSON body. Otherwise it posts to the route
    directly. Signed deliveries never use the relay, because they name
    the sending domain anyway.
-
-Foss                    Expires 15 May 2027                    [Page 86]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 10.5.  Anonymous Requests
 
    A first-contact request can be sent with a Privacy Pass token
@@ -6155,6 +5811,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    1.  The client reads the recipient domain's policy. It MUST have
        privacyPass. The reference client sends anonymously by default
        when it does.
+
+Foss                    Expires 15 May 2027                    [Page 99]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    2.  The client fetches its own home server's issuer: GET /v0/issuer
        (client-authenticated) returns {"name", "publicKey"}, where
@@ -6181,15 +5841,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    The issuer never sees the token. The attester never sees the token
    either: it sees only the blinded message. The issuer also serves its
    public key at GET /v0/issuer-key.
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 87]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 10.5.3.  Redeeming a Token
 
    The sender's home server delivers the anonymous request locally or
@@ -6219,6 +5870,10 @@ Experimental           Signet Protocol, Version 0          November 2026
        of anonymous requests (reference default 200), and otherwise
        stores the item with an empty from and sealed: true.
 
+Foss                    Expires 15 May 2027                   [Page 100]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    An issuer MUST keep its signing key across restarts, and an origin
    MUST keep spent nonces across restarts at least until the issuer key
    changes. Otherwise tokens stop verifying, or one token can be spent
@@ -6244,11 +5899,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    reference schedule waits 1 minute, 5 minutes, 30 minutes, 2 hours, 6
    hours, then 24 hours four times, about 4.4 days in all (10 attempts),
    before bouncing.
-
-Foss                    Expires 15 May 2027                    [Page 88]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    A bounce is stored in the sender's own mailbox:
 
       { "id": "b_…", "kind": "bounce",
@@ -6277,6 +5927,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | from       | string  | yes      | The sender, or empty for sealed |
    |            |         |          | and anonymous deliveries.       |
    +------------+---------+----------+---------------------------------+
+
+Foss                    Expires 15 May 2027                   [Page 101]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    | sealed     | boolean | no       | True for sealed and anonymous   |
    |            |         |          | deliveries.                     |
    +------------+---------+----------+---------------------------------+
@@ -6331,6 +5986,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  *Mailbox retention.* Section 10.7 lets a server delete items that
       every active reading client has acknowledged, and requires it to
+
+Foss                    Expires 15 May 2027                   [Page 102]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       delete them after the retention period. A client that is offline
       longer than the period loses mail, and a client that never
       acknowledges holds items until then. Acknowledgements reveal to
@@ -6386,6 +6046,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    The policy is published in two places, both signed by the identity
    key:
 
+Foss                    Expires 15 May 2027                   [Page 103]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    *  the card's humanKeys lists the agreement key of every active
       client that reads humans-only mail (Section 4.3);
 
@@ -6395,12 +6059,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    Opting an agent in lets the owner overrule an over-cautious sender: a
    sender cannot keep the owner's own assistant out against the owner's
    wishes.
-
-
-Foss                    Expires 15 May 2027                    [Page 90]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 11.4.  Humans-only Threads
 
    A message in a conversation cannot be encrypted to only some members
@@ -6446,6 +6104,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    2.  Every active escrow client is added to the card's requestKeys,
        even when the intake is exclusive (Section 4.3).
 
+Foss                    Expires 15 May 2027                   [Page 104]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    3.  Every active escrow client reads humans-only mail, so it is in
        humanKeys and is humansOnly in the view.
 
@@ -6454,12 +6116,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    5.  An escrow client receives a copy of every legacy email (Section
        11.6).
-
-
-Foss                    Expires 15 May 2027                    [Page 91]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    Contacts who have the view are told plainly that escrow receives
    everything, by its escrow kind. A client SHOULD show this to its user
    when an escrow client is present in a thread.
@@ -6505,6 +6161,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       applied by each client, not by encryption. A client that ignores
       it can read humans-only mail.
 
+
+Foss                    Expires 15 May 2027                   [Page 105]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    *  *Escrow is labelled, not hidden.* Request keys of escrow clients
       carry escrow: true (Section 4.3), and a sender MUST tell the
       person. A sender that ignores the label still sends to the
@@ -6517,11 +6178,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    Thread messages are durable and asynchronous. When two agents need
    fast back-and-forth, for example to settle a meeting time through
    several rounds, a thread can move to a live session using the
-
-Foss                    Expires 15 May 2027                    [Page 92]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    Agent2Agent (A2A) protocol, version 0.3 [A2A], which is JSON-RPC 2.0
    over HTTP.
 
@@ -6564,6 +6220,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | url       | string | yes      | The host's A2A base URL.          |
    +-----------+--------+----------+-----------------------------------+
    | sessionId | string | yes      | s_ followed by 12 random bytes in |
+
+Foss                    Expires 15 May 2027                   [Page 106]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |           |        |          | b64u.                             |
    +-----------+--------+----------+-----------------------------------+
    | expires   | string | yes      | When the offer and session end.   |
@@ -6576,11 +6237,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    Sending the offer needs the intent:session.offer scope like any other
    intent (Section 9.4). Receivers accept session.* intents from any
-
-Foss                    Expires 15 May 2027                    [Page 93]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    agent in the thread without a grant (Section 9.5), because a session
    is a channel the receiver may decline.
 
@@ -6623,6 +6279,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    2.  Authorises the call. It succeeds only if the session exists with
        role host, has not expired, its thread is still one the host is a
+
+Foss                    Expires 15 May 2027                   [Page 107]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        member of, the thread has no pending handoff (Section 12.6), and
        the token equals the current liveToken in a constant-time
        comparison. On failure it answers HTTP 401 with JSON-RPC error
@@ -6634,12 +6295,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    4.  Passes the concatenated text parts of the message to the agent
        and returns a result of kind message, role agent, with the answer
        as one text part and metadata.sessionId set.
-
-
-Foss                    Expires 15 May 2027                    [Page 94]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    5.  Reports any other failure as JSON-RPC error -32603.
 
    Other paths return 404.
@@ -6683,6 +6338,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    reports a handoff event, so the owner's devices can show the thread
    as needing them.
 
+
+Foss                    Expires 15 May 2027                   [Page 108]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    A receiver that holds a handoff for an account MUST NOT show as a
    message, and MUST report as an error, a message in the thread from
    an agent or tool client of that account, other than handoff.human.
@@ -6699,12 +6359,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       12.4, step 2);
 
    *  the other side's agents are not held.
-
-
-Foss                    Expires 15 May 2027                    [Page 95]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    The handoff ends when one of the account's devices sends a message in
    the thread that is not itself a handoff. Every client that receives
    such a message from a device of the account the thread was handed to
@@ -6743,6 +6397,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  *Email to Signet.* A Signet home server can receive plain email
       for its users. It checks SPF, DKIM and DMARC, encrypts the message
       to the recipient's reading clients on arrival, and keeps no
+
+Foss                    Expires 15 May 2027                   [Page 109]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       plaintext.
 
    *  *Alongside an existing provider.* A domain can keep its existing
@@ -6752,20 +6411,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 13.2.  Outbound Plain Email
 
 13.2.1.  Routes
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 96]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
       POST /v0/legacy/send          (client-authenticated)
       {
         "to": ["dana@example.org"],
@@ -6798,35 +6443,6 @@ Experimental           Signet Protocol, Version 0          November 2026
       Signet: v=signet0; server=https://signet.example.com;
         fp=sha256:Tq…; ts=2026-11-11T09:30:00.000Z;
         nonce=n_Wc2m0aL2vTq1xYb0aLcd; sig=Fq…
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Foss                    Expires 15 May 2027                    [Page 97]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +========+=================+========================================+
    | Key    | Required        | Meaning                                |
    +========+=================+========================================+
@@ -6840,6 +6456,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |        |                 | string, in sha256: form.               |
    +--------+-----------------+----------------------------------------+
    | addr   | no              | A Signet address other than the From   |
+
+Foss                    Expires 15 May 2027                   [Page 110]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |        |                 | address, for someone who sends from a  |
    |        |                 | different mailbox.                     |
    +--------+-----------------+----------------------------------------+
@@ -6890,17 +6511,15 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A home server MAY accept plain email over SMTP [RFC5321] for its
    domain. If it does:
-
-
-
-Foss                    Expires 15 May 2027                    [Page 98]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    1.  It MUST refuse with 550 any recipient that is not an enrolled
        address on its domain.
 
    2.  It SHOULD offer STARTTLS. The reference server offers it when
+
+Foss                    Expires 15 May 2027                   [Page 111]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
        configured with a certificate, and does not offer AUTH.
 
    3.  It MUST evaluate SPF [RFC7208], DKIM [RFC6376] and DMARC
@@ -6951,13 +6570,13 @@ Experimental           Signet Protocol, Version 0          November 2026
        lookalike. Otherwise it puts it in the request tier.
 
    7.  Notes whether it is humans-only.
-
-Foss                    Expires 15 May 2027                    [Page 99]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    Plain email was readable in transit. Clients MUST show it at a lower
    trust level than Signet mail, whatever its tier.
+
+
+Foss                    Expires 15 May 2027                   [Page 112]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 13.5.  Checking a Signet Header
 
@@ -7010,17 +6629,13 @@ Experimental           Signet Protocol, Version 0          November 2026
       Signet-Audience header fields, and checks each Signet field
       (Section 13.5). It applies the humans-only policy itself (Section
       11.6).
-
-
-
-
-Foss                   Expires 15 May 2027                    [Page 100]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    Sending needs the gmail.send scope. Scanning headers needs
    gmail.metadata, a restricted scope that needs Google verification for
    public apps.
+
+Foss                    Expires 15 May 2027                   [Page 113]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 13.7.  Choosing Between Signet and Email
 
@@ -7070,17 +6685,14 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  senders may be malicious, including other users' agents;
 
    *  a client may be lost or compromised;
-
-
-
-
-Foss                   Expires 15 May 2027                    [Page 101]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  the transparency log operator follows the protocol, and its
       misbehaviour can be detected but not prevented by a single client
       (Section 14.6).
+
+
+Foss                    Expires 15 May 2027                   [Page 114]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
 14.2.  What a Home Server Can and Cannot Do
 
@@ -7132,14 +6744,14 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    Recovery (Section 3.9) replaces an identity key the owner no longer
    holds. It is visible to contacts as recovered, and it voids grants
-
-Foss                   Expires 15 May 2027                    [Page 102]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    signed before it. Clients SHOULD tell their users when a contact's
    key was recovered, because the old key may be in someone else's
    hands.
+
+
+Foss                    Expires 15 May 2027                   [Page 115]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    A recovery key does not protect against theft of the identity key.
    Whoever holds the identity key can rotate it, add clients, sign
@@ -7191,15 +6803,15 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    Deployments SHOULD use at least two independent log operators and
    SHOULD have clients or monitors exchange tree heads.
-
-Foss                   Expires 15 May 2027                    [Page 103]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 14.7.  Signatures and Canonicalization
 
    All signatures are over canonical JSON (Section 3.2). Implementations
    MUST use the same canonical form for signing and verifying, and MUST
+
+Foss                    Expires 15 May 2027                   [Page 116]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    reject non-I-JSON input. Two implementations that disagree on
    canonical form will reject each other's signatures. They will not
    accept a forgery.
@@ -7248,19 +6860,17 @@ Experimental           Signet Protocol, Version 0          November 2026
    instructions in their text or arguments as authority to act beyond
    its own scopes, and SHOULD hand off to its owner (Section 12.6) when
    asked to do something it is not sure it may do.
-
-
-
-Foss                   Expires 15 May 2027                    [Page 104]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    pay.request and pay.sent never move money (Section 9.3.1). A
    pay.request link is a classic phishing vector. A pay.sent is a claim,
    not a receipt from a payment system.
 
    Live sessions carry nothing binding. A receiver MUST NOT treat
    anything said in a live session as a commitment until it arrives as a
+
+Foss                    Expires 15 May 2027                   [Page 117]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    signed intent in the thread.
 
 14.10.  Spoofing
@@ -7309,17 +6919,17 @@ Experimental           Signet Protocol, Version 0          November 2026
    +======================+======================+=====================+
    | Party                | Learns               | Does not learn      |
    +======================+======================+=====================+
-
-Foss                   Expires 15 May 2027                    [Page 105]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    | Sender's home server | Its own user's       | Content of          |
    |                      | lookups (by          | requests, messages, |
    |                      | address), claims,    | attachments and     |
    |                      | submissions,         | legacy mail.        |
    |                      | recipients, sizes    |                     |
    |                      | and timing; the      |                     |
+
+Foss                    Expires 15 May 2027                   [Page 118]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    |                      | the size and timing  |                     |
    |                      | of changes to its    |                     |
    |                      | user's contacts      |                     |
@@ -7369,16 +6979,16 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                      | and humans-only      |                     |
    |                      | flags, expiry;       |                     |
    |                      | revoked grant ids.   |                     |
-
-Foss                   Expires 15 May 2027                    [Page 106]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    +----------------------+----------------------+---------------------+
 
 15.2.  Directory Enumeration
 
    Directory answers for unknown and unenrolled addresses are identical
+
+Foss                    Expires 15 May 2027                   [Page 119]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    and signed (Section 4.5). Log leaves are filed under VRF outputs, so
    the log cannot be used to test guessed addresses offline (Section
    5.2). Lookups are rate-limited per requester, per domain and per IP,
@@ -7428,16 +7038,16 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  A live session exposes each side's network address to the other
       (Section 12.7).
-
-Foss                   Expires 15 May 2027                    [Page 107]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 15.6.  Contacts and Labels
 
    Admission is decided on the recipient's clients. The home server
    stores contacts and trusted domains encrypted, so that all of an
    account's clients share them without it reading them (Section 7.9).
+
+Foss                    Expires 15 May 2027                   [Page 120]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    Client labels never appear in the directory. A label reaches a
    thread only if a client chooses to share it (Section 8.4).
 
@@ -7484,14 +7094,6 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    This would be added to the "Underscored and Globally Scoped DNS Node
    Names" registry [RFC8552].
-
-
-
-
-Foss                   Expires 15 May 2027                    [Page 108]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
 16.3.  Message Header Fields
 
    +=================+=============+=================================+
@@ -7500,6 +7102,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | Signet          | provisional | Section 13.2.2 of this document |
    +-----------------+-------------+---------------------------------+
    | Signet-Audience | provisional | Section 11.6 of this document   |
+
+Foss                    Expires 15 May 2027                   [Page 121]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
    +-----------------+-------------+---------------------------------+
 
    These would be added to the "Permanent Message Header Field Names"
@@ -7550,15 +7157,15 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  [RFC3339] "Date and Time on the Internet: Timestamps"
       <https://www.rfc-editor.org/rfc/rfc3339>, RFC 3339, July 2002.
-
-Foss                   Expires 15 May 2027                    [Page 109]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  [RFC4648] "The Base16, Base32, and Base64 Data Encodings"
       <https://www.rfc-editor.org/rfc/rfc4648>, RFC 4648, October 2006.
 
    *  [RFC5321] "Simple Mail Transfer Protocol"
+
+Foss                    Expires 15 May 2027                   [Page 122]
+
+Experimental           Signet Protocol, Version 0          November 2026
+
       <https://www.rfc-editor.org/rfc/rfc5321>, RFC 5321, October 2008.
 
    *  [RFC5322] "Internet Message Format"
@@ -7607,18 +7214,16 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  [RFC9576] "The Privacy Pass Architecture"
       <https://www.rfc-editor.org/rfc/rfc9576>, RFC 9576, June 2024.
-
-
-
-Foss                   Expires 15 May 2027                    [Page 110]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
    *  [RFC9577] "The Privacy Pass HTTP Authentication Scheme"
       <https://www.rfc-editor.org/rfc/rfc9577>, RFC 9577, June 2024.
 
    *  [RFC9578] "Privacy Pass Issuance Protocols"
       <https://www.rfc-editor.org/rfc/rfc9578>, RFC 9578, June 2024.
+
+
+Foss                    Expires 15 May 2027                   [Page 123]
+
+Experimental           Signet Protocol, Version 0          November 2026
 
    *  [A2A] "Agent2Agent (A2A) Protocol Specification"
       <https://a2a-protocol.org/v0.3.0/specification/>, version 0.3.0.
@@ -7673,4 +7278,4 @@ Author's Address
 
    Email: jerzy@contextsystems.com
 
-Foss                   Expires 15 May 2027                    [Page 111]
+Foss                    Expires 15 May 2027                   [Page 124]

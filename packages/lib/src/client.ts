@@ -788,7 +788,7 @@ export class SignetClient {
   /** Download and decrypt an attachment from a message this client has read. */
   async fetchAttachment(ref: AttachmentRef): Promise<Buffer> {
     let failure: unknown;
-    for (const url of [ref.url, ...(ref.copies ?? [])]) {
+    for (const url of [ref.url, ...(ref.mirrors ?? [])]) {
       try {
         const response = await this.fetchImpl(url);
         if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
@@ -1477,7 +1477,7 @@ export class SignetClient {
     // The message names where the ciphertext is, so it goes to every home: one operator being down or
     // withholding must not cost the reader the file.
     const urls = await this.eachHome(async (home) => ((await this.request(home, 'POST', '/v0/blobs', blob)) as { url: string }).url);
-    return { ...ref, url: urls[0], ...(urls.length > 1 ? { copies: urls.slice(1) } : {}) };
+    return { ...ref, url: urls[0], ...(urls.length > 1 ? { mirrors: urls.slice(1) } : {}) };
   }
 
   private thread(thread: string): string {

@@ -2255,15 +2255,28 @@ Experimental           Signet Protocol, Version 0          November 2026
    (Section 4.6). requester names the user on whose behalf the lookup is
    made, as a requester hash:
 
-      requesterHash(address) = sha256("{domain}|{local}@{domain}")
+      requesterHash(requester, target) =
+        sha256("signet0 requester|" + requester + "|" + target)
+
 
 Foss                    Expires 15 May 2027                    [Page 38]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-   where the address is lowercased and the hash is computed over the
-   UTF-8 string and written in sha256: form. Calls without signet-domain
-   are anonymous.
+   where requester is the requesting user's address and target is the
+   address being looked up, both lowercased, and the hash is computed
+   over the UTF-8 string and written in sha256: form. The target is part
+   of the hash, so one requester has a different hash at each address.
+   Calls without signet-domain are anonymous.
+
+   A call that asks for contact level MUST also carry the header
+   signet-requester, whose value is b64u(JCS({"address": A, "cert": C,
+   "ts": T, "sig": S})). A is the requester's address. C is a client
+   certificate of A (Section 3.4) that the requesting client holds. T is
+   the time of the call. S is the client's Ed25519 signature, by the
+   certified key, over UTF-8(JCS({"v": "signet0", "requester": H,
+   "target": X, "ts": T})), where H is the requester parameter and X is
+   the target address.
 
    The server answers as follows:
 
@@ -2276,8 +2289,13 @@ Experimental           Signet Protocol, Version 0          November 2026
        limit (Section 4.10), refuse with 429.
 
    3.  If the call is authenticated and the owner released the view to
-       requester (Section 4.8), the access level is contact. Otherwise
-       it is public.
+       requester (Section 4.8), and signet-requester is valid, the
+       access level is contact. The proof is valid if H equals
+       requesterHash(A, X), T is within five minutes of now, S verifies
+       under C's key, and C verifies against A's account log, which the
+       server fetches by looking up A and verifying the answer as in
+       Section 5.8. The server MAY cache a verified certificate until
+       the log changes. Otherwise the access level is public.
 
    4.  Build the entry (Section 4.5) at that access level. The log is
        never included.
@@ -2302,7 +2320,9 @@ Experimental           Signet Protocol, Version 0          November 2026
       { "add": ["sha256:…"], "remove": ["sha256:…"] }
 
    A client (Section 3.11) adds or removes requester hashes to which its
-   account's contact view is released. A client SHOULD release its view
+   account's contact view is released. Each hash is
+   requesterHash(person, own address), computed by the owner's client
+   for the person it is releasing to. A client SHOULD release its view
    to each person it sends a request to, starts a thread with, or
    accepts, before doing so. The reference client does this in
    sendRequest and startThread.
@@ -2475,29 +2495,22 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 4.12.  Open Issues
 
-   *  *Requester hashes are asserted, not proven.* The requester
-      parameter is chosen by the calling home server. A dishonest home
-      server can spread one user's lookups over many hashes, or present
-      the hash of someone the target released its view to. The
-      per-domain limit and the scanning rule bound the first. The second
-      would release a contact view to the wrong server. The view holds
-      no labels or scopes, but it lists client keys. A future version
-      should bind the requester to a proof from the requesting client.
+   *  *Requester hashes hide little.* requesterHash is an unkeyed hash
+      of two addresses. Anyone who can guess both can compute it. Since
+      the target is in the hash, one requester's hashes at different
+      addresses cannot be linked, but a target that wants to know
+      whether a given person looked it up can test a guess. A contact
+      view is released only on a valid proof (Section 4.7), so a
+      dishonest home server cannot ask for someone else's level. It can
+      still spread one user's lookups over many hashes for public
+      answers; the per-domain limit and the scanning rule bound that.
 
-   *  *Requester hashes are guessable.* requesterHash is an unkeyed hash
-      of an address. Anyone who can guess an address can compute it. It
-      hides addresses from casual inspection, not from a determined
-      observer.
-
-   *  *Domain key rotation.* Version 0 has no way to rotate a domain key
-      other than publishing a new policy. Bindings signed by the old key
-      stop verifying when the policy changes. A future version should
-
-Foss                    Expires 15 May 2027                    [Page 42]
-
-Experimental           Signet Protocol, Version 0          November 2026
-
-      specify an overlap period.
+   *  *Domain key rotation overlap.* Section 6.5 requires a rotation
+      proof, so a new domainKey is accepted while clients hold the old
+      one. Bindings signed by the old key stop verifying once the
+      policy changes. A domain SHOULD re-sign its bindings with the new
+      key before it publishes the rotation. An overlap in which both
+      keys verify is not specified.
 
 5.  Key Transparency
 
@@ -4354,9 +4367,16 @@ Experimental           Signet Protocol, Version 0          November 2026
       POST /v0/contacts   { "contacts": ["…"], "trustedDomains": ["…"] }
 
    Both require client authentication (Section 3.11). POST adds the
-   given entries (lowercased) and never removes any. GET returns
-   {contacts, trustedDomains}. Each client merges the stored lists into
-   its own on every sync.
+   given entries (lowercased). To remove entries, a POST body also
+   MAY carry removeContacts and removeTrustedDomains, arrays of the
+   same form. Within one POST, removals apply after additions. GET
+   returns {contacts, trustedDomains}.
+
+   The stored list is authoritative. On every sync a client first
+   uploads the entries it added since its last sync, then replaces its
+   own lists with the stored ones. It MUST NOT upload an entry merely
+   because it is in its local list, or a removal made by another client
+   would be undone.
 
 7.10.  Errors
 
@@ -4482,11 +4502,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       routes (Section 7.9) store an account's contacts and trusted
       domains on its home server in the clear, so that all of its
       clients admit the same people. The admission decision is still
-      made on the client. A future version should store the lists
-      encrypted to the account's clients.
-
-   *  *No removal.* Contacts and trusted domains can be added but not
-      removed through the shared-contacts routes.
+      made on the client. Storing the lists encrypted needs a key that
+      every client of the account shares and the home server does not
+      hold. Enrollment (Section 3.4.4) could carry one, but version 0
+      does not specify that. A client that does not want its home
+      server to see its contacts MUST NOT use these routes.
 
 8.  Threads and Messages
 
@@ -5029,34 +5049,34 @@ Foss                    Expires 15 May 2027                    [Page 71]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-   +========+========+==========+======================================+
-   | Field  | Type   | Required | Meaning                              |
-   +========+========+==========+======================================+
-   | name   | string | yes      | File name.                           |
-   +--------+--------+----------+--------------------------------------+
-   | type   | string | yes      | Media type.                          |
-   +--------+--------+----------+--------------------------------------+
-   | size   | number | yes      | Plaintext size in bytes.             |
-   +--------+--------+----------+--------------------------------------+
-   | url    | string | yes      | Where the ciphertext can be fetched. |
-   +--------+--------+----------+--------------------------------------+
-   | copies | array  | no       | Other URLs of the same ciphertext,   |
-   |        |        |          | one for each other home it was       |
-   |        |        |          | uploaded to.                         |
-   +--------+--------+----------+--------------------------------------+
-   | key    | string | yes      | The AES-256 key (b64u).              |
-   +--------+--------+----------+--------------------------------------+
-   | iv     | string | yes      | The nonce (b64u).                    |
-   +--------+--------+----------+--------------------------------------+
-   | digest | string | yes      | SHA-256 of the ciphertext, in        |
-   |        |        |          | sha256: form.                        |
-   +--------+--------+----------+--------------------------------------+
+   +=========+========+==========+======================================+
+   | Field   | Type   | Required | Meaning                              |
+   +=========+========+==========+======================================+
+   | name    | string | yes      | File name.                           |
+   +---------+--------+----------+--------------------------------------+
+   | type    | string | yes      | Media type.                          |
+   +---------+--------+----------+--------------------------------------+
+   | size    | number | yes      | Plaintext size in bytes.             |
+   +---------+--------+----------+--------------------------------------+
+   | url     | string | yes      | Where the ciphertext can be fetched. |
+   +---------+--------+----------+--------------------------------------+
+   | mirrors | array  | no       | Other URLs of the same ciphertext,   |
+   |         |        |          | one for each other home it was       |
+   |         |        |          | uploaded to.                         |
+   +---------+--------+----------+--------------------------------------+
+   | key     | string | yes      | The AES-256 key (b64u).              |
+   +---------+--------+----------+--------------------------------------+
+   | iv      | string | yes      | The nonce (b64u).                    |
+   +---------+--------+----------+--------------------------------------+
+   | digest  | string | yes      | SHA-256 of the ciphertext, in        |
+   |         |        |          | sha256: form.                        |
+   +---------+--------+----------+--------------------------------------+
 
    A receiver fetches url with GET /v0/blobs/{id} (no authentication),
    checks the ciphertext digest, decrypts, and checks that the plaintext
    length equals size. Any mismatch is an error. If url cannot be
    fetched, or its ciphertext fails the digest check, the receiver
-   tries each of copies in turn. The reference
+   tries each of mirrors in turn. The reference
    implementation limits a file to 25 MiB.
 
 8.10.  Client State
@@ -6085,6 +6105,28 @@ Experimental           Signet Protocol, Version 0          November 2026
    for it. A client SHOULD skip items whose id matches a delivery it
    submitted itself.
 
+   A client tells the server how far it has read with:
+
+      POST /v0/mailbox/ack   { "through": 42, "epoch": "e_…" }
+        (client-authenticated)  → { "through": 42 }
+
+   through is the highest seq the client has processed and stored
+   durably; a client sends it only after that. The server records the
+   largest value it has received from each client, and answers 409 if
+   epoch is not the store's current epoch, in which case the client
+   resets its cursor as described below. A lower value than one already
+   recorded changes nothing.
+
+   The server MAY delete an item once every active client of the
+   account that holds a read scope (Section 3.4.2) has acknowledged its
+   seq, and MUST delete it after retention seconds, whether or not
+   every client has. A server SHOULD use 2592000 (30 days) and MUST
+   publish its value in the policy field mailboxRetention when it
+   differs. A client that has not synced within retention can therefore
+   lose items, and one that is revoked stops being counted. Recorded
+   acknowledgements are part of the replicated state (Section 6.8.5).
+   In a domain with several homes, each home keeps its own.
+
    epoch names the mailbox store. It is made when the store is, and
    changes if the store is lost and started over, so seq values restart
    from 1. A client that knows an epoch sends it. If it differs from the
@@ -6101,10 +6143,12 @@ Experimental           Signet Protocol, Version 0          November 2026
       nothing is batched or delayed. Timing and size still reveal a lot
       (Section 15).
 
-   *  *Mailbox retention.* Version 0 has no route for a client to
-      acknowledge mailbox items, so a server cannot know when every
-      reading client has an item and it can be deleted. A future version
-      should add one.
+   *  *Mailbox retention.* Section 10.7 lets a server delete items that
+      every active reading client has acknowledged, and requires it to
+      delete them after the retention period. A client that is offline
+      longer than the period loses mail, and a client that never
+      acknowledges holds items until then. Acknowledgements reveal to
+      the home server which clients are reading and when.
 
    *  *One relay, one issuer.* Version 0 assumes one relay and one
       issuer operator. Collusion between relay and gateway, or between

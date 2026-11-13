@@ -353,8 +353,8 @@ describe('a domain run by three operators who share nothing', () => {
     const message = (await w.clients.jerzy.sync()).find((event) => event.kind === 'message');
     if (message?.kind !== 'message') throw new Error('expected a message');
     const [ref] = message.message.body.attachments;
-    expect(ref.copies).toHaveLength(2);
-    for (const url of [ref.url, ...(ref.copies ?? [])]) expect(new URL(url).origin).toEqual(expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/));
+    expect(ref.mirrors).toHaveLength(2);
+    for (const url of [ref.url, ...(ref.mirrors ?? [])]) expect(new URL(url).origin).toEqual(expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/));
 
     // The first home goes down: the file still arrives, from a copy.
     w.blocked.add(new URL(ref.url).origin);

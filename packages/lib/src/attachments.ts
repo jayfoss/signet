@@ -12,6 +12,8 @@ export interface AttachmentRef {
   type: string;
   size: number;
   url: string;
+  /** A content id: the message's html can show this attachment inline as `<img src="cid:…">` (Section 8.9). */
+  cid?: string;
   /** The same ciphertext at the sender's other homes, when it has several (Section 6.9.5). */
   mirrors?: string[];
   key: string;
@@ -23,6 +25,8 @@ export interface FileInput {
   name: string;
   type: string;
   data: Uint8Array;
+  /** Make the file available to the message's html as `cid:<cid>`. */
+  cid?: string;
 }
 
 const AAD = utf8('signet0 attachment');
@@ -33,7 +37,7 @@ export function sealAttachment(file: FileInput): { blob: Buffer; ref: Omit<Attac
   const key = randomSecret();
   const { iv, ct } = encrypt(key, file.data, AAD);
   const blob = fromB64u(ct);
-  return { blob, ref: { name: file.name, type: file.type, size: file.data.length, key: b64u(key), iv, digest: sha256(blob) } };
+  return { blob, ref: { name: file.name, type: file.type, size: file.data.length, ...(file.cid ? { cid: file.cid } : {}), key: b64u(key), iv, digest: sha256(blob) } };
 }
 
 export function openAttachment(ref: AttachmentRef, blob: Uint8Array): Buffer {

@@ -30,6 +30,8 @@ export interface GmailHeaders {
   humansOnly: boolean;
   /** The message's text body, fetched only for messages that carry a Signet header (Section 13.2.2). */
   text?: string;
+  /** Its text/html part, if it has one. */
+  html?: string;
 }
 
 const HEADERS = ['From', 'To', 'Subject', 'Message-ID', SIGNET_HEADER, AUDIENCE_HEADER];
@@ -56,6 +58,7 @@ export class GmailMailbox {
     to: string[];
     subject: string;
     text: string;
+    html?: string;
     signetHeader?: string;
     humansOnly?: boolean;
     files?: FileInput[];
@@ -65,6 +68,7 @@ export class GmailMailbox {
       to: mail.to,
       subject: mail.subject,
       text: mail.text,
+      ...(mail.html === undefined ? {} : { html: mail.html }),
       headers: {
         ...(mail.signetHeader ? { [SIGNET_HEADER]: mail.signetHeader } : {}),
         ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}),
@@ -110,7 +114,7 @@ export class GmailMailbox {
     };
     const header = (name: string) => message.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value;
     const from = header('From') ?? '';
-    const text = header(SIGNET_HEADER) ? await this.bodyText(id) : undefined;
+    const body = header(SIGNET_HEADER) ? await this.bodyParts(id) : undefined;
     return {
       id: message.id,
       threadId: message.threadId,
@@ -120,12 +124,12 @@ export class GmailMailbox {
       messageId: header('Message-ID') ?? '',
       ...(header(SIGNET_HEADER) ? { signet: header(SIGNET_HEADER) } : {}),
       humansOnly: header(AUDIENCE_HEADER)?.trim().toLowerCase() === 'humans',
-      ...(text !== undefined ? { text } : {}),
+      ...(body ? { text: body.text, ...(body.html === undefined ? {} : { html: body.html }) } : {}),
     };
   }
 
-  /** The text/plain part of a message, else its text/html part, decoded. */
-  private async bodyText(id: string): Promise<string> {
+  /** The text/plain part of a message ('' if it has none) and its text/html part, decoded. */
+  private async bodyParts(id: string): Promise<{ text: string; html?: string }> {
     type Part = { mimeType?: string; body?: { data?: string }; parts?: Part[] };
     const message = (await this.api('GET', `/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`)) as { payload?: Part };
     const find = (part: Part | undefined, type: string): string | undefined => {
@@ -137,7 +141,8 @@ export class GmailMailbox {
       }
       return undefined;
     };
-    return find(message.payload, 'text/plain') ?? find(message.payload, 'text/html') ?? '';
+    const html = find(message.payload, 'text/html');
+    return { text: find(message.payload, 'text/plain') ?? '', ...(html === undefined ? {} : { html }) };
   }
 
   private async api(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {

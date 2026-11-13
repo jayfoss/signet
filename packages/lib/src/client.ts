@@ -23,6 +23,7 @@ import {
   UnlistedAddressError,
 } from './directory';
 import { decodeResponse, encodeRequest } from './bhttp';
+import { MAX_HTML_BYTES, htmlToText, sanitizeHtml, textDiverges } from './html';
 import { signRequesterProof } from './requester';
 import type { ApprovalCard, ApprovalChoice, AudienceMember, DisclosureContext, OrgClaim } from './disclosure';
 import { DisclosureError, audienceHash, verifyOrgClaim } from './disclosure';
@@ -74,6 +75,8 @@ export interface LegacyMail {
   from: string;
   subject: string;
   text: string;
+  /** The html part reduced by the rules of Section 8.4.1, with no images: the only form of it that may be shown. */
+  html?: string;
   date: string | null;
   auth: LegacyAuth;
   /** `inbox` only when DMARC passed and the sender would be admitted anyway; everything else is a request. */
@@ -133,7 +136,16 @@ export type SignetEvent =
       linkedTo?: string;
     }
   | { kind: 'removed'; thread: string }
-  | { kind: 'message'; thread: string; message: SignedMessage; sender: ClientSummary }
+  | {
+      kind: 'message';
+      thread: string;
+      message: SignedMessage;
+      sender: ClientSummary;
+      /** The message's html reduced by the rules of Section 8.4.1: the only form of it that may be shown. */
+      safeHtml?: string;
+      /** The text and the html say different things, so a person and an agent reading them would not agree (Section 8.4.1). */
+      divergent?: boolean;
+    }
   | { kind: 'legacy'; mail: LegacyMail }
   | { kind: 'bounce'; id: string; to: string[]; reason: string }
   /** An agent handed a thread to its owner: their devices should show it as needing them. */
@@ -739,6 +751,11 @@ export class SignetClient {
     this.directories.clear();
     let id = this.thread(thread);
     const { files = [], humansOnly, ...rest } = fields;
+    if (rest.html !== undefined) {
+      if (Buffer.byteLength(rest.html) > MAX_HTML_BYTES) throw new Error(`a message's html is at most ${MAX_HTML_BYTES} bytes`);
+      // text is always present: an html-only message gets the text a person would read from it.
+      if (rest.text.trim() === '') rest.text = htmlToText(rest.html);
+    }
     const handsOff = (rest.intents ?? []).some((intent) => intent.name.startsWith('handoff.human'));
     if (this.state.needsHuman[id]?.by === this.address && this.keys.cert.kind !== 'device' && !handsOff) {
       throw new Error(`this thread was handed to a human (${this.state.needsHuman[id].reason}); an agent can't send in it until they reply`);
@@ -1002,19 +1019,19 @@ export class SignetClient {
   }
 
   /** Plain email through the home server, for recipients who aren't on Signet. It carries the Signet header. */
-  async sendLegacy(to: string[], fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ messageId: string }> {
+  async sendLegacy(to: string[], fields: { subject: string; text: string; html?: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ messageId: string }> {
     const attachments = (fields.files ?? []).map((file) => ({
       filename: file.name,
       contentType: file.type,
       content: Buffer.from(file.data).toString('base64'),
     }));
-    return (await this.call('POST', '/v0/legacy/send', { to, subject: fields.subject, text: fields.text, attachments, humansOnly: fields.humansOnly })) as {
+    return (await this.call('POST', '/v0/legacy/send', { to, subject: fields.subject, text: fields.text, ...(fields.html === undefined ? {} : { html: fields.html }), attachments, humansOnly: fields.humansOnly })) as {
       messageId: string;
     };
   }
 
   /** A Signet header for an outgoing plain email, attested by this account's home server with its domain key. */
-  async signetHeader(fields: { to: string[]; subject: string; bodyHash: string; humansOnly?: boolean }): Promise<string> {
+  async signetHeader(fields: { to: string[]; subject: string; bodyHash: string; htmlHash?: string; humansOnly?: boolean }): Promise<string> {
     return ((await this.call('POST', '/v0/legacy/attest', fields)) as { header: string }).header;
   }
 
@@ -1052,9 +1069,9 @@ export class SignetClient {
   }
 
   /** Plain email through the Gmail API (Gmail mode), carrying an attested Signet header. */
-  async sendViaGmail(gmail: GmailMailbox, to: string[], fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ id: string }> {
-    const header = await this.signetHeader({ to, subject: fields.subject, bodyHash: hashBody(fields.text), humansOnly: fields.humansOnly });
-    return gmail.send({ from: this.address, to, subject: fields.subject, text: fields.text, signetHeader: header, humansOnly: fields.humansOnly, files: fields.files });
+  async sendViaGmail(gmail: GmailMailbox, to: string[], fields: { subject: string; text: string; html?: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ id: string }> {
+    const header = await this.signetHeader({ to, subject: fields.subject, bodyHash: hashBody(fields.text), ...(fields.html === undefined ? {} : { htmlHash: hashBody(fields.html) }), humansOnly: fields.humansOnly });
+    return gmail.send({ from: this.address, to, subject: fields.subject, text: fields.text, html: fields.html, signetHeader: header, humansOnly: fields.humansOnly, files: fields.files });
   }
 
   /** New Gmail messages since `historyId` that carry a Signet header, checked; and where to resume. */
@@ -1068,7 +1085,7 @@ export class SignetClient {
     for (const message of messages) {
       if (!message.signet || (message.humansOnly && !mayReadHumansOnly)) continue;
       const signet = await this.checkSignetHeader(
-        { from: message.from, to: message.to, subject: message.subject, bodyHash: hashBody(message.text ?? ''), ...(message.humansOnly ? { audience: 'humans' as const } : {}) },
+        { from: message.from, to: message.to, subject: message.subject, bodyHash: hashBody(message.text ?? ''), ...(message.html === undefined ? {} : { htmlHash: hashBody(message.html) }), ...(message.humansOnly ? { audience: 'humans' as const } : {}) },
         message.signet,
       );
       if (signet) offers.push({ gmailId: message.id, from: message.from, subject: message.subject, signet, humansOnly: message.humansOnly });
@@ -1077,7 +1094,7 @@ export class SignetClient {
   }
 
   /** Signet when the recipient is enrolled (a request, or the existing thread), plain email otherwise. */
-  async mail(to: string, fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ via: 'signet' | 'smtp'; thread?: string }> {
+  async mail(to: string, fields: { subject: string; text: string; html?: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ via: 'signet' | 'smtp'; thread?: string }> {
     this.directories.clear();
     let enrolled: Directory | null = null;
     let unlisted = false;
@@ -1410,7 +1427,18 @@ export class SignetClient {
       throw new Error(`${held.by} handed this thread to a human, so its agents may not send in it`);
     }
     if (message.body.profile?.label) this.state.labels[member.clientId] = message.body.profile.label.slice(0, 64);
-    const events: SignetEvent[] = [{ kind: 'message', thread: payload.thread, message, sender: this.summary(directory, member) }];
+    const html = message.body.html;
+    const events: SignetEvent[] = [
+      {
+        kind: 'message',
+        thread: payload.thread,
+        message,
+        sender: this.summary(directory, member),
+        ...(html === undefined
+          ? {}
+          : { safeHtml: sanitizeHtml(html, message.body.attachments.flatMap((attachment) => (attachment.cid ? [attachment.cid] : []))), divergent: textDiverges(message.body.text, html) }),
+      },
+    ];
     for (const intent of message.body.intents) {
       if (intent.name.startsWith('session.end')) delete this.state.liveSessions[intent.args.sessionId as string];
       if (intent.name.startsWith('handoff.human')) {
@@ -1432,7 +1460,7 @@ export class SignetClient {
     const from = parsed.from?.value[0]?.address ?? sealed.envelopeFrom;
     const to = (Array.isArray(parsed.to) ? parsed.to : parsed.to ? [parsed.to] : []).flatMap((group) => group.value.map((entry) => entry.address ?? ''));
     const signet = await this.checkSignetHeader(
-      { from, to, subject: parsed.subject ?? '', bodyHash: hashBody(parsed.text ?? (typeof parsed.html === 'string' ? parsed.html : '')), ...(isHumansOnly(raw) ? { audience: 'humans' as const } : {}) },
+      { from, to, subject: parsed.subject ?? '', bodyHash: hashBody(parsed.text ?? ''), ...(typeof parsed.html === 'string' ? { htmlHash: hashBody(parsed.html) } : {}), ...(isHumansOnly(raw) ? { audience: 'humans' as const } : {}) },
       parsed.headers.get(SIGNET_HEADER.toLowerCase())?.toString(),
     );
     const lookalike = lookalikeOf(splitAddress(from).domain, knownDomains(this.state.admission, this.address)) ?? undefined;
@@ -1441,6 +1469,7 @@ export class SignetClient {
       from,
       subject: parsed.subject ?? '',
       text: parsed.text ?? '',
+      ...(typeof parsed.html === 'string' ? { html: sanitizeHtml(parsed.html, []) } : {}),
       date: parsed.date?.toISOString() ?? null,
       auth: sealed.auth,
       tier: trusted && !lookalike ? 'inbox' : 'request',

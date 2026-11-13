@@ -91,4 +91,32 @@ describe('mixing deliveries (Section 10.6.1)', () => {
     await mix.flush();
     await expect(held).resolves.toBe('out');
   });
+
+  it('asks its sources for work at every edge, even when nothing was submitted', async () => {
+    const mix = new Mix(40);
+    let edges = 0;
+    const sent: string[] = [];
+    mix.addSource(() => {
+      edges += 1;
+      return [{ key: `cover:${edges}`, run: async () => void sent.push('cover'), resolve: () => undefined, reject: () => undefined }];
+    });
+    mix.start();
+    await sleep(220);
+    await mix.stop();
+    expect(edges).toBeGreaterThanOrEqual(4);
+    expect(sent.length).toBe(edges);
+    const after = edges;
+    await sleep(100);
+    expect(edges).toBe(after);
+  });
+
+  it('puts real work and a source’s work into one shuffle', async () => {
+    const mix = new Mix(10_000);
+    const order: string[] = [];
+    mix.addSource(() => [{ key: 'cover', run: async () => void order.push('cover'), resolve: () => undefined, reject: () => undefined }]);
+    const real = mix.run('alice', async () => void order.push('real'));
+    await mix.flush();
+    await real;
+    expect([...order].sort()).toEqual(['cover', 'real']);
+  });
 });

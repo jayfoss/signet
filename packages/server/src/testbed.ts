@@ -62,7 +62,7 @@ export class Testbed {
 
   static async start(
     domains: string[],
-    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number; batchMs?: number } = {},
+    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number; batchMs?: number; cover?: Record<string, { domains: string[]; rate?: number; backlog?: number }>; acceptCover?: Record<string, { partners: string[]; perHour?: number }> } = {},
   ): Promise<Testbed> {
     const bed = new Testbed();
     // Witnesses need the log's address and key, and the log needs theirs, so they join the list once running.
@@ -98,6 +98,8 @@ export class Testbed {
           issuer: { url: bed.issuer.url, key: bed.issuer.publicKey },
           ohttpRelay: bed.relay.url,
           batchMs: options.batchMs,
+          cover: options.cover?.[domain],
+          acceptCover: options.acceptCover?.[domain],
           fetchImpl: (input, init) => bed.fetchBetweenServers(input, init),
         }),
       );

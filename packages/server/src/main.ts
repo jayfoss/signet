@@ -35,6 +35,8 @@ import { ClusterWitness } from './witness';
  * SIGNET_DKIM            JSON {"selector","privateKey"} to DKIM-sign outbound plain email
  * SIGNET_ISSUER          JSON {"url","key":{"name","publicKey"}} of the Privacy Pass issuer (anonymous requests)
  * SIGNET_OHTTP_RELAY     URL of the Oblivious HTTP relay for sealed and anonymous deliveries
+ * SIGNET_COVER           JSON {"domains":[...],"rate":1}: send cover traffic to these domains (needs batching; Section 10.6.2)
+ * SIGNET_ACCEPT_COVER    JSON {"partners":[...],"perHour":3600}: take cover traffic from these domains
  * SIGNET_BATCH_MS        a home or relay holds deliveries to other servers for up to this long and sends them together
  *                        in random order (2000; 0 sends at once). It helps only as much as there are senders to mix.
  * SIGNET_LIMITS          JSON of daily limits to change, e.g. {"requestsPerSenderPerDay":2}. Each home counts its own,
@@ -214,6 +216,8 @@ async function main(): Promise<void> {
     publicUrl: env('SIGNET_PUBLIC_URL'),
     openEnrollment: env('SIGNET_OPEN_ENROLLMENT') === '1',
     batchMs: batchMs(),
+    cover: jsonEnv<{ domains: string[]; rate?: number; backlog?: number }>('SIGNET_COVER'),
+    acceptCover: jsonEnv<{ partners: string[]; perHour?: number }>('SIGNET_ACCEPT_COVER'),
     dataDir: cluster ? undefined : dataDir(),
     intake: env('SIGNET_INTAKE') === '1',
     outbound: new OutboundSmtp(domain, { relay: jsonEnv('SIGNET_SMTP_RELAY'), dkim: jsonEnv('SIGNET_DKIM') }),

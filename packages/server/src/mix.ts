@@ -1,14 +1,25 @@
+/** One piece of work for a window: a sender's delivery, or a cover delivery with a key of its own. */
+export interface Work {
+  key: string;
+  run: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+}
+
 /**
  * Holds work until the end of a clock-aligned window and then starts all of it together, groups in a random order
  * (Section 10.6.1). What an observer of the outgoing traffic sees is that deliveries leave at the window's edge, in an
  * order unrelated to when they were submitted, so the moment one user sent says little about the moment a delivery
  * left. Work from one sender keeps its order: a commit never overtakes the message before it.
  *
- * It hides nothing when only one sender has work in a window, and it sends no cover traffic.
+ * Sources add work of their own at every edge, which is how cover traffic is sent whether or not anyone has anything
+ * to send (Section 10.6.2). Without cover it hides nothing when only one sender has work in a window.
  */
 export class Mix {
-  private pending: { key: string; run: () => Promise<unknown>; resolve: (value: unknown) => void; reject: (error: unknown) => void }[] = [];
+  private pending: Work[] = [];
   private timer?: NodeJS.Timeout;
+  private looping = false;
+  private readonly sources: (() => Work[])[] = [];
 
   constructor(
     private readonly windowMs: number,
@@ -20,23 +31,49 @@ export class Mix {
     return this.windowMs > 0;
   }
 
+  /** Ask `source` for work at every edge. Call `start` for edges to come when nothing was submitted. */
+  addSource(source: () => Work[]): void {
+    this.sources.push(source);
+  }
+
+  /** Have an edge every window, whether or not anything is held. */
+  start(): void {
+    if (!this.enabled || this.looping) return;
+    this.looping = true;
+    this.schedule();
+  }
+
+  /** Stop having edges, and send what is held now. */
+  async stop(): Promise<void> {
+    this.looping = false;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    await this.flush();
+  }
+
+  private schedule(): void {
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.flush();
+      if (this.looping) this.schedule();
+    }, this.windowMs - (this.now() % this.windowMs));
+    this.timer.unref();
+  }
+
   /** Run `work` at the end of the current window. `key` names the sender: its work runs in the order it was given. */
   run<T>(key: string, work: () => Promise<T>): Promise<T> {
     if (!this.enabled) return work();
     return new Promise<T>((resolve, reject) => {
       this.pending.push({ key, run: work, resolve: resolve as (value: unknown) => void, reject });
-      this.timer ??= setTimeout(() => void this.flush(), this.windowMs - (this.now() % this.windowMs));
-      this.timer.unref();
+      if (!this.timer) this.schedule();
     });
   }
 
   /** Start everything held now, and wait for it. Used at the end of a window, and when the server stops. */
   async flush(): Promise<void> {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = undefined;
-    const batch = this.pending;
+    const batch = [...this.pending, ...this.sources.flatMap((source) => source())];
     this.pending = [];
-    const groups = new Map<string, typeof batch>();
+    const groups = new Map<string, Work[]>();
     for (const item of batch) groups.set(item.key, [...(groups.get(item.key) ?? []), item]);
     const order = [...groups.values()];
     // Fisher-Yates: a uniformly random order of senders.

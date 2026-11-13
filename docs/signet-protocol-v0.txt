@@ -135,6 +135,25 @@ Experimental           Signet Protocol, Version 0          November 2026
       6.5.  Caching and Downgrade Resistance ........................ 52
       6.6.  Running Alongside Existing Mail ......................... 53
       6.7.  Open Issues ............................................. 53
+      6.8.  Multi-Home Domains ...................................... 53
+         6.8.1.  Overview .......................................... 53
+         6.8.2.  Replicas and Roles ................................ 53
+         6.8.3.  Policy and Discovery .............................. 54
+         6.8.4.  Choosing a Home ................................... 54
+         6.8.5.  Replicated State .................................. 55
+         6.8.6.  Election and Replication .......................... 55
+         6.8.7.  Failure Behaviour ................................. 56
+         6.8.8.  Replica Recovery .................................. 57
+         6.8.9.  Security Considerations ........................... 57
+         6.8.10.  Open Issues ...................................... 57
+      6.9.  Multi-Operator Domains ................................ 58
+         6.9.1.  Overview .......................................... 58
+         6.9.2.  The Operators Statement ........................... 59
+         6.9.3.  Home Keys and Server Calls ........................ 60
+         6.9.4.  What the Domain Owner Keeps ....................... 60
+         6.9.5.  Delivery to Many Homes ............................ 61
+         6.9.6.  Reading and Registering ........................... 62
+         6.9.7.  Security Considerations and Open Issues ........... 62
    7.  Requests and Admission ....................................... 53
       7.1.  Overview ................................................ 53
       7.2.  Request Body ............................................ 54
@@ -2964,6 +2983,17 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |        |          | in this document are relative   |
    |             |        |          | to it.                          |
    +-------------+--------+----------+---------------------------------+
+   | homes       | array  | no       | Base URLs of the domain's homes |
+   |             |        |          | in order of preference, when it |
+   |             |        |          | runs more than one (Section     |
+   |             |        |          | 6.8). server MUST equal the     |
+   |             |        |          | first.                          |
+   +-------------+--------+----------+---------------------------------+
+   | operators   | object | no       | The domain owner's signed list  |
+   |             |        |          | of independent homes (Section   |
+   |             |        |          | 6.9). Needs dk in the DNS       |
+   |             |        |          | record.                         |
+   +-------------+--------+----------+---------------------------------+
    | mode        | string | yes      | enforce or testing (Section     |
    |             |        |          | 6.5).                           |
    +-------------+--------+----------+---------------------------------+
@@ -3021,18 +3051,23 @@ Experimental           Signet Protocol, Version 0          November 2026
        key=value is a field; the key and value are trimmed and
        lowercased. Parts without exactly one = are ignored.
 
-   4.  If a host field is present, it MUST be a hostname made of
-       letters, digits and hyphens in dot-separated labels, with no
-       label starting or ending in a hyphen, and it MUST equal the
-       domain or end with . followed by the domain. If either check
-       fails, the domain does not support Signet. Otherwise the
-       candidate hosts are [host].
+   4.  If a host field is present, split it on commas. Each part MUST
+       be a hostname made of letters, digits and hyphens in
+       dot-separated labels, with no label starting or ending in a
+       hyphen, and it MUST equal the domain or end with . followed by
+       the domain. If any part fails either check, the domain does not
+       support Signet. Otherwise the candidate hosts are the parts, in
+       order (Section 6.8.3).
 
    5.  If there is no host field, the candidate hosts are
        signet.<domain>, then <domain>.
 
    The host restriction keeps control of the policy with whoever runs
    the domain's zone. A host on another domain is refused.
+
+   A record MAY carry dk, the domain's public key, which pins
+   domainKey (Section 6.9.2). The value of dk is not lowercased in
+   step 3.
 
 6.4.  Fetching the Policy
 
@@ -3113,6 +3148,697 @@ Experimental           Signet Protocol, Version 0          November 2026
       domain, but the policy's server URL may point anywhere. This
       allows hosted providers, and also means the policy host decides
       where all traffic goes.
+
+6.8.  Multi-Home Domains
+
+6.8.1.  Overview
+
+   A domain MAY run several home servers, called homes, that hold the
+   same state. At any moment one of them is the primary and answers
+   requests; the others are standbys that copy the primary's changes
+   and can take over without anyone editing DNS. A domain with one home
+   is a cluster of one and needs nothing in this section.
+
+   The design has four aims:
+
+   1.  Mail keeps flowing when a home, or the provider that hosts it,
+       fails. Homes are found through _signet and the policy host, not
+       through MX (Section 6.1), so an outage at the domain's mail
+       provider does not touch them.
+
+   2.  A change the primary has acknowledged is never lost by a
+       failover.
+
+   3.  There are never two primaries accepting changes.
+
+   4.  Callers need no new configuration: the policy lists the homes
+       and the callers choose among them (Section 6.8.4).
+
+   It does not spread load, allow writes on more than one home at a
+   time, or let one cluster span operators who do not trust each other
+   (Section 6.8.9).
+
+   Homes do not order MLS commits. Section 8.11 describes that gap; it
+   is the same with one home or many.
+
+6.8.2.  Replicas and Roles
+
+   A cluster is a fixed set of replicas. Each has an identifier unique
+   within the cluster and one of two roles:
+
+   +=========+=======================================================+
+   | Role    | Behaviour                                             |
+   +=========+=======================================================+
+   | home    | Keeps the replication log, applies it to a full copy  |
+   |         | of the home's state, serves the policy, votes, and    |
+   |         | can become primary. Listed in the policy.             |
+   +---------+-------------------------------------------------------+
+   | witness | Keeps the replication log and votes. Does not apply   |
+   |         | it, never becomes primary, serves only cluster calls, |
+   |         | and is not listed in the policy.                      |
+   +---------+-------------------------------------------------------+
+
+   Every replica votes. A majority is more than half of all replicas.
+   The cluster keeps working while a majority can talk to each other,
+   so it survives the loss of floor((N - 1) / 2) of N replicas. Two
+   homes alone survive no failure, since neither is a majority; two
+   homes and a witness survive one. A cluster SHOULD have an odd number
+   of replicas.
+
+   A witness stores the replication log, and the log holds everything
+   a home holds: mailbox items, key packages, parked deliveries and
+   account logs. A witness is therefore as trusted as a home. A
+   replica that voted without keeping the log could let an
+   acknowledged change be lost, so there is no vote-only role.
+
+   All replicas of a home use the same key and the same VRF, OHTTP
+   gateway and intake keys: they are one server in several places, not
+   several servers. The operator supplies these keys to each replica.
+   For a domain whose homes are run by one party, that key is the
+   domain key. A domain whose homes belong to different operators uses
+   Section 6.9 instead, and no replica holds the domain key.
+
+6.8.3.  Policy and Discovery
+
+   The policy (Section 6.2) gains one field, homes: an array of one to
+   seven base URLs, in order of preference, one for each home. Witnesses
+   are never listed. When homes is present, server MUST equal its first
+   element, so that a client that ignores homes still works. When it is
+   absent, the domain has one home, server. All replicas serve the same
+   policy.
+
+   The host field of the DNS record (Section 6.3) MAY list several
+   hostnames separated by commas. Each is checked as Section 6.3 says
+   for a single host, and the candidate hosts are the listed ones, in
+   order. Each home serves the policy at /.well-known/signet.json
+   whatever its role and whether or not a primary exists, so discovery
+   works during an election and does not depend on one host being up.
+
+6.8.4.  Choosing a Home
+
+   A caller is a client of the domain, or the server of another domain
+   delivering or querying. To make a request to a domain with several
+   homes, a caller:
+
+   1.  Tries the home that last worked first, then the others in
+       policy order.
+
+   2.  Moves to the next home when a request fails to connect, times
+       out, or gets a response of 500 or above.
+
+   3.  When a home answers 421, reads its Signet-Primary field. If the
+       value is the base URL of a home in the policy, the caller sends
+       the request there once. It MUST NOT use a URL that is not one
+       of the policy's homes.
+
+   4.  When every home has failed, treats the failure as temporary. A
+       delivery is queued and retried as Section 10.6 says.
+
+   A replica that is not the primary answers every request other than
+   GET /.well-known/signet.json and the cluster calls (Section 6.8.6)
+   with 421. It sets Signet-Primary to the primary's base URL if it
+   knows one, and omits it during an election. A primary that has lost
+   contact with a majority (Section 6.8.6) answers 503.
+
+   A request that fails after it was sent, such as a dropped
+   connection, may have taken effect. A caller MAY send it again. A
+   receiving home MUST ignore a delivery whose id is already in the
+   recipient's mailbox (Section 6.9.5).
+
+   A caller learns which home is primary from 421 answers. The
+   primary's position changes at election time; the policy does not.
+
+6.8.5.  Replicated State
+
+   The primary replicates every change to its store: accounts,
+   mailboxes, key packages, delivery tokens, parked deliveries, spent
+   Privacy Pass nonces, contacts, view grants, daily counters,
+   organisation claims, accepted request replays, the epoch of the
+   mailbox store (Section 10.7) and the queue of deliveries waiting
+   for a retry. Pairing slots (Section 3.4.4) last ten minutes and
+   are not replicated; a failover loses them, and the owner opens a
+   new one.
+
+   Attachment ciphertext (Section 8.9) is not part of the log, since
+   a file of tens of megabytes would otherwise sit in every replica's
+   log and every snapshot. The primary keeps each blob beside its
+   log and copies it to the other homes with a signed
+   POST /v0/cluster/blob/{id}, and answers the upload only once at
+   least one other home has acknowledged, if the cluster has one. If
+   none can be reached it answers 503. Any home serves GET
+   /v0/blobs/{id}, and a home that lacks a blob asks the others for it
+   with a signed GET /v0/cluster/blob/{id} and keeps what it gets. A
+   witness holds no blobs. Version 0 does not copy a blob again once
+   the replicas that held it are gone.
+
+   Changes travel as batches of commands. Every replica applies the
+   same batches in the same order, so a mailbox item has the same seq
+   on every home, and a client may use the cursor it holds with any
+   home.
+
+   The primary MUST NOT answer a request until every change the
+   request made, and every change made before it, is committed
+   (Section 6.8.6). Effects outside the store, such as relaying a
+   delivery or sending plain email, MAY happen before the commit. If
+   the primary loses its place before the commit, the caller gets an
+   ambiguous failure (Section 6.8.4) and the uncommitted change is
+   discarded.
+
+   A replica that stops being primary MUST discard any state it applied
+   but did not commit, by rebuilding its state from the committed part
+   of its log.
+
+   When a home becomes primary it MUST rebuild whatever it derived
+   from the store (for example which users are unlisted) and schedule
+   every delivery in the retry queue. Only the primary retries
+   deliveries.
+
+6.8.6.  Election and Replication
+
+   Replicas choose the primary and replicate changes with the Raft
+   algorithm [RAFT], with the profile below. Where this section is
+   silent, [RAFT] applies.
+
+   1.  Each replica keeps a current term, the identifier it voted for
+       in that term, and the log. It MUST write all three to durable
+       storage before answering any call that changes them. A replica
+       with no durable storage MUST NOT take part.
+
+   2.  A log entry is a term and a batch of commands. A new primary
+       appends an empty entry in its own term and MUST NOT answer a
+       request until that entry is committed.
+
+   3.  A replica grants a vote to a candidate only if the candidate's
+       term is at least its own, it has not voted for another candidate
+       in that term, and the candidate's log is at least as up to date
+       as its own. Witnesses grant votes the same way and never
+       stand as candidates.
+
+   4.  A home that hears nothing from a primary for a random time
+       between T and 2T first asks the others for a pre-vote: would
+       they vote for it in the next term? A replica grants one only if
+       the candidate's log is at least as up to date as its own, it
+       has not heard from a primary for T, and it is not a primary
+       itself. A pre-vote changes nothing on the replica that grants
+       it. Only if a majority grants does the home raise its term and
+       start an election, so a replica that is merely cut off does
+       not force an election when it returns. T is 1000 milliseconds
+       unless configured. The primary sends a heartbeat every T/5.
+
+   5.  An entry is committed once the primary has stored it on a
+       majority of replicas and it, or a later entry, is from the
+       primary's own term.
+
+   6.  A primary that has not had an answer from a majority within T
+       MUST step down and answer 503 until it has. This stops a
+       primary on the small side of a partition from serving stale
+       answers for long. It relies on clocks that run at nearly the
+       same rate; it does not rely on them agreeing.
+
+   7.  A primary MUST step down when it sees a higher term in any call
+       or answer. Every answer a primary gives to a client includes the
+       header Signet-Term with its term.
+
+   8.  A replica MAY compact its log. It takes a snapshot of its
+       state as of the last entry it applied, keeps the snapshot with
+       the index and term of that entry, and drops the entries it
+       covers. A snapshot is only taken when the state holds nothing
+       that is not committed, so a primary waits until its own changes
+       are committed. A witness applies nothing; its snapshot is only
+       an index and a term. The snapshot is written durably before the
+       log is cut down to match it.
+
+   9.  A primary that needs to send a replica entries it has dropped
+       sends its snapshot instead. The replica discards its log and
+       state and takes the snapshot, then receives the entries after
+       it. A replica that restarts loads its snapshot before it
+       applies anything else.
+
+   Replicas call each other at three routes. All are POST, send JSON,
+   and are authenticated like calls between servers (Section 4.6)
+   with the key the replicas of a home share. The body names the
+   sender's identifier, and a replica rejects a call whose sender is
+   not in its configured membership. It also rejects a call whose
+   signature it has already seen.
+
+   +=====================+===========================================+
+   | Route               | Meaning                                   |
+   +=====================+===========================================+
+   | /v0/cluster/vote    | { term, candidate, lastIndex, lastTerm,   |
+   |                     | pre? } → { term, granted }. With pre set  |
+   |                     | it is a pre-vote.                         |
+   +---------------------+-------------------------------------------+
+   | /v0/cluster/append  | { term, leader, prevIndex, prevTerm,      |
+   |                     | entries, commit } → { term, success,      |
+   |                     | matchIndex }. Empty entries make it a     |
+   |                     | heartbeat.                                |
+   +---------------------+-------------------------------------------+
+   | /v0/cluster/        | { term, leader, index, snapshotTerm,      |
+   | snapshot            | data } → { term, matchIndex }             |
+   +---------------------+-------------------------------------------+
+
+6.8.7.  Failure Behaviour
+
+   +==========================+========================================+
+   | Failure                  | Result                                 |
+   +==========================+========================================+
+   | A standby or witness     | No effect while a majority remains.    |
+   | fails                    |                                        |
+   +--------------------------+----------------------------------------+
+   | The primary fails        | After T to 2T, a standby with the most |
+   |                          | complete log wins an election. Callers |
+   |                          | follow 421 or move to the next home.   |
+   +--------------------------+----------------------------------------+
+   | A partition              | The side with a majority elects a      |
+   |                          | primary if it needs one. The old       |
+   |                          | primary, if on the small side, answers |
+   |                          | 503 within T and steps down.           |
+   +--------------------------+----------------------------------------+
+   | A majority is down       | No primary. Policies are still served. |
+   |                          | Senders queue deliveries as Section    |
+   |                          | 10.6 says. Clients keep their local    |
+   |                          | state and wait.                        |
+   +--------------------------+----------------------------------------+
+   | The domain's mail        | No effect.                             |
+   | provider fails           |                                        |
+   +--------------------------+----------------------------------------+
+
+6.8.8.  Replica Recovery
+
+   A replica that restarts keeps its term, vote and log, and applies
+   the log up to the commit index it learns from the primary. A
+   replica that lost its storage rejoins empty under its old
+   identifier and receives the whole log from the primary. A replica
+   that lost its storage MUST NOT vote until it has caught up to a
+   commit index learned from a primary, because it may have voted
+   earlier in a term it can no longer remember.
+
+6.8.9.  Security Considerations
+
+   *  *Replicas share a key.* A replica that is compromised can sign
+      as the home and read the replicated mailbox ciphertext, and keys
+      for the OHTTP gateway and intake. All replicas of one home MUST
+      belong to one operator. Operators who do not trust each other
+      run separate homes (Section 6.9); they do not join a cluster.
+
+   *  *Message content is unaffected.* Replicas hold what a home
+      holds: ciphertext, and the metadata a home sees. They never hold
+      a key that opens a message. Copying that data to more places
+      increases who can see the metadata.
+
+   *  *Cluster calls are domain calls.* They are signed with the
+      domain key and are accepted only from configured members. The
+      cluster routes SHOULD NOT be reachable from the public Internet.
+
+   *  *Homes in the policy are trusted like server.* Section 6.7
+      already notes that server is unconstrained. homes is the same,
+      with more entries.
+
+   *  *Signet-Primary is a hint.* A caller uses it only for URLs
+      already in the policy, so a hostile replica can send a caller
+      to a home it already trusts and no further.
+
+6.8.10.  Open Issues
+
+   *  *Membership changes.* Version 0 has fixed membership.
+      Replacing a replica keeps its identifier. Adding or removing
+      one is not specified.
+
+   *  *No follower reads.* Standbys could answer reads with a note of
+      how far they have applied. Version 0 sends all client traffic to
+      the primary.
+
+   *  *Who was primary.* Recording each term in the account log or
+      the transparency log would let outsiders check who was primary
+      and when. It is not specified.
+
+   *  *Ambiguous retries.* Deliveries repeat after an ambiguous
+      failure. Section 6.8.4 asks homes to drop a repeated delivery id;
+      the effect of a repeat on a sealed delivery whose token has been
+      spent is not described.
+
+6.9.  Multi-Operator Domains
+
+6.9.1.  Overview
+
+   A domain MAY spread across operators who do not trust each other.
+   Each operator runs an independent home with its own key, state and
+   mailboxes. Homes copy nothing between them. Resilience comes from
+   redundancy at the edges: a delivery goes to every home of its
+   recipient, and a client reads from every home of its own domain.
+
+   In this section a home is one operator's service. A home MAY be a
+   cluster of replicas as Section 6.8 describes; the "homes" and
+   "replicas" of that section are then the replicas of this home, all
+   run by one operator and all using that operator's home key.
+
+   The threat model is that every operator is hostile. Content is end
+   to end encrypted and identities are signed by keys the operators do
+   not hold, so a hostile operator's powers are these:
+
+   +=====================+===========================================+
+   | A hostile operator  | Why                                       |
+   +=====================+===========================================+
+   | cannot read         | Messages, attachments and legacy mail are |
+   | content             | encrypted to client keys.                 |
+   +---------------------+-------------------------------------------+
+   | cannot forge a      | Messages and requests are signed by       |
+   | message or identity | client and identity keys; account logs    |
+   |                     | are signed by the identity key.           |
+   +---------------------+-------------------------------------------+
+   | cannot speak for    | It holds no domain key (Section 6.9.4).   |
+   | the domain          | It cannot bind an address to a key, add   |
+   |                     | to the transparency log, or sign an org   |
+   |                     | claim.                                    |
+   +---------------------+-------------------------------------------+
+   | can withhold or     | Other homes still hold the delivery       |
+   | delay mail          | (Section 6.9.5).                          |
+   +---------------------+-------------------------------------------+
+   | can see metadata    | Who writes to whom, when, and thread ids  |
+   | for what it         | (Section 15). Each home sees only what    |
+   | receives            | is delivered to it.                       |
+   +---------------------+-------------------------------------------+
+   | can serve stale or  | Clients compare the homes they read       |
+   | different mailboxes | (Section 6.9.6).                          |
+   +---------------------+-------------------------------------------+
+
+6.9.2.  The Operators Statement
+
+   The domain owner signs a statement naming the homes, and the policy
+   (Section 6.2) carries it in a field operators:
+
+      { "body": { "v": "signet0", "domain": "example.net",
+          "seq": 3, "notAfter": "2027-02-01T00:00:00.000Z",
+          "homes": [
+            { "url": "https://home.alpha.example",
+              "key": "b64u Ed25519 public key",
+              "replicas": ["https://r2.alpha.example"],
+              "ohttp": {
+                "gateway": "https://home.alpha.example/v0/ohttp",
+                "keys": "b64u key configuration" } },
+            { "url": "https://home.beta.example",
+              "key": "b64u Ed25519 public key" } ] },
+        "sig": "b64u signature by the domain key over body" }
+
+   +==========+========+=============================================+
+   | Field    | Type   | Meaning                                     |
+   +==========+========+=============================================+
+   | seq      | number | Increases with every statement. A client    |
+   |          |        | that holds a higher seq for the domain MUST |
+   |          |        | refuse a lower one, and SHOULD keep the     |
+   |          |        | highest seq across restarts.                |
+   +----------+--------+---------------------------------------------+
+   | notAfter | string | When the statement expires. A client MUST   |
+   |          |        | refuse an expired statement. This is how an |
+   |          |        | operator is removed: the owner signs a new  |
+   |          |        | statement without it.                       |
+   +----------+--------+---------------------------------------------+
+   | homes    | array  | One to seven homes, in order of preference. |
+   |          |        | url is the home's base URL and key the home |
+   |          |        | key (Section 6.9.3). replicas, if present,  |
+   |          |        | lists other base URLs of the same home, for |
+   |          |        | Section 6.8.4. ohttp, if present, is the    |
+   |          |        | home's own Oblivious HTTP gateway and key   |
+   |          |        | configuration (Section 10.4).               |
+   +----------+--------+---------------------------------------------+
+
+   Every home serves the same policy. The domain owner signs the
+   statement with the domain key, which operators do not hold, and
+   gives it to each operator to serve.
+
+   A policy that carries operators is only as trustworthy as the domain
+   key it names, and operators serve the policy. The DNS record
+   (Section 6.3) therefore pins that key with a dk field:
+
+      _signet.example.net. IN TXT
+         "v=signet0; host=a.example.net,b.example.net; dk=<b64u key>"
+
+   dk is the domain's Ed25519 public key. Unlike other fields, its
+   value is not lowercased. A client MUST refuse a policy whose
+   domainKey differs from dk, MUST refuse a policy with operators when
+   the record has no dk, and MUST refuse a statement whose signature,
+   domain, seq or notAfter fails the checks above. A policy host that
+   fails them counts as failed (Section 6.4).
+
+   Once accepted, a client treats homes as the policy's homes
+   (Section 6.8.3), the first home's url as server and its ohttp as
+   the policy's ohttp. A domain with operators has no unsigned homes
+   or ohttp field.
+
+6.9.3.  Home Keys and Server Calls
+
+   Each home has an Ed25519 home key, shared by that operator's
+   replicas and nobody else. A home signs its server-to-server calls
+   (Section 4.6) with the home key. It adds the header:
+
+   +==============+==================================================+
+   | Header       | Value                                            |
+   +==============+==================================================+
+   | signet-home  | The home key, b64u. It is covered by the         |
+   |              | signature, as the field home of the signed       |
+   |              | object.                                          |
+   +--------------+--------------------------------------------------+
+
+   The receiver resolves the calling domain's policy and accepts the
+   call only if signet-home is the key of a home in the verified
+   statement and the signature verifies under it. A call with no
+   signet-home header is checked against the domain key as before.
+
+   Appending to a transparency log (Section 5.6) is not a home's
+   power: a log accepts appends signed by the domain key only.
+
+   A home also signs the directory answers that say an address is not
+   enrolled or is unlisted (Section 4). Such an answer carries home,
+   the home key, and verifies under it when the key is in the verified
+   statement; an answer without home verifies under the domain key.
+
+6.9.4.  What the Domain Owner Keeps
+
+   The domain key stays with the domain owner. It is used for four
+   things, none of which a home does itself:
+
+   *  Binding an address to an identity key (Section 4.2).
+
+   *  Recording that binding, or its removal, in the transparency log.
+
+   *  Signing organisation claims (Section 9.3.2).
+
+   *  Attesting legacy mail (Section 13.2.2).
+
+   A home that needs one of these asks the owner's registrar. A home
+   never gives the registrar a leaf or a binding to sign.
+
+   The registrar is a service the owner runs. A home calls it with a
+   POST, signed with its home key as Section 6.9.3 describes. The
+   registrar accepts a call only from a home in the owner's current
+   statement and refuses a signature it has already seen.
+
+   +=======================+=========================================+
+   | Route                 | Meaning                                 |
+   +=======================+=========================================+
+   | /v0/registrar/bind    | A publication (Section 3.10) →          |
+   |                       | the domain binding. The registrar       |
+   |                       | checks the log, card and view itself,   |
+   |                       | appends a leaf to the transparency log  |
+   |                       | if the card or view changed, and signs  |
+   |                       | the binding.                            |
+   +-----------------------+-----------------------------------------+
+   | /v0/registrar/unbind  | { principal } → {}. Appends an          |
+   |                       | unbound leaf.                           |
+   +-----------------------+-----------------------------------------+
+   | /v0/registrar/attest  | { principal, to, subject, server,       |
+   |                       | proof } → { header }. The attested      |
+   |                       | Signet header for plain email.          |
+   +-----------------------+-----------------------------------------+
+
+   The registrar enforces these rules, so that a hostile home gets
+   nothing from it that it could not already do for its own users:
+
+   *  It binds a new address only after the owner has approved that
+      address. A home cannot create an account.
+
+   *  It remembers the account log of every address it has bound. A
+      later publication must extend that log, and any key change in
+      it must be one the log's own signatures allow. A home cannot
+      swap in a different log or identity key.
+
+   *  It releases an address only when the owner's rule allows it.
+      With no rule, no home can.
+
+   *  It attests mail only for a request one of the user's own clients
+      signed. proof is that client's own request to its home, passed
+      on unchanged: the method, path, body and the signet-principal,
+      signet-client, signet-ts, signet-nonce and signet-sig headers. The
+      registrar checks, against the log it bound, that the client is
+      active and may send, that the signature verifies and has not been
+      used before, that the path is /v0/legacy/attest or
+      /v0/legacy/send, and that the body names the same recipients and
+      subject as the request. A home cannot attest mail nobody asked
+      to send, or reuse a proof for different mail.
+
+   Organisation claims (Section 9.3.2) are signed by the owner ahead
+   of time, not by a home. The owner gives a home the signed claims,
+   and the home keeps only claims that verify under the domain key
+   for the address and have not expired. It serves them as they are.
+   The owner signs new claims before the old ones expire.
+
+6.9.5.  Delivery to Many Homes
+
+   An endpoint client submits a message once, to its own domain
+   (Section 10.2), and chooses the delivery id itself. It does not send
+   a message to each recipient home. The submitting home does:
+
+   1.  For each recipient domain, the home delivers to every home in
+       that domain's statement, at the same time. It sends each home
+       the same delivery, with the same id, to the home's own URL, and
+       sends a sealed or anonymous delivery through that home's own
+       gateway (Section 10.4.3) when it has one. Replica failover
+       within a home (Section 6.8.4) still applies; substituting a
+       different home does not.
+
+   2.  A recipient domain counts as delivered once any of its homes
+       accepts. An address counts as unknown only if every home that
+       answered says so.
+
+   3.  A home that cannot be reached, or fails in a way Section 10.6
+       calls temporary, is retried on its own schedule, apart from the
+       others. The delivery is not reported as queued once another
+       home has accepted it.
+
+   4.  The sender is told a delivery failed for good only when every
+       home of the recipient domain refused it permanently.
+
+   5.  A home MUST ignore a delivery whose id is already in the
+       recipient's mailbox. This applies to every home, whatever the
+       domain's setup.
+
+   If the client's submitting home cannot be reached, the client sends
+   the same envelope, with the same id, to another of its own homes.
+   The id makes this safe.
+
+   The submitting home is not trusted to say that it delivered. Every
+   home that stores a delivery for a recipient signs a receipt, and the
+   submitting home passes the receipts back to the client:
+
+      { "body": { "v": 0, "id": "i_…", "domain": "example.net",
+          "to": ["bob@example.net"], "held": [],
+          "ts": "2026-11-13T09:30:00.000Z",
+          "home": "b64u home key" },
+        "sig": "b64u signature over body" }
+
+   +========+========+================================================+
+   | Field  | Type   | Meaning                                        |
+   +========+========+================================================+
+   | id     | string | The delivery id.                               |
+   +--------+--------+------------------------------------------------+
+   | domain | string | The recipient domain.                          |
+   +--------+--------+------------------------------------------------+
+   | to     | array  | Addresses whose mailbox now holds the          |
+   |        |        | delivery.                                      |
+   +--------+--------+------------------------------------------------+
+   | held   | array  | Addresses for which the home is holding it,    |
+   |        |        | such as a sealed delivery waiting for its      |
+   |        |        | token (Section 10.3.3).                        |
+   +--------+--------+------------------------------------------------+
+   | home   | string | Present when a home key signed in place of the |
+   |        |        | domain key (Section 6.9.3).                    |
+   +--------+--------+------------------------------------------------+
+
+   A receiving home returns its receipt in the delivery response, in a
+   field receipts, and includes no address it delivered through an
+   intake (Section 4.11), so an unlisted address answers as an unknown
+   one does. A delivery that was queued and lands on a retry is proved
+   to the sender in a mailbox item of kind receipt, with the payload
+   { "id": "i_…", "receipts": [ … ] }, which the sender's home stores
+   as it stores a bounce.
+
+   A client counts an address as confirmed when the server answered
+   that it is unknown or refused it, or when a receipt that verifies
+   under the recipient domain's key, or under the key of one of its
+   listed homes, names it in to or held for that delivery id. A
+   receipt from one of the client's own domain's homes, where that
+   home is the one the client submitted through, does not count: that
+   home is the one that might have dropped the message.
+
+   A client keeps a send until every address is confirmed. If one is
+   not confirmed within a grace period, which the reference client sets
+   to five minutes, the client sends the same envelope again, with the
+   same id and only the addresses still unconfirmed, through a home
+   other than the one it used last. After three such resends it
+   reports that the delivery is unconfirmed to its user and stops. A
+   recipient home that already holds the id ignores the repeat and
+   signs a receipt for it.
+
+6.9.6.  Reading and Registering
+
+   A client of a domain with several homes:
+
+   1.  Reads the mailbox of every home of its own domain, keeping a
+       cursor for each, because seq values differ between homes. It
+       processes an item only if it has not processed the item's id,
+       whichever home it came from, and remembers processed ids with
+       the rest of its state. It remembers each id with the time it
+       was processed and forgets it after thirty days, longer than a
+       sender retries (about five days), so an item that arrives late
+       is still recognised however much mail came after it. It also
+       remembers the epoch each home gave for its mailbox (Section
+       10.7) and starts that home's cursor over when the epoch
+       changes. If some homes fail it uses the others; it reports an
+       error only if none answered.
+
+   2.  Registers delivery tokens, key packages, contacts and view
+       grants with every home. A home that was unreachable misses the
+       registration. The client keeps it and repeats it, in order, at
+       its next sync, until the home answers. Key packages are counted
+       at each home on every sync, so a home that missed an upload
+       is topped up.
+
+   3.  Expects every home to know its account. The domain owner
+       enrolls an address at every home.
+
+   A client compares what its homes return. It notes, for each item,
+   which homes delivered it. Once an item has been missing from a home
+   that answered for longer than a grace period, while another home
+   delivered it, the client reports that home once for that item. The
+   grace period SHOULD be longer than a sender's first retry; the
+   reference client uses ten minutes. A home that did not answer is not
+   reported, and an item every home has is forgotten. Reports are
+   evidence that a home is withholding mail or is behind, not proof.
+
+6.9.7.  Security Considerations and Open Issues
+
+   *  *The VRF and intake keys are shared.* Homes answer lookups for
+      addresses that do not exist (Section 5.2) and open unlisted
+      requests (Section 4.11), so each needs the domain's VRF key and,
+      with an intake, its intake key. An operator that leaks either
+      weakens the enumeration protection of the whole domain. Per-home
+      keys are not specified.
+
+   *  *Limits are per home.* A home counts its own daily limits, and
+      sharing counts between homes would need the coordination
+      this design avoids. A legitimate sender's delivery reaches
+      every home, so each counts it once; a hostile sending server
+      can choose to give different items to different homes, and a
+      domain with N homes can then accept up to N times a limit. The
+      owner sets each home's limits knowing N. Dividing a limit by N
+      would instead cut a legitimate sender to one Nth of it.
+
+   *  *Receipts show delivery, not reading.* A receipt says a home
+      stored the delivery. It says nothing about whether the
+      recipient's client has fetched it. A recipient domain whose
+      homes all drop mail can still sign receipts; the recipient's own
+      comparison of its homes (Section 6.9.6) is what catches that.
+
+   *  *No receipt, no proof of drop.* A send without a receipt is
+      reported as unconfirmed, not as dropped: the recipient's homes
+      may simply have been unreachable for all four attempts.
+
+   *  *The registrar is always on.* A home needs it to bind or
+      attest. While it is down, enrollment and attested mail wait;
+      mail that is already flowing does not.
+
+   *  *Metadata.* Each extra operator is another party that sees
+      traffic metadata for what it receives.
 
 7.  Requests and Admission
 
@@ -4169,7 +4895,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    2.  The sender uploads the ciphertext to its own home server with
        POST /v0/blobs (client-authenticated, body: raw bytes), which
        returns { "id": "blob_…", "url":
-       "https://signet.example.com/v0/blobs/blob_…" }.
+       "https://signet.example.com/v0/blobs/blob_…" }. A sender whose
+       domain has several homes (Section 6.9) uploads it to every home
+       it can reach.
 
    3.  The sender puts an attachment reference in the message:
 
@@ -4200,6 +4928,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------+--------+----------+--------------------------------------+
    | url    | string | yes      | Where the ciphertext can be fetched. |
    +--------+--------+----------+--------------------------------------+
+   | copies | array  | no       | Other URLs of the same ciphertext,   |
+   |        |        |          | one for each other home it was       |
+   |        |        |          | uploaded to.                         |
+   +--------+--------+----------+--------------------------------------+
    | key    | string | yes      | The AES-256 key (b64u).              |
    +--------+--------+----------+--------------------------------------+
    | iv     | string | yes      | The nonce (b64u).                    |
@@ -4210,7 +4942,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A receiver fetches url with GET /v0/blobs/{id} (no authentication),
    checks the ciphertext digest, decrypts, and checks that the plaintext
-   length equals size. Any mismatch is an error. The reference
+   length equals size. Any mismatch is an error. If url cannot be
+   fetched, or its ciphertext fails the digest check, the receiver
+   tries each of copies in turn. The reference
    implementation limits a file to 25 MiB.
 
 8.10.  Client State
@@ -5037,7 +5771,7 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    An OHTTP relay is a separate service:
 
-      POST /v0/relay?domain={domain}        (Content-Type:
+      POST /v0/relay?domain={domain}[&home={url}]   (Content-Type:
         message/ohttp-req)
 
    The relay:
@@ -5047,10 +5781,12 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    2.  resolves domain's policy (Section 6) and refuses with 404 if it
        has no ohttp gateway, so the relay cannot be pointed at arbitrary
-       URLs;
+       URLs. If home is given and the domain has operators (Section
+       6.9), the gateway is that home's own, from the statement; with
+       no home it is the policy's;
 
-   3.  forwards the body to the policy's gateway URL with only the
-       content type;
+   3.  forwards the body to that gateway URL with only the content
+       type;
 
    4.  returns the gateway's body as message/ohttp-res, or 502 if the
        gateway did not answer with success.
@@ -5179,9 +5915,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    domain authentication, or a sealed or anonymous delivery to the
    matching route, through OHTTP when configured (Section 10.4.3).
 
-   A response of 400 to 499, other than 429, is permanent. Any other
-   failure, including a network error, an OHTTP relay failure and 429,
-   is temporary.
+   A response of 400 to 499, other than 421 and 429, is permanent.
+   Any other failure, including a network error, an OHTTP relay
+   failure and 429, is temporary.
 
    On a permanent failure, the home server bounces at once. On a
    temporary failure, it lists the addresses as queued and retries. The
@@ -5202,8 +5938,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 10.7.  Mailbox
 
-      GET /v0/mailbox?after={seq}        (client-authenticated)
-      → { "items": [ MailItem, … ] }
+      GET /v0/mailbox?after={seq}[&epoch={epoch}]
+        (client-authenticated)
+      → { "items": [ MailItem, … ], "epoch": "e_…" }
 
    +============+=========+==========+=================================+
    | Field      | Type    | Required | Meaning                         |
@@ -5214,7 +5951,8 @@ Experimental           Signet Protocol, Version 0          November 2026
    | id         | string  | yes      | The delivery id.                |
    +------------+---------+----------+---------------------------------+
    | kind       | string  | yes      | request, welcome, commit,       |
-   |            |         |          | message, legacy or bounce.      |
+   |            |         |          | message, legacy, bounce or      |
+   |            |         |          | receipt.                        |
    +------------+---------+----------+---------------------------------+
    | from       | string  | yes      | The sender, or empty for sealed |
    |            |         |          | and anonymous deliveries.       |
@@ -5231,6 +5969,15 @@ Experimental           Signet Protocol, Version 0          November 2026
    keeps its own cursor and skips items it cannot open or that are not
    for it. A client SHOULD skip items whose id matches a delivery it
    submitted itself.
+
+   epoch names the mailbox store. It is made when the store is, and
+   changes if the store is lost and started over, so seq values restart
+   from 1. A client that knows an epoch sends it. If it differs from the
+   server's, the server ignores after and answers from the start, and
+   the client sets its cursor for that home to the start. Without
+   this, a client whose cursor was past the new store's seq would
+   skip that home's new mail. The replicas of a home share one epoch,
+   since they keep the same seq values.
 
 10.8.  Open Issues
 
@@ -6412,6 +7159,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  Media types message/ohttp-req, message/ohttp-res and
       application/ohttp-keys [RFC9458].
 
+   *  The HTTP header fields Signet-Primary, Signet-Term and
+      Signet-Home (Sections 6.8.4, 6.8.6 and 6.9.3) are used without
+      registration.
+
    The HPKE info strings (signet0 request <address>, signet0 legacy
    <address>), the AES-GCM additional data signet0 attachment, and the
    hash prefixes (signet0 request key , signet joiner , signet0  for VRF
@@ -6501,6 +7252,10 @@ Experimental           Signet Protocol, Version 0          November 2026
       <https://a2a-protocol.org/v0.3.0/specification/>, version 0.3.0.
 
 17.2.  Informative References
+
+   *  [RAFT] Ongaro, D. and J. Ousterhout, "In Search of an
+      Understandable Consensus Algorithm", USENIX Annual Technical
+      Conference, June 2014.
 
    *  [RFC3864] "Registration Procedures for Message Header Fields"
       <https://www.rfc-editor.org/rfc/rfc3864>, BCP 90, RFC 3864,

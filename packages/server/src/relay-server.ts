@@ -1,5 +1,5 @@
 import type { Resolver } from '@signet/lib';
-import { OHTTP_REQUEST_TYPE, OHTTP_RESPONSE_TYPE } from '@signet/lib';
+import { OHTTP_REQUEST_TYPE, OHTTP_RESPONSE_TYPE, homeGateway } from '@signet/lib';
 import type { HttpRequest, HttpResult } from './http';
 import { HttpError, JsonServer } from './http';
 
@@ -41,8 +41,11 @@ export class RelayServer {
     const domain = request.url.searchParams.get('domain');
     if (!domain) throw new HttpError(400, 'domain is required');
     // Only forward to gateways that Signet domains publish, so the relay can't be pointed at arbitrary URLs.
-    const { ohttp } = await this.resolver.policy(domain);
-    if (!ohttp) throw new HttpError(404, `${domain} has no OHTTP gateway`);
+    // `home` picks one of the domain's homes; without it, the domain's first.
+    const policy = await this.resolver.policy(domain);
+    const home = request.url.searchParams.get('home');
+    const ohttp = homeGateway(policy, home ?? policy.server);
+    if (!ohttp) throw new HttpError(404, `${domain} has no OHTTP gateway${home ? ` at ${home}` : ''}`);
     const response = await this.fetchImpl(ohttp.gateway, { method: 'POST', headers: { 'content-type': OHTTP_REQUEST_TYPE }, body: request.body });
     if (!response.ok) throw new HttpError(502, `gateway answered ${response.status}`);
     this.forwarded += 1;

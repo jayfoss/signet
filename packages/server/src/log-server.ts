@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import type { KeyPair, LogLeaf, Resolver } from '@signet/lib';
-import { MerkleLog, ReplayCache, verifyDomainAuth } from '@signet/lib';
+import { MerkleLog, ReplayCache, verifyDomainCall } from '@signet/lib';
 import type { HttpRequest } from './http';
 import { HttpError, JsonServer, header, json } from './http';
 
@@ -78,7 +78,8 @@ export class TransparencyLogServer {
     // A device its own server has locked out (say, after a rebinding) can still check its history, slowly.
     const budgets: (readonly [string, number])[] = [];
     if (request.headers['signet-domain']) {
-      const domain = await this.authenticate(request, 'query');
+      // Reads may come from any home of the domain; only the domain itself may write (Section 6.9.3).
+      const domain = await this.authenticate(request, 'query', true);
       const requester = request.url.searchParams.get('requester') ?? 'unknown';
       budgets.push([`${day}:@${domain}`, this.limits.queriesPerDomainPerDay], [`${day}:${domain}:${requester}`, this.limits.queriesPerRequesterPerDay]);
     } else {
@@ -91,19 +92,19 @@ export class TransparencyLogServer {
     }
   }
 
-  private async authenticate(request: HttpRequest, action: string): Promise<string> {
+  private async authenticate(request: HttpRequest, action: string, allowHomes = false): Promise<string> {
     const domain = header(request.headers, 'signet-domain');
-    const { domainKey } = await this.resolver.policy(domain);
-    const ok = verifyDomainAuth(
-      domain,
-      domainKey,
-      header(request.headers, 'signet-sig'),
-      header(request.headers, 'signet-ts'),
-      header(request.headers, 'signet-nonce'),
-      request.method,
-      request.path,
-      request.body,
-    );
+    const policy = await this.resolver.policy(domain);
+    const home = request.headers['signet-home'];
+    const ok =
+      (allowHomes || home === undefined) &&
+      verifyDomainCall(
+        policy,
+        { sig: header(request.headers, 'signet-sig'), ts: header(request.headers, 'signet-ts'), nonce: header(request.headers, 'signet-nonce'), home: typeof home === 'string' ? home : undefined },
+        request.method,
+        request.path,
+        request.body,
+      );
     if (!ok) throw new HttpError(401, `${action} is not signed by ${domain}`);
     if (!this.replays.firstUse(`${domain} ${header(request.headers, 'signet-sig')}`)) throw new HttpError(401, `${action} was already used`);
     return domain;

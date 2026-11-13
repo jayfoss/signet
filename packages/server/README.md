@@ -1,11 +1,16 @@
 # @signet/server
 
-Four roles from one app, chosen with `SIGNET_ROLE`:
+Seven roles from one app, chosen with `SIGNET_ROLE`:
 
 - **home** (default): one domain's server. It serves the policy and directory, writes every directory change to the transparency log, hands out MLS key packages, accepts mail from its own clients, relays to other domains, and holds mailboxes and blobs that are all ciphertext. With `SIGNET_SMTP_PORT` it also accepts plain email, checks SPF, DKIM and DMARC, and encrypts each message to the recipient's clients on arrival. Plain email out goes through `SIGNET_SMTP_RELAY` or straight to MX, optionally DKIM-signed.
 - **log**: the transparency log service. Domains append leaves; anyone reads tree heads, latest leaves, history and consistency proofs.
 - **issuer**: the Privacy Pass issuer. Home servers forward their users' blinded token requests, signed as their domain; it signs them without seeing the tokens and caps tokens per domain per day.
 - **relay**: the Oblivious HTTP relay. It forwards encapsulated deliveries to the gateway a Signet domain publishes, and keeps nothing.
+- **witness**: a replica that only keeps the replication log and votes, so two homes of one operator survive the loss of one (Section 6.8).
+- **registrar**: the domain owner's service for the things only the domain key may do, when the domain's homes are run by other operators: binding addresses, releasing them and attesting plain email (Section 6.9.4).
+- **sign-operators**: prints the owner's signed list of homes and exits.
+
+A home can also run as one of several replicas (`SIGNET_CLUSTER_ID`) or as one operator's home of a multi-operator domain (`SIGNET_HOME_KEY`); the environment variables are listed at the top of `src/main.ts`.
 
 Storage is in memory.
 
@@ -36,7 +41,7 @@ Storage is in memory.
 | `POST /v0/pairing/:slot/b`, `GET /v0/pairing/:slot/:side` | The new client, which has no account yet (per-IP daily limit): its two messages, and reading the other side's. A slot holds two messages a side, so a wrong code burns it |
 | `POST /v0/enroll` | Only with `SIGNET_OPEN_ENROLLMENT=1` (demo) |
 
-Relays that fail are retried with backoff (about five days by default), then bounced to the sender's mailbox. Daily limits (`DEFAULT_LIMITS` in `src/server.ts`) cap requests per sender and sender domain, lookups per requester, domain and anonymous IP, and key-package claims per requester and client. A lookup that finds nobody counts ten times, and a domain whose lookups mostly miss (after 50 in a day) is refused for the rest of the day. Colleagues on the same domain see each other's contact views unless `colleaguesSeeViews` is off.
+Relays that fail are retried with backoff (about 4.4 days by default), then bounced to the sender's mailbox. Daily limits (`DEFAULT_LIMITS` in `src/server.ts`) cap requests per sender and sender domain, lookups per requester, domain and anonymous IP, and key-package claims per requester and client. A lookup that finds nobody counts ten times, and a domain whose lookups mostly miss (after 50 in a day) is refused for the rest of the day. Colleagues on the same domain see each other's contact views unless `colleaguesSeeViews` is off.
 
 ## Running alongside Google Workspace (or any existing mail)
 

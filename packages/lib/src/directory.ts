@@ -36,7 +36,7 @@ export interface DomainPolicy {
   /** The transparency log this domain writes every directory change to. Clients only accept logs they trust. */
   log: TrustedLog;
   /** Oblivious HTTP gateway (RFC 9458) for sealed and anonymous deliveries: its URL and key configuration. */
-  ohttp?: { gateway: string; keys: string };
+  ohttp?: { gateway: string; keys: string; cover?: { perHour: number } };
   /** The Privacy Pass issuer whose tokens this domain accepts on anonymous requests. */
   privacyPass?: { issuer: string };
   /**

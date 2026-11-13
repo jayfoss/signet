@@ -6,6 +6,7 @@ import { SMTPServer } from 'smtp-server';
 import { IssuerServer } from './issuer-server';
 import { TransparencyLogServer } from './log-server';
 import { LogWitnessServer } from './log-witness';
+import type { RelayLimits } from './relay-server';
 import { RelayServer } from './relay-server';
 import type { Limits } from './server';
 import { SignetServer } from './server';
@@ -62,7 +63,7 @@ export class Testbed {
 
   static async start(
     domains: string[],
-    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number; batchMs?: number } = {},
+    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number; batchMs?: number; relayLimits?: RelayLimits; cover?: Record<string, { domains: string[]; rate?: number; backlog?: number }>; acceptCover?: Record<string, { partners: string[]; perHour?: number }> } = {},
   ): Promise<Testbed> {
     const bed = new Testbed();
     // Witnesses need the log's address and key, and the log needs theirs, so they join the list once running.
@@ -77,7 +78,7 @@ export class Testbed {
     }
     bed.issuer = new IssuerServer('issuer.signet.test', bed.resolver);
     await bed.issuer.listen();
-    bed.relay = new RelayServer(bed.resolver, undefined, options.batchMs);
+    bed.relay = new RelayServer(bed.resolver, undefined, options.batchMs, options.relayLimits);
     await bed.relay.listen();
     const sinkPort = await bed.startSink();
     for (const domain of domains) {
@@ -98,6 +99,8 @@ export class Testbed {
           issuer: { url: bed.issuer.url, key: bed.issuer.publicKey },
           ohttpRelay: bed.relay.url,
           batchMs: options.batchMs,
+          cover: options.cover?.[domain],
+          acceptCover: options.acceptCover?.[domain],
           fetchImpl: (input, init) => bed.fetchBetweenServers(input, init),
         }),
       );

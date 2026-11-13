@@ -7,6 +7,7 @@ import type { ClusterMember } from './cluster';
 import { IssuerServer } from './issuer-server';
 import { TransparencyLogServer } from './log-server';
 import { HttpRegistrar, LocalRegistrar, RegistrarServer } from './registrar';
+import type { RelayLimits } from './relay-server';
 import { RelayServer } from './relay-server';
 import type { Limits } from './server';
 import { SignetServer } from './server';
@@ -35,6 +36,10 @@ import { ClusterWitness } from './witness';
  * SIGNET_DKIM            JSON {"selector","privateKey"} to DKIM-sign outbound plain email
  * SIGNET_ISSUER          JSON {"url","key":{"name","publicKey"}} of the Privacy Pass issuer (anonymous requests)
  * SIGNET_OHTTP_RELAY     URL of the Oblivious HTTP relay for sealed and anonymous deliveries
+ * SIGNET_RELAY_LIMITS   relay only, off unless set: JSON {"perSource":{"perSecond":100,"burst":1000},
+ *                        "perTarget":{"perSecond":50,"burst":500},"maxHeld":5000}. A source is the address that connects.
+ * SIGNET_COVER           JSON {"domains":[...],"rate":1}: send cover traffic to these domains (needs batching; Section 10.6.2)
+ * SIGNET_ACCEPT_COVER    JSON {"partners":[...],"perHour":3600}: take cover traffic from these domains
  * SIGNET_BATCH_MS        a home or relay holds deliveries to other servers for up to this long and sends them together
  *                        in random order (2000; 0 sends at once). It helps only as much as there are senders to mix.
  * SIGNET_LIMITS          JSON of daily limits to change, e.g. {"requestsPerSenderPerDay":2}. Each home counts its own,
@@ -154,7 +159,7 @@ async function main(): Promise<void> {
     return;
   }
   if (env('SIGNET_ROLE') === 'relay') {
-    const relay = new RelayServer(resolver(), undefined, batchMs());
+    const relay = new RelayServer(resolver(), undefined, batchMs(), jsonEnv<RelayLimits>('SIGNET_RELAY_LIMITS'));
     console.log(`signet OHTTP relay at ${await relay.listen(port, '0.0.0.0', env('SIGNET_PUBLIC_URL'))}`);
     return;
   }
@@ -214,6 +219,8 @@ async function main(): Promise<void> {
     publicUrl: env('SIGNET_PUBLIC_URL'),
     openEnrollment: env('SIGNET_OPEN_ENROLLMENT') === '1',
     batchMs: batchMs(),
+    cover: jsonEnv<{ domains: string[]; rate?: number; backlog?: number }>('SIGNET_COVER'),
+    acceptCover: jsonEnv<{ partners: string[]; perHour?: number }>('SIGNET_ACCEPT_COVER'),
     dataDir: cluster ? undefined : dataDir(),
     intake: env('SIGNET_INTAKE') === '1',
     outbound: new OutboundSmtp(domain, { relay: jsonEnv('SIGNET_SMTP_RELAY'), dkim: jsonEnv('SIGNET_DKIM') }),

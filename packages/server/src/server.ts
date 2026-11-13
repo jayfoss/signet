@@ -54,8 +54,11 @@ import {
   attestedSignetHeader,
   signServerUrls,
   underDomain,
+  COVER_CELL,
+  ENVELOPE_PAD,
   hashBody,
   padJson,
+  padJsonTo,
   MAX_HTML_BYTES,
   hasScope,
   cardHash,
@@ -93,6 +96,7 @@ import type { ClusterMember, ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
 import { DomainKeyLogger } from './domain-key-log';
 import { HttpError, JsonServer, header, json } from './http';
+import { BacklogFull, CoverPacer } from './cover';
 import { Mix } from './mix';
 
 const optionalHeader = (headers: Record<string, string | string[] | undefined>, name: string): string | undefined => {
@@ -188,6 +192,17 @@ export interface SignetServerOptions {
    * window's deliveries together in random order of sender (Section 10.6.1). 0, the default, sends at once.
    */
   batchMs?: number;
+  /**
+   * Send cover traffic to these domains (Section 10.6.2): at every edge of the batching window, `rate` deliveries to
+   * each, real or cover, whether or not anyone sent anything. Needs `batchMs`. `backlog` is how many real deliveries
+   * may wait for a domain before new submissions for it are refused with 503 (default 100).
+   */
+  cover?: { domains: string[]; rate?: number; backlog?: number };
+  /**
+   * Accept cover traffic from these partner domains (Section 10.6.2) and say so in the policy. Cover is signed by the
+   * sending domain; only a partner named here is looked at, and each may send `perHour` a hour (default 3600).
+   */
+  acceptCover?: { partners: string[]; perHour?: number };
   /** Seconds a mailbox item is kept at most (Section 10.7). Default 30 days; published in the policy when it differs. */
   mailboxRetentionSeconds?: number;
   /** Seconds an attachment is kept at most (Section 8.9). Default 30 days; published in the policy when it differs. */
@@ -273,6 +288,8 @@ const CLIENT_KINDS: MailKind[] = ['request', 'welcome', 'commit', 'message'];
 const SEALABLE_KINDS: MailKind[] = ['welcome', 'commit', 'message'];
 const HOUR = 3_600_000;
 const DEFAULT_RETENTION_MS = 30 * 24 * HOUR;
+/** How much cover a partner may send a gateway in an hour, unless the operator says otherwise (Section 10.6.2). */
+const DEFAULT_COVER_PER_HOUR = 3600;
 /** The most ciphertext (base64url characters) an account's contacts may take: about 1 MiB. */
 const MAX_CONTACTS_B64 = 1_400_000;
 /** Sealed deliveries wait this long for their recipient to register the token, at most this many per user. */
@@ -322,6 +339,16 @@ export class SignetServer implements LegacyInbox {
   constructor(private readonly options: SignetServerOptions) {
     this.fetchImpl = options.resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
     this.mix = new Mix(options.batchMs ?? 0);
+    if (options.cover) {
+      if (!this.mix.enabled) throw new Error('cover traffic needs batchMs: it is sent at the edge of each window');
+      this.pacer = new CoverPacer({
+        domains: options.cover.domains,
+        rate: options.cover.rate ?? 1,
+        limit: options.cover.backlog ?? 100,
+        cover: (domain) => ({ key: `cover:${randomId('c')}`, run: () => this.sendCover(domain), resolve: () => undefined, reject: () => undefined }),
+      });
+      this.mix.addSource(() => (this.pacer as CoverPacer).source());
+    }
     if (options.domainKey) this.keyLogger = new DomainKeyLogger({ domain: options.domain, domainKey: options.domainKey, log: options.log, rotation: options.rotation, fetchImpl: options.fetchImpl });
     if (!options.domainKey) {
       if (!options.homeKey || !options.operators || !options.domainPublicKey) throw new Error('a home without the domain key needs homeKey, operators and domainPublicKey');
@@ -402,7 +429,7 @@ export class SignetServer implements LegacyInbox {
       ...this.serverSignature(server, homes),
       vrfKey: this.vrfKey.public,
       log: this.options.log,
-      ohttp: { gateway: `${server}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey) },
+      ohttp: { gateway: `${server}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey), ...(this.options.acceptCover ? { cover: { perHour: this.options.acceptCover.perHour ?? DEFAULT_COVER_PER_HOUR } } : {}) },
       privacyPass: this.options.issuer ? { issuer: this.options.issuer.key.name } : undefined,
       intake: this.intakeKey ? { keyId: requestKeyId(this.intakeKey.publicKey), agreeKey: this.intakeKey.publicKey } : undefined,
     };
@@ -434,6 +461,7 @@ export class SignetServer implements LegacyInbox {
 
   private readonly keyLogger?: DomainKeyLogger;
   private readonly mix: Mix;
+  private readonly pacer?: CoverPacer;
 
   private get mailboxRetentionMs(): number {
     return (this.options.mailboxRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
@@ -450,6 +478,7 @@ export class SignetServer implements LegacyInbox {
     this.cluster?.start();
     this.sweepTimer = setInterval(() => void this.sweep(), 10 * 60_000);
     this.sweepTimer.unref();
+    if (this.pacer) this.mix.start();
     return url;
   }
 
@@ -475,7 +504,7 @@ export class SignetServer implements LegacyInbox {
   async close(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     // What is held goes out now, so no client is left waiting on a server that has stopped.
-    await this.mix.flush();
+    await this.mix.stop();
     this.cluster?.close();
     this.cancelRetries();
     await this.http.close();
@@ -787,6 +816,13 @@ export class SignetServer implements LegacyInbox {
   }
 
   /** A request to another Signet service, signed with this domain's key over its method, path, query and body. */
+  /** The headers that sign a request to another server as this domain, or as this home when the domain key is not here. */
+  private authHeaders(method: string, path: string, body: string): Record<string, string> {
+    return this.options.domainKey
+      ? domainAuthHeaders(this.options.domain, this.options.domainKey, method, path, body)
+      : homeAuthHeaders(this.options.domain, this.options.homeKey as KeyPair, method, path, body);
+  }
+
   private signedFetch(method: 'GET' | 'POST', url: string, body = '', extra?: Record<string, string>): Promise<Response> {
     const { pathname, search } = new URL(url);
     return this.fetchImpl(url, {
@@ -794,9 +830,7 @@ export class SignetServer implements LegacyInbox {
       headers: {
         ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
         ...extra,
-        ...(this.options.domainKey
-          ? domainAuthHeaders(this.options.domain, this.options.domainKey, method, `${pathname}${search}`, body)
-          : homeAuthHeaders(this.options.domain, this.options.homeKey as KeyPair, method, `${pathname}${search}`, body)),
+        ...this.authHeaders(method, `${pathname}${search}`, body),
       },
       body: method === 'POST' ? body : undefined,
     });
@@ -846,6 +880,7 @@ export class SignetServer implements LegacyInbox {
       return { raw: data, contentType: 'application/octet-stream' };
     }
     if (method === 'POST' && path === '/v0/deliver') return this.deliverSigned(await this.authenticateDomain(request), json<Delivery>(request));
+    if (method === 'POST' && path === '/v0/cover') return JSON.parse(padJson(await this.receiveCover(request), COVER_CELL)) as object;
     if (method === 'POST' && path === '/v0/deliver-sealed') return this.deliverLocal(json<Delivery>(request));
     if (method === 'POST' && path === '/v0/deliver-anonymous') return this.deliverAnonymous(json<Delivery>(request));
     const pairing = path.match(/^\/v0\/pairing\/(\d{4})\/(a|b)$/);
@@ -960,6 +995,18 @@ export class SignetServer implements LegacyInbox {
         status = error instanceof HttpError ? error.status : 400;
         result = { error: describe(error) };
       }
+    } else if (message.method === 'POST' && message.path === '/v0/cover') {
+      try {
+        result = await this.receiveCover({
+          method: 'POST',
+          path: message.path,
+          headers: Object.fromEntries(message.headers.map(([name, value]) => [name.toLowerCase(), value])),
+          body: Buffer.from(message.body),
+        });
+      } catch (error) {
+        status = error instanceof HttpError ? error.status : 400;
+        result = { error: describe(error) };
+      }
     } else if (message.method !== 'POST' || !['/v0/deliver-sealed', '/v0/deliver-anonymous'].includes(message.path)) {
       status = 403;
       result = { error: 'the gateway only accepts deliveries and directory lookups' };
@@ -973,8 +1020,77 @@ export class SignetServer implements LegacyInbox {
         result = { error: describe(error) };
       }
     }
-    const response = encodeResponse({ status, headers: [['content-type', 'application/json']], body: Buffer.from(JSON.stringify(result)) });
+    // A gateway that takes cover pads every answer, so a relay cannot tell cover from a delivery by the answer's size.
+    const answer = this.options.acceptCover ? padJson(result as Record<string, unknown>, COVER_CELL) : JSON.stringify(result);
+    const response = encodeResponse({ status, headers: [['content-type', 'application/json']], body: Buffer.from(answer) });
     return { raw: encapsulateResponse(pending, response), contentType: OHTTP_RESPONSE_TYPE };
+  }
+
+  /**
+   * Take cover traffic and drop it (Section 10.6.2). It is signed by the sending domain, so that nobody else can make
+   * this server do work for it: only a partner the operator named is looked at, its signature must verify and not
+   * repeat, and each partner has a budget for the hour. The server learns which partner sent it, and cannot tell
+   * which of that partner's real deliveries it came with: those arrive without a sender.
+   */
+  private async receiveCover(call: Pick<HttpRequest, 'method' | 'path' | 'headers' | 'body'>): Promise<Record<string, unknown>> {
+    const accept = this.options.acceptCover;
+    if (!accept) throw new HttpError(404, 'this server does not take cover traffic');
+    const claimed = optionalHeader(call.headers, 'signet-domain');
+    if (!claimed || !accept.partners.map((partner) => partner.toLowerCase()).includes(claimed.toLowerCase())) throw new HttpError(403, 'not a cover partner of this server');
+    const domain = await this.authenticateDomain(call);
+    const hour = new Date().toISOString().slice(0, 13);
+    if (this.store.bump(`cover:${domain}:${hour}`) > (accept.perHour ?? DEFAULT_COVER_PER_HOUR)) throw new HttpError(429, 'too much cover this hour');
+    return {};
+  }
+
+  /** A body for `value` that makes the encoded request exactly a multiple of `cell` bytes. */
+  private fitBody(encode: (body: Buffer) => Buffer, value: Record<string, unknown>, cell: number): string {
+    const size = (length: number): number => encode(Buffer.alloc(length)).length;
+    const least = Buffer.byteLength(padJson(value, 1));
+    const target = Math.ceil(size(least) / cell) * cell;
+    let length = Math.max(least, target - (size(0) - 0));
+    while (length > least && size(length) > target) length -= 1;
+    while (size(length + 1) <= target) length += 1;
+    return padJsonTo(value, length);
+  }
+
+  /** One cover delivery to a covered domain: to each home a real delivery would go to, the way a real one would go. */
+  private async sendCover(domain: string): Promise<void> {
+    const pacer = this.pacer as CoverPacer;
+    const policy = await this.options.resolver.policy(domain).catch(() => undefined);
+    // Not reachable just now: nothing to send to, and nothing learned about whether it takes cover.
+    if (!policy) return;
+    const cover = policy.ohttp?.cover;
+    // A domain that does not take cover, or takes less than this rate, is not covered: what waits for it goes out.
+    if (!cover || (pacer.rate * HOUR) / (this.options.batchMs as number) > cover.perHour) {
+      pacer.markUnsupported(domain);
+      return;
+    }
+    await Promise.allSettled(
+      homeGroups(policy).map(async (group) => {
+        const target = group[0];
+        const gateway = homeGateway(policy, target);
+        if (this.options.ohttpRelay && gateway) {
+          await this.relayCover(domain, target, gateway.keys);
+          return;
+        }
+        const body = padJson({}, COVER_CELL);
+        await this.fetchImpl(`${target}/v0/cover`, { method: 'POST', headers: { 'content-type': 'application/json', ...this.authHeaders('POST', '/v0/cover', body) }, body });
+      }),
+    );
+  }
+
+  /**
+   * Cover through the relay, sized as a whole to the cell like a real delivery is: the signing headers are in the
+   * request, so the body is made shorter by as much as they add. The headers are the same length whatever they sign.
+   */
+  private async relayCover(domain: string, target: string, keys: string): Promise<void> {
+    const authority = new URL(target).host;
+    const sign = (body: string): [string, string][] => Object.entries(this.authHeaders('POST', '/v0/cover', body));
+    const encodeWith = (signed: [string, string][]) => (content: Buffer) =>
+      encodeRequest({ method: 'POST', scheme: 'https', authority, path: '/v0/cover', headers: [['content-type', 'application/json'], ...signed], body: content });
+    const body = this.fitBody(encodeWith(sign('{}')), {}, COVER_CELL);
+    await this.relayOblivious(domain, target, keys, '/v0/cover', body, sign(body));
   }
 
   /** Attester: rate-limit this user, then get their blinded token requests signed by the issuer. */
@@ -1210,7 +1326,7 @@ export class SignetServer implements LegacyInbox {
   }
 
   /** A request from another Signet server, signed with the key in that domain's published policy. */
-  private async authenticateDomain(request: HttpRequest): Promise<string> {
+  private async authenticateDomain(request: Pick<HttpRequest, 'method' | 'path' | 'headers' | 'body'>): Promise<string> {
     const domain = header(request.headers, 'signet-domain');
     const policy = await this.options.resolver.policy(domain);
     const home = request.headers['signet-home'];
@@ -1260,7 +1376,14 @@ export class SignetServer implements LegacyInbox {
 
   /** Deliver to a domain: here if it is this one, to its other homes as well when it has several, and by relay if it is another. */
   private async deliverToDomain(domain: string, delivery: Delivery, sender: string): Promise<DeliveryResult> {
-    if (domain !== this.options.domain) return this.mix.run(sender, () => this.relay(domain, delivery, sender));
+    if (domain !== this.options.domain) {
+      const send = () => this.relay(domain, delivery, sender);
+      if (!this.pacer?.covers(domain)) return this.mix.run(sender, send);
+      return this.pacer.submit(domain, sender, send).catch((error) => {
+        if (error instanceof BacklogFull) throw new HttpError(503, error.message, { 'retry-after': '2' });
+        throw error;
+      });
+    }
     const local = () => (delivery.anonymousToken ? this.deliverAnonymous(delivery) : this.deliverLocal(delivery));
     const peers = this.peerHomes();
     return peers.length === 0 ? local() : this.mix.run(sender, () => this.fanOut(domain, delivery, sender, peers, local));
@@ -1337,14 +1460,16 @@ export class SignetServer implements LegacyInbox {
     const policy = await this.options.resolver.policy(domain);
     const target = home ?? policy.server;
     // Padded, so the size of a delivery on the wire says little (Section 10.2).
-    const body = padJson(delivery as unknown as Record<string, unknown>);
+    const body = padJson(delivery as unknown as Record<string, unknown>, this.pacer?.covers(domain) ? COVER_CELL : ENVELOPE_PAD);
     if (!delivery.token && !delivery.anonymousToken) return this.answer(domain, await this.signedFetch('POST', `${target}/v0/deliver`, body));
     // Sealed and anonymous deliveries aren't signed by this domain: a token authorizes them. Through an OHTTP
     // relay, the receiving server doesn't even see which server sent them.
     const path = delivery.token ? '/v0/deliver-sealed' : '/v0/deliver-anonymous';
     // Each home has its own gateway, vouched for by the owner's statement.
     const gateway = homeGateway(policy, target);
-    if (this.options.ohttpRelay && gateway) return this.relayOblivious(domain, target, gateway.keys, path, body);
+    if (this.options.ohttpRelay && gateway) {
+      return this.relayOblivious(domain, target, gateway.keys, path, body, [], this.pacer?.covers(domain) ? { value: delivery as unknown as Record<string, unknown>, cell: COVER_CELL } : undefined);
+    }
     return this.answer(domain, await this.fetchImpl(`${target}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }));
   }
 
@@ -1356,9 +1481,25 @@ export class SignetServer implements LegacyInbox {
     return (await response.json()) as DeliveryResult;
   }
 
-  private async relayOblivious(domain: string, target: string, keys: string, path: string, body: string): Promise<DeliveryResult> {
+  /**
+   * With `exact`, the request is made so that the whole of it, as the relay carries it, is a multiple of the cell,
+   * whatever its path and headers: a cover request, a sealed delivery and an anonymous one then cannot be told apart by
+   * size (Section 10.6.2).
+   */
+  private async relayOblivious(
+    domain: string,
+    target: string,
+    keys: string,
+    path: string,
+    body: string,
+    extra: [string, string][] = [],
+    exact?: { value: Record<string, unknown>; cell: number },
+  ): Promise<DeliveryResult> {
     const authority = new URL(target).host;
-    const inner = encodeRequest({ method: 'POST', scheme: 'https', authority, path, headers: [['content-type', 'application/json']], body: Buffer.from(body) });
+    const headers: [string, string][] = [['content-type', 'application/json'], ...extra];
+    const encode = (content: Buffer) => encodeRequest({ method: 'POST', scheme: 'https', authority, path, headers, body: content });
+    const fitted = exact ? this.fitBody(encode, exact.value, exact.cell) : body;
+    const inner = encode(Buffer.from(fitted));
     const { message, pending } = await encapsulateRequest(keys, inner);
     const relayed = await this.fetchImpl(`${this.options.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}&home=${encodeURIComponent(target)}`, {
       method: 'POST',

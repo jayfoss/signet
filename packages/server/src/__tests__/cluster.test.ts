@@ -79,6 +79,9 @@ async function world(options: { snapshotEvery?: number } = {}) {
   await jerzyClient.ready();
 
   return {
+    resolver,
+    log,
+    shared,
     homes,
     members,
     aliceKeys,
@@ -200,7 +203,8 @@ describe('a domain with two homes and a witness', () => {
     const { jerzyClient, aliceClient } = w;
     await jerzyClient.sendRequest('alice@alpha.test', { subject: 'First', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
     expect(kinds(await aliceClient.sync())).toEqual(['request']);
-    await until(() => w.standby().store.mailbox('alice').length === 1);
+    // Alice's acknowledgement empties the mailbox on the standby too, since it is replicated state.
+    await until(() => w.standby().store.mailbox('alice').length === 0);
 
     const dead = w.primary();
     const survivor = w.standby();
@@ -209,11 +213,40 @@ describe('a domain with two homes and a witness', () => {
 
     await jerzyClient.sendRequest('alice@alpha.test', { subject: 'Second', intent: { name: 'schedule.propose', args: { durationMin: 45 } } });
     // beta's first attempt may find no primary yet; its retries land the delivery.
-    await until(() => survivor.store.mailbox('alice').length === 2);
+    await until(() => survivor.store.mailbox('alice').length === 1);
+    // The seq goes on from where the first item left it: a deleted item's number is not reused.
+    expect(survivor.store.mailbox('alice').map((item) => item.seq)).toEqual([2]);
     const events = await aliceClient.sync();
     expect(kinds(events)).toEqual(['request']);
     expect(events[0].kind === 'request' && events[0].request.body.subject).toBe('Second');
-    expect(survivor.store.mailbox('alice').map((item) => item.seq)).toEqual([1, 2]);
+  });
+
+  it('adds a third home to a running cluster, which then holds the same state, and removes it again', async () => {
+    const port = await freePort();
+    const h3Member: ClusterMember = { id: 'h3', url: `http://127.0.0.1:${port}`, role: 'home' };
+    const h3 = new SignetServer({
+      domain: 'alpha.test',
+      domainKey: w.alphaKey,
+      resolver: w.resolver,
+      log: w.log,
+      openEnrollment: true,
+      ...w.shared,
+      // The new replica knows the old ones and waits to be caught up before it votes.
+      cluster: { id: 'h3', members: [...w.members, h3Member], electionMs: T, volatileLog: true, rejoin: true },
+    });
+    await h3.listen(port);
+    try {
+      await w.jerzyClient.sendRequest('alice@alpha.test', { subject: 'Before h3', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+      await w.primary().addReplica(h3Member);
+      await until(() => h3.store.userLocals().includes('alice') && h3.store.mailbox('alice').length === 1);
+      expect(w.primary().policy.replicas).toEqual([w.members[0].url, w.members[1].url, h3Member.url]);
+      // Another change in a row is fine once the last one has committed.
+      await w.primary().removeReplica('h3');
+      expect(w.primary().policy.replicas).toEqual([w.members[0].url, w.members[1].url]);
+      expect(kinds(await w.aliceClient.sync())).toEqual(['request']);
+    } finally {
+      await h3.close();
+    }
   });
 
   it('does not acknowledge a change it could not commit, and forgets it', async () => {

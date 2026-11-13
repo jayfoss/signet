@@ -28,6 +28,8 @@ export interface GmailHeaders {
   messageId: string;
   signet?: string;
   humansOnly: boolean;
+  /** The message's text body, fetched only for messages that carry a Signet header (Section 13.2.2). */
+  text?: string;
 }
 
 const HEADERS = ['From', 'To', 'Subject', 'Message-ID', SIGNET_HEADER, AUDIENCE_HEADER];
@@ -108,6 +110,7 @@ export class GmailMailbox {
     };
     const header = (name: string) => message.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value;
     const from = header('From') ?? '';
+    const text = header(SIGNET_HEADER) ? await this.bodyText(id) : undefined;
     return {
       id: message.id,
       threadId: message.threadId,
@@ -117,7 +120,24 @@ export class GmailMailbox {
       messageId: header('Message-ID') ?? '',
       ...(header(SIGNET_HEADER) ? { signet: header(SIGNET_HEADER) } : {}),
       humansOnly: header(AUDIENCE_HEADER)?.trim().toLowerCase() === 'humans',
+      ...(text !== undefined ? { text } : {}),
     };
+  }
+
+  /** The text/plain part of a message, else its text/html part, decoded. */
+  private async bodyText(id: string): Promise<string> {
+    type Part = { mimeType?: string; body?: { data?: string }; parts?: Part[] };
+    const message = (await this.api('GET', `/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`)) as { payload?: Part };
+    const find = (part: Part | undefined, type: string): string | undefined => {
+      if (!part) return undefined;
+      if (part.mimeType === type && part.body?.data) return Buffer.from(part.body.data, 'base64url').toString('utf8');
+      for (const child of part.parts ?? []) {
+        const found = find(child, type);
+        if (found !== undefined) return found;
+      }
+      return undefined;
+    };
+    return find(message.payload, 'text/plain') ?? find(message.payload, 'text/html') ?? '';
   }
 
   private async api(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {

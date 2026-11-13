@@ -85,13 +85,14 @@ describe.each([
     store.updateTokens('bob', ['t1', 't2'], []);
     store.updateTokens('bob', [], ['t1']);
     store.updateViewGrants('bob', ['v1'], []);
-    store.addContacts('bob', ['Alice@Alpha.test'], ['Alpha.test']);
+    store.putContactsDoc('bob', { epoch: 1, version: 3, data: { iv: 'iv', ct: 'ct' }, wraps: { c_1: { enc: 'e', ct: 'w' } } });
     store.setClaims('bob', ['team:corporate']);
     store.putBlob('b1', Buffer.from('ciphertext'));
     store.saveOutbound({ id: 'o1', domain: 'alpha.test', delivery: { id: 'd' }, sender: 'bob@beta.test', attempt: 2, dueAt: 5, reason: 'down' });
 
     expect([store.hasToken('bob', 't1'), store.hasToken('bob', 't2'), store.hasViewGrant('bob', 'v1')]).toEqual([false, true, true]);
-    expect(store.contactsOf('bob')).toEqual({ contacts: ['alice@alpha.test'], trustedDomains: ['alpha.test'] });
+    expect(store.contactsDoc('bob')).toEqual({ epoch: 1, version: 3, data: { iv: 'iv', ct: 'ct' }, wraps: { c_1: { enc: 'e', ct: 'w' } } });
+    expect(store.contactsDoc('nobody')).toEqual({ epoch: 0, version: 0, data: null, wraps: {} });
     expect(store.claims('bob')).toEqual(['team:corporate']);
     expect(store.blob('b1')?.toString()).toBe('ciphertext');
     expect(store.outbound()).toEqual([expect.objectContaining({ id: 'o1', attempt: 2 })]);

@@ -173,7 +173,8 @@ function describe(event: SignetEvent): string {
     }
     case 'joined':
     case 'rekeyed':
-      return `${event.kind} ${event.thread}${event.humansOnly ? ' [humans only]' : ''}${event.linkedTo ? ` beside ${event.linkedTo}` : ''} at epoch ${event.epoch} with ${people(event.participants)}`;
+    case 'fork-resolved':
+      return `${event.kind === 'fork-resolved' ? 'two commits competed; settled on the one with the smaller hash:' : event.kind} ${event.thread}${event.humansOnly ? ' [humans only]' : ''}${event.linkedTo ? ` beside ${event.linkedTo}` : ''} at epoch ${event.epoch} with ${people(event.participants)}`;
     case 'removed':
       return `removed from ${event.thread}`;
     case 'message': {
@@ -481,6 +482,7 @@ async function runClientCommand(command: string, rest: string[], opts: Opts, cli
     }
     case 'request': {
       const to = required(rest[0], 'ADDRESS');
+      if (await client.escrowRecipient(to, Boolean(opts['humans-only']))) ctx.out(`note: ${to} has an organisation escrow client, which can read this request`);
       await client.sendRequest(
         to,
         { subject: required(opts.subject, 'subject'), note: opts.note, intent: intentFrom(opts.intent, opts.args) },

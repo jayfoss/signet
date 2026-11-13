@@ -1,5 +1,5 @@
 import type { DirectoryEntry } from '@signet/lib';
-import { HiddenAddressError, Identity, attestedSignetHeader, signUnlisted } from '@signet/lib';
+import { HiddenAddressError, Identity, attestedSignetHeader, hashBody, signUnlisted } from '@signet/lib';
 import { Testbed } from '../testbed';
 
 async function world() {
@@ -81,7 +81,7 @@ describe('catching a domain that hides a listed address to read first requests',
 
   it('refuses the intake for an address known from an authenticated Signet header', async () => {
     lieToEveryone('bob');
-    const fields = { from: 'bob@beta.test', to: ['alice@alpha.test'], subject: 'Following up' };
+    const fields = { from: 'bob@beta.test', to: ['alice@alpha.test'], subject: 'Following up', bodyHash: hashBody('Hello') };
     const header = attestedSignetHeader(w.bed.domainKey('beta.test'), w.bed.url('beta.test'), (await w.bobPhone.lookup('bob@beta.test'))?.identityKey ?? '', fields);
 
     expect(await w.alicePhone.checkSignetHeader(fields, header)).toMatchObject({ onSignet: true, authenticated: true });

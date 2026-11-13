@@ -22,7 +22,15 @@ export interface DomainPolicy {
   operators?: Operators;
   mode: 'enforce' | 'testing';
   maxAge: number;
+  /** Seconds a mailbox item is kept at most, when not the default 30 days (Section 10.7). */
+  mailboxRetention?: number;
+  /** Seconds an attachment is kept at most, when not the default 30 days (Section 8.9). */
+  blobRetention?: number;
   domainKey: string;
+  /** Present when `domainKey` has changed: the previous key's signature over the change (Section 6.5). */
+  rotation?: { from: string; sig: string };
+  /** The domain key's signature over `server` and `replicas`, required for a URL outside the domain (Section 6.4). */
+  serverSig?: string;
   /** VRF public key: proves each address's index in the transparency log (RFC 9381). */
   vrfKey: string;
   /** The transparency log this domain writes every directory change to. Clients only accept logs they trust. */
@@ -155,8 +163,12 @@ export function splitAddress(address: string): { local: string; domain: string }
   return { local: address.slice(0, at).toLowerCase(), domain: address.slice(at + 1).toLowerCase() };
 }
 
-/** How home servers name a requester to each other, and how owners name contacts they release their view to. */
-export const requesterHash = (address: string): string => sha256(`${splitAddress(address).domain}|${normalizeAddress(address)}`);
+/**
+ * How home servers name a requester to each other, and how owners name contacts they release their view to
+ * (Section 4.7). It is the same at every address, so a server can limit one user's lookups; the proof that a
+ * requester is who the hash names is bound to the address being looked up.
+ */
+export const requesterHash = (requester: string): string => sha256(`${splitAddress(requester).domain}|${normalizeAddress(requester)}`);
 
 export const normalizeAddress = (address: string): string => {
   const { local, domain } = splitAddress(address);

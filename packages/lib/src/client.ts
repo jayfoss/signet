@@ -6,7 +6,8 @@ import { openAttachment, sealAttachment } from './attachments';
 import { clientAuthHeaders } from './auth';
 import type { Directory, Grant, SignedView, ViewMember } from './cards';
 import { cardHash, cardKeyHistory, verifyView, viewHash, viewMember } from './cards';
-import { randomId, sha256 } from './crypto';
+import type { Ciphertext, Sealed } from './crypto';
+import { decrypt, encrypt, open, padPlaintext, randomId, randomSecret, seal, sha256, unpadPlaintext } from './crypto';
 import type { ContactCard, DirectoryEntry, DomainPolicy, EnrolledEntry } from './directory';
 import {
   HiddenAddressError,
@@ -22,23 +23,24 @@ import {
   UnlistedAddressError,
 } from './directory';
 import { decodeResponse, encodeRequest } from './bhttp';
+import { signRequesterProof } from './requester';
 import type { ApprovalCard, ApprovalChoice, AudienceMember, DisclosureContext, OrgClaim } from './disclosure';
 import { DisclosureError, audienceHash, verifyOrgClaim } from './disclosure';
 import { b64u, canonicalJson, fromB64u, utf8 } from './encoding';
 import { OHTTP_REQUEST_TYPE, decapsulateResponse, encapsulateRequest } from './ohttp';
 import type { KeyPair } from './crypto';
-import type { ClientKeys, ClientKind, LogEntry } from './identity';
-import { keyChangeSince, recoveryProof, replayLog } from './identity';
+import type { ClientCert, ClientKeys, ClientKind, LogEntry } from './identity';
+import { activeClients, keyChangeSince, recoveryProof, replayLog } from './identity';
 import type { PairingChannel, PendingClient } from './enrollment';
 import { EnrollmentError, HttpPairingChannel, completeEnrollment, newPairingSecret, pairAsNewClient, pairingCode, parsePairingCode } from './enrollment';
 import type { Intent } from './intents';
 import type { GmailMailbox } from './gmail';
 import type { AttestedFields, LegacyAuth, SealedLegacyMail } from './legacy';
-import { AUDIENCE_HEADER, SIGNET_HEADER, hasLegacyCopy, openLegacyMail, parseSignetHeader, verifyAttestation } from './legacy';
+import { AUDIENCE_HEADER, SIGNET_HEADER, hasLegacyCopy, hashBody, isHumansOnly, openLegacyMail, parseSignetHeader, verifyAttestation } from './legacy';
 import type { MessageFields, SignedMessage } from './message';
 import { composeMessage, verifyMessage } from './message';
-import type { Addition, ClaimedKeyPackage, Joiner, Member } from './mls';
-import { MlsSession } from './mls';
+import type { Addition, ClaimedKeyPackage, CommitPreview, Joiner, Member, StateUndo } from './mls';
+import { MlsSession, commitHash } from './mls';
 import type { AgentCard } from './live';
 import { LIVE_LABEL, LiveSession, agentCardHash, newSessionId, tokensMatch } from './live';
 import type { IssuerKey } from './privacypass';
@@ -52,7 +54,8 @@ import type { Resolver } from './resolver';
 import { NotSignetDomainError } from './resolver';
 import { DELIVERY_LABEL, TOKEN_EPOCHS_KEPT, deliveryTokenHash, randomToken } from './sealed';
 import type { InclusionProof, LatestLeaf, LogLeaf, TreeHead, TrustedLog } from './transparency';
-import { TransparencyError, checkLeafDomain, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
+import { TransparencyError, checkLeafDomain, countCosignatures, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
+import { domainKeyIndex } from './policy';
 
 export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce' | 'receipt';
 
@@ -120,7 +123,7 @@ export interface Participant {
 export type SignetEvent =
   | { kind: 'request'; request: SignedRequest; admission: AdmissionDecision }
   | {
-      kind: 'joined' | 'rekeyed';
+      kind: 'joined' | 'rekeyed' | 'fork-resolved';
       thread: string;
       epoch: number;
       members: Member[];
@@ -191,6 +194,20 @@ export interface ClientSnapshot {
   /** Ids of this client's own deliveries, so their echoes are skipped. */
   sentIds: string[];
   treeHeads: Record<string, TreeHead>;
+  /** The domain key already checked against the domain's log, by domain (Section 6.5). */
+  domainKeys: Record<string, string>;
+  /** The contacts key each home's document is under (Section 7.9), by home URL. */
+  contactKeys: Record<string, { epoch: number; key: string }>;
+  /** The newest contacts epoch and version each home has answered with, so an older answer is refused. */
+  contactSeen: Record<string, { epoch: number; version: number }>;
+  /** Changes to the contacts that a home has not taken yet, by home URL. */
+  contactOps: Record<string, ContactOp[]>;
+  /** The latest commit applied in each thread, with the undo for it, kept briefly in case a competing one arrives (Section 8.8). */
+  lastCommit: Record<string, { hash: string; undo: StateUndo; at: number; own: boolean; joined?: boolean }>;
+  /** Messages that could not be read yet, kept until the winning commit may arrive (Section 8.8). */
+  held: { item: MailItem; at: number }[];
+  /** Threads where this client's own commit lost, to be recomputed against the winner. */
+  rekeyAgain: string[];
   knownOwnClients: string[];
   /** Grants this agent holds from its owner. */
   grants: Grant[];
@@ -230,6 +247,13 @@ export interface LiveSessionRecord {
 
 export interface SignetClientOptions {
   trustedLogs: TrustedLog[];
+  /**
+   * Witnesses whose cosignatures a tree head needs, and how many of them (Section 5.5.1). Set by the client,
+   * never by a domain's policy. Without them a log is trusted on its own signature alone.
+   */
+  witnesses?: { keys: string[]; threshold: number };
+  /** Reject tree heads older than this many milliseconds (Section 5.5.2). Defaults to 24 hours. */
+  maxHeadAgeMs?: number;
   snapshot?: Partial<ClientSnapshot>;
   fetchImpl?: typeof fetch;
   /** How many unused key packages to keep on the home server, besides the last-resort one. */
@@ -267,6 +291,9 @@ interface WelcomePayload {
   for: string[];
   humansOnly?: boolean;
   linkedTo?: string;
+  /** For a welcome that comes with a commit: the hex SHA-256 of that commit and the epoch it makes (Section 8.8). */
+  commit?: string;
+  epoch?: number;
 }
 
 interface MlsPayload {
@@ -290,6 +317,13 @@ const emptySnapshot = (): ClientSnapshot => ({
   tokens: {},
   sentIds: [],
   treeHeads: {},
+  domainKeys: {},
+  contactKeys: {},
+  contactSeen: {},
+  contactOps: {},
+  lastCommit: {},
+  held: [],
+  rekeyAgain: [],
   knownOwnClients: [],
   grants: [],
   views: {},
@@ -314,16 +348,41 @@ const WATCH_KEPT = 500;
 const WATCH_MAX_AGE_MS = 24 * 3_600_000;
 
 const joinerTag = (clientId: string): string => sha256(`signet joiner ${clientId}`);
-const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }): WelcomePayload => ({
+const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }, commit?: { hash: string; epoch: number }): WelcomePayload => ({
   thread,
   welcome,
   for: joiners.map((joiner) => joinerTag(joiner.clientId)),
+  ...(commit ? { commit: commit.hash, epoch: commit.epoch } : {}),
   ...(meta.humansOnly ? { humansOnly: true } : {}),
   ...(meta.linkedTo ? { linkedTo: meta.linkedTo } : {}),
 });
 
 /** Who may be in a thread: readers, and in a humans-only thread only devices and agents their owner opted in. */
 const eligible = (member: ViewMember, humansOnly: boolean): boolean => member.reads && (!humansOnly || member.humansOnly);
+
+/** One change to the shared contacts (Section 7.9). */
+interface ContactOp {
+  op: 'add' | 'remove';
+  kind: 'contact' | 'domain';
+  value: string;
+}
+
+function applyContactOps(lists: AdmissionPolicy, ops: ContactOp[]): AdmissionPolicy {
+  const contacts = new Set(lists.contacts);
+  const domains = new Set(lists.trustedDomains);
+  for (const { op, kind, value } of ops) {
+    const set = kind === 'contact' ? contacts : domains;
+    if (op === 'add') set.add(value);
+    else set.delete(value);
+  }
+  return { contacts: [...contacts], trustedDomains: [...domains] };
+}
+
+/** How long a client keeps the means to take back its latest commit, and messages it cannot read yet (Section 8.8). */
+const FORK_WINDOW_MS = 5 * 60_000;
+
+/** A thread message that cannot be decrypted yet, perhaps because the commit it follows has not arrived. */
+class NotReadableYet extends Error {}
 
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const unique = (values: string[]) => [...new Set(values)];
@@ -392,20 +451,47 @@ export class SignetClient {
   }
 
   /**
-   * Contacts and trusted domains live on the account's home server, so every device and agent of the
-   * account admits the same people and warns about the same lookalikes. They're routing metadata the
-   * server already sees, not content. Each client keeps a copy and syncs it on every `sync`.
+   * Contacts and trusted domains are shared by every client of the account, so each admits the same people and
+   * warns about the same lookalikes. The home server holds them encrypted under a key only the account's clients
+   * have (Section 7.9). A change is kept until every home has taken it.
    */
   async addContact(address: string): Promise<void> {
-    const who = normalizeAddress(address);
-    if (!this.state.admission.contacts.includes(who)) this.state.admission.contacts.push(who);
-    await this.callEach('POST', '/v0/contacts', { contacts: [who] });
+    await this.changeContacts([{ op: 'add', kind: 'contact', value: normalizeAddress(address) }]);
   }
 
   async trustDomain(domain: string): Promise<void> {
-    const name = domain.toLowerCase();
-    if (!this.state.admission.trustedDomains.includes(name)) this.state.admission.trustedDomains.push(name);
-    await this.callEach('POST', '/v0/contacts', { trustedDomains: [name] });
+    await this.changeContacts([{ op: 'add', kind: 'domain', value: domain.toLowerCase() }]);
+  }
+
+  async removeContact(address: string): Promise<void> {
+    await this.changeContacts([{ op: 'remove', kind: 'contact', value: normalizeAddress(address) }]);
+  }
+
+  async untrustDomain(domain: string): Promise<void> {
+    await this.changeContacts([{ op: 'remove', kind: 'domain', value: domain.toLowerCase() }]);
+  }
+
+  /** Delete an attachment this client uploaded, at every home that holds it (Section 8.9). Copies already fetched stay fetched. */
+  async deleteAttachment(ref: AttachmentRef): Promise<void> {
+    const failed: unknown[] = [];
+    for (const url of [ref.url, ...(ref.mirrors ?? [])]) {
+      const { origin, pathname } = new URL(url);
+      try {
+        await this.request(origin, 'DELETE', pathname);
+      } catch (error) {
+        failed.push(error);
+      }
+    }
+    if (failed.length > 0) throw failed[0];
+  }
+
+  /**
+   * Whether a request to this address will be readable by the recipient's organisation escrow client. A sender
+   * MUST tell the person before sending (Section 4.3); the card says so on the escrow client's key.
+   */
+  async escrowRecipient(address: string, humansOnly = false): Promise<boolean> {
+    const { card } = await this.recipientFor(normalizeAddress(address));
+    return (humansOnly ? card.humanKeys : card.requestKeys).some((key) => key.escrow === true);
   }
 
   /** Mark a client this device approved itself, so `monitor` doesn't ask whether it was you. */
@@ -413,12 +499,125 @@ export class SignetClient {
     if (!this.state.knownOwnClients.includes(clientId)) this.state.knownOwnClients.push(clientId);
   }
 
+  /** Apply a change here, and at every home as soon as each takes it. */
+  private async changeContacts(ops: ContactOp[]): Promise<void> {
+    this.state.admission = applyContactOps(this.state.admission, ops);
+    const homes = await this.homeBases();
+    for (const home of homes) (this.state.contactOps[home] ??= []).push(...ops);
+    let failure: unknown;
+    let taken = 0;
+    for (const home of homes) {
+      try {
+        await this.syncContactsAt(home);
+        taken += 1;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (taken === 0 && failure) throw failure;
+  }
+
+  /** The clients that hold a copy of the contacts key: every active client of this account. */
+  private async activeOwnClients(): Promise<ClientCert[]> {
+    const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
+    if (!own.log) throw new Error('home server did not return this account’s log');
+    return activeClients(replayLog(own.log));
+  }
+
+  private contactsAad = (epoch: number): Uint8Array => utf8(`signet0 contacts|${this.address}|${epoch}`);
+  private contactsInfo = (epoch: number): string => `signet0 contacts key|${this.address}|${epoch}`;
+
+  private sealContacts(lists: AdmissionPolicy, key: Buffer, epoch: number): Ciphertext {
+    return encrypt(key, padPlaintext(utf8(JSON.stringify({ v: 0, contacts: lists.contacts, trustedDomains: lists.trustedDomains }))), this.contactsAad(epoch));
+  }
+
+  private openContacts(data: Ciphertext, key: Buffer, epoch: number): AdmissionPolicy {
+    const body = JSON.parse(unpadPlaintext(decrypt(key, data, this.contactsAad(epoch))).toString('utf8')) as { contacts?: string[]; trustedDomains?: string[] };
+    return { contacts: unique(body.contacts ?? []), trustedDomains: unique(body.trustedDomains ?? []) };
+  }
+
+  private async wrapsFor(clients: ClientCert[], key: Buffer, epoch: number): Promise<Record<string, Sealed>> {
+    return Object.fromEntries(await Promise.all(clients.map(async (cert) => [cert.clientId, await seal(cert.agreeKey, key, this.contactsInfo(epoch))] as const)));
+  }
+
+  /**
+   * Bring one home's contacts document in step (Section 7.9): open the key, apply the changes this home has not
+   * taken, give new clients their wraps, and rotate the key if a revoked client still has one. Returns the lists
+   * the home holds, with changes it has not yet taken applied, or null if this client has no key there yet.
+   */
+  private async syncContactsAt(home: string): Promise<AdmissionPolicy | null> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const answer = (await this.request(home, 'GET', '/v0/contacts')) as { epoch: number; version: number; data: Ciphertext | null; wrap: Sealed | null; wrapped: string[] };
+      const seen = this.state.contactSeen[home];
+      if (seen && (answer.epoch < seen.epoch || (answer.epoch === seen.epoch && answer.version < seen.version))) {
+        throw new Error(`${home} answered with older contacts than it did before`);
+      }
+      this.state.contactSeen[home] = { epoch: answer.epoch, version: answer.version };
+      const pending = this.state.contactOps[home] ?? [];
+      let held: { epoch: number; key: string } | undefined = this.state.contactKeys[home];
+      if (answer.epoch > 0 && held?.epoch !== answer.epoch) {
+        held = undefined;
+        delete this.state.contactKeys[home];
+        if (answer.wrap) {
+          const key = await open(this.keys.agreement, answer.wrap, this.contactsInfo(answer.epoch));
+          held = { epoch: answer.epoch, key: b64u(key) };
+          this.state.contactKeys[home] = held;
+        }
+      }
+      // No key yet: another client has to give this one a wrap.
+      if (answer.epoch > 0 && !held) return null;
+      const active = await this.activeOwnClients();
+      const activeIds = new Set(active.map((cert) => cert.clientId));
+      let key = held ? fromB64u(held.key) : randomSecret();
+      let epoch = answer.epoch;
+      const stored = answer.data && held ? this.openContacts(answer.data, key, answer.epoch) : answer.epoch === 0 ? this.state.admission : { contacts: [], trustedDomains: [] };
+      const lists = applyContactOps(stored, pending);
+      const missing = active.filter((cert) => !answer.wrapped.includes(cert.clientId));
+      const revoked = answer.wrapped.some((id) => !activeIds.has(id));
+      let body: { expectedVersion: number; epoch: number; data?: Ciphertext; wraps: Record<string, Sealed> } | undefined;
+      if (answer.epoch === 0 || revoked) {
+        // A first key, or a new one because a client that is no longer active still holds the old.
+        epoch = answer.epoch + 1;
+        key = randomSecret();
+        body = { expectedVersion: answer.version, epoch, data: this.sealContacts(lists, key, epoch), wraps: await this.wrapsFor(active, key, epoch) };
+      } else if (pending.length > 0 || missing.length > 0) {
+        body = {
+          expectedVersion: answer.version,
+          epoch,
+          ...(pending.length > 0 ? { data: this.sealContacts(lists, key, epoch) } : {}),
+          wraps: await this.wrapsFor(missing, key, epoch),
+        };
+      }
+      if (body) {
+        try {
+          const { version } = (await this.request(home, 'PUT', '/v0/contacts', body)) as { version: number };
+          this.state.contactSeen[home] = { epoch, version };
+          this.state.contactKeys[home] = { epoch, key: b64u(key) };
+          delete this.state.contactOps[home];
+        } catch (error) {
+          if (error instanceof Error && error.message.includes(' 409 ')) continue;
+          throw error;
+        }
+      }
+      return lists;
+    }
+    throw new Error(`${home} kept changing the contacts; try again`);
+  }
+
+  /** At each sync: bring every home's contacts in step, then take the lists from the first that answers (Section 7.9). */
   private async pullContacts(): Promise<void> {
-    const shared = (await this.call('GET', '/v0/contacts')) as AdmissionPolicy;
-    this.state.admission = {
-      contacts: unique([...this.state.admission.contacts, ...shared.contacts]),
-      trustedDomains: unique([...this.state.admission.trustedDomains, ...shared.trustedDomains]),
-    };
+    let lists: AdmissionPolicy | null = null;
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        const got = await this.syncContactsAt(home);
+        if (!lists && got) lists = got;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (lists) this.state.admission = lists;
+    else if (failure && (await this.homeBases()).length === 1) throw failure;
   }
 
   /** Hold a grant from this client's owner. The agent presents it only to the counterparty it names. */
@@ -776,10 +975,11 @@ export class SignetClient {
     }
     if (removed.length === 0 && additions.length === 0) return { removed: [], added: [] };
     const token = this.deliveryToken(id);
-    const result = this.mls.commit(id, removed.map((member) => member.leafIndex), additions);
+    const result = this.mls.commitUndoable(id, removed.map((member) => member.leafIndex), additions);
+    this.state.lastCommit[id] = { hash: commitHash(result.commit).toString('hex'), undo: result.undo, at: Date.now(), own: true };
     await this.submit(principals, 'commit', { thread: id, mls: result.commit } satisfies MlsPayload, token);
     if (result.welcome) {
-      await this.submit(this.principalsOf(result.joiners), 'welcome', welcomeFor(id, result.welcome, result.joiners, this.state.threadMeta[id]), token);
+      await this.submit(this.principalsOf(result.joiners), 'welcome', welcomeFor(id, result.welcome, result.joiners, this.state.threadMeta[id], { hash: commitHash(result.commit).toString('hex'), epoch: this.mls.epoch(id) }), token);
     }
     await this.registerCurrentToken(id);
     return { removed, added: result.joiners };
@@ -788,7 +988,7 @@ export class SignetClient {
   /** Download and decrypt an attachment from a message this client has read. */
   async fetchAttachment(ref: AttachmentRef): Promise<Buffer> {
     let failure: unknown;
-    for (const url of [ref.url, ...(ref.copies ?? [])]) {
+    for (const url of [ref.url, ...(ref.mirrors ?? [])]) {
       try {
         const response = await this.fetchImpl(url);
         if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
@@ -814,7 +1014,7 @@ export class SignetClient {
   }
 
   /** A Signet header for an outgoing plain email, attested by this account's home server with its domain key. */
-  async signetHeader(fields: { to: string[]; subject: string }): Promise<string> {
+  async signetHeader(fields: { to: string[]; subject: string; bodyHash: string; humansOnly?: boolean }): Promise<string> {
     return ((await this.call('POST', '/v0/legacy/attest', fields)) as { header: string }).header;
   }
 
@@ -838,6 +1038,7 @@ export class SignetClient {
       }
       // The attestation must come from the From address's own domain: nobody else can vouch for that mail.
       const fromPolicy = await this.resolver.policy(splitAddress(fields.from).domain).catch(() => null);
+      if (fromPolicy) await this.checkDomainKey(fromPolicy, this.trustedLog(fromPolicy));
       const vouched = fromPolicy !== null && verifyAttestation(header, fields, fromPolicy.domainKey);
       // An unlisted sender can't be looked up, but its domain's attestation still names its key.
       const onSignet = directory ? sha256(directory.identityKey) === header.fingerprint : hidden && vouched;
@@ -852,7 +1053,7 @@ export class SignetClient {
 
   /** Plain email through the Gmail API (Gmail mode), carrying an attested Signet header. */
   async sendViaGmail(gmail: GmailMailbox, to: string[], fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ id: string }> {
-    const header = await this.signetHeader({ to, subject: fields.subject });
+    const header = await this.signetHeader({ to, subject: fields.subject, bodyHash: hashBody(fields.text), humansOnly: fields.humansOnly });
     return gmail.send({ from: this.address, to, subject: fields.subject, text: fields.text, signetHeader: header, humansOnly: fields.humansOnly, files: fields.files });
   }
 
@@ -866,7 +1067,10 @@ export class SignetClient {
     const offers: GmailSignetOffer[] = [];
     for (const message of messages) {
       if (!message.signet || (message.humansOnly && !mayReadHumansOnly)) continue;
-      const signet = await this.checkSignetHeader({ from: message.from, to: message.to, subject: message.subject }, message.signet);
+      const signet = await this.checkSignetHeader(
+        { from: message.from, to: message.to, subject: message.subject, bodyHash: hashBody(message.text ?? ''), ...(message.humansOnly ? { audience: 'humans' as const } : {}) },
+        message.signet,
+      );
       if (signet) offers.push({ gmailId: message.id, from: message.from, subject: message.subject, signet, humansOnly: message.humansOnly });
     }
     return { historyId: next, offers };
@@ -925,12 +1129,19 @@ export class SignetClient {
           try {
             events.push(...(await this.process(item)));
           } catch (error) {
-            events.push({ kind: 'error', item, error: describe(error) });
+            if (error instanceof NotReadableYet) this.state.held.push({ item, at: Date.now() });
+            else events.push({ kind: 'error', item, error: describe(error) });
           }
         }
       }
       lastAnswered = mailboxes.map((mailbox) => mailbox.home);
       if (this.released === 0) break;
+    }
+    await this.acknowledgeMailboxes();
+    events.push(...this.expireHeld());
+    // A commit of ours that lost to another is recomputed against the winning epoch (Section 8.8 step 4).
+    for (const thread of this.state.rekeyAgain.splice(0)) {
+      if (this.state.threads.includes(thread)) await this.rekey(thread).catch(() => undefined);
     }
     events.push(...(await this.retryUnconfirmed()));
     events.push(...(await this.laggingHomes(lastAnswered)));
@@ -1069,15 +1280,30 @@ export class SignetClient {
   /** Join only if every member of the group is a current client in its owner's contact view. */
   private async onWelcome(payload: WelcomePayload): Promise<SignetEvent[]> {
     if (!payload.for.includes(joinerTag(this.keys.cert.clientId))) return [];
-    if (this.state.threads.includes(payload.thread)) return [];
-    const preview = this.mls.peekWelcome(payload.welcome);
+    let replaces = false;
+    if (this.state.threads.includes(payload.thread)) {
+      // A second welcome for a thread this client just joined: two commits competed. Keep the one that won (Section 8.8).
+      const held = this.state.lastCommit[payload.thread];
+      if (!held?.joined || payload.commit === undefined || payload.epoch === undefined || Date.now() - held.at > FORK_WINDOW_MS) return [];
+      const wins = payload.epoch > this.mls.epoch(payload.thread) || (payload.epoch === this.mls.epoch(payload.thread) && Buffer.compare(Buffer.from(payload.commit, 'hex'), Buffer.from(held.hash, 'hex')) < 0);
+      if (!wins) return [];
+      replaces = true;
+    }
+    const taken = this.state.lastCommit[payload.thread];
+    const preview = replaces && taken ? this.mls.peekWelcomeBefore(payload.welcome, taken.undo) : this.mls.peekWelcome(payload.welcome);
     if (preview.thread !== payload.thread) throw new Error('welcome is for a different thread than it claims');
     const humansOnly = payload.humansOnly === true;
     for (const member of preview.members) {
       const { member: current } = await this.checkMember(member);
       if (humansOnly && !current.humansOnly) throw new Error(`humans-only thread includes ${member.principal}'s agent, which its owner hasn't allowed`);
     }
-    const { thread, members } = this.mls.join(payload.welcome);
+    if (replaces && taken) {
+      this.mls.rollback(taken.undo);
+      this.state.threads = this.state.threads.filter((known) => known !== payload.thread);
+      delete this.state.lastCommit[payload.thread];
+    }
+    const { thread, members, undo } = this.mls.joinUndoable(payload.welcome);
+    if (payload.commit !== undefined) this.state.lastCommit[thread] = { hash: payload.commit, undo, at: Date.now(), own: false, joined: true };
     const meta: ThreadMeta = { humansOnly, ...(payload.linkedTo ? { linkedTo: payload.linkedTo } : {}) };
     this.state.threads.push(thread);
     this.state.threadMeta[thread] = meta;
@@ -1089,7 +1315,25 @@ export class SignetClient {
   /** Apply a commit only if its sender and every client it adds are current in their owners' views. */
   private async onCommit(payload: MlsPayload): Promise<SignetEvent[]> {
     if (!this.state.threads.includes(payload.thread)) return [];
-    const preview = this.mls.previewCommit(payload.thread, payload.mls);
+    // Two members can commit from the same epoch: the smaller hash wins, and the client that applied the other
+    // goes back to before it (Section 8.8). A commit that is not for the current epoch is looked at as if it were.
+    const last = this.state.lastCommit[payload.thread];
+    let preview: CommitPreview;
+    let supersedes = false;
+    try {
+      preview = this.mls.previewCommit(payload.thread, payload.mls);
+    } catch (error) {
+      if (!last || Date.now() - last.at > FORK_WINDOW_MS) throw error;
+      // A client that just joined has nothing from before its welcome to compare with: the other commit's welcome settles it.
+      if (last.joined) return [];
+      try {
+        preview = this.mls.previewCommitBefore(payload.thread, payload.mls, last.undo);
+      } catch {
+        throw error;
+      }
+      if (Buffer.compare(commitHash(payload.mls), Buffer.from(last.hash, 'hex')) >= 0) return [];
+      supersedes = true;
+    }
     if (!preview.selfRemoved) {
       await this.checkMember(preview.sender);
       for (const member of preview.added) {
@@ -1099,7 +1343,13 @@ export class SignetClient {
         }
       }
     }
-    const applied = this.mls.applyCommit(payload.thread, payload.mls);
+    if (supersedes && last) {
+      this.mls.rollback(last.undo);
+      delete this.state.lastCommit[payload.thread];
+      if (last.own) this.state.rekeyAgain.push(payload.thread);
+    }
+    const applied = this.mls.applyCommitUndoable(payload.thread, payload.mls);
+    this.state.lastCommit[payload.thread] = { hash: commitHash(payload.mls).toString('hex'), undo: applied.undo, at: Date.now(), own: false };
     if (applied.selfRemoved || !this.mls.isActive(payload.thread)) {
       this.state.threads = this.state.threads.filter((thread) => thread !== payload.thread);
       await this.registerTokens([], this.state.tokens[payload.thread] ?? []);
@@ -1108,24 +1358,57 @@ export class SignetClient {
     }
     await this.registerCurrentToken(payload.thread);
     const members = this.mls.members(payload.thread);
-    return [
-      {
-        kind: 'rekeyed',
-        thread: payload.thread,
-        epoch: this.mls.epoch(payload.thread),
-        members,
-        participants: await this.toParticipants(members),
-        ...(this.state.threadMeta[payload.thread] ?? { humansOnly: false }),
-      },
-    ];
+    const base = { thread: payload.thread, epoch: this.mls.epoch(payload.thread), members, participants: await this.toParticipants(members), ...(this.state.threadMeta[payload.thread] ?? { humansOnly: false }) };
+    return [...(supersedes ? [{ kind: 'fork-resolved' as const, ...base }] : []), { kind: 'rekeyed', ...base }, ...(await this.retryHeld(payload.thread))];
+  }
+
+  /** Messages that could not be read before this commit may be readable now (Section 8.8 step 3). */
+  private async retryHeld(thread: string): Promise<SignetEvent[]> {
+    const events: SignetEvent[] = [];
+    const waiting = this.state.held;
+    this.state.held = [];
+    for (const entry of waiting) {
+      if ((entry.item.payload as MlsPayload).thread !== thread) {
+        this.state.held.push(entry);
+        continue;
+      }
+      try {
+        events.push(...(await this.process(entry.item)));
+      } catch (error) {
+        if (error instanceof NotReadableYet) this.state.held.push(entry);
+        else events.push({ kind: 'error', item: entry.item, error: describe(error) });
+      }
+    }
+    return events;
+  }
+
+  /** Held messages that no commit has made readable in the window are reported as errors (Section 8.8 step 5). */
+  private expireHeld(): SignetEvent[] {
+    const now = Date.now();
+    const expired = this.state.held.filter((entry) => now - entry.at > FORK_WINDOW_MS);
+    this.state.held = this.state.held.filter((entry) => now - entry.at <= FORK_WINDOW_MS);
+    for (const thread of Object.keys(this.state.lastCommit)) if (now - this.state.lastCommit[thread].at > FORK_WINDOW_MS) delete this.state.lastCommit[thread];
+    return expired.map((entry) => ({ kind: 'error' as const, item: entry.item, error: 'could not be decrypted: no commit arrived that makes it readable' }));
   }
 
   private async onMessage(payload: MlsPayload): Promise<SignetEvent[]> {
     if (!this.state.threads.includes(payload.thread)) return [];
-    const { sender, plaintext } = this.mls.decrypt(payload.thread, payload.mls);
+    let decrypted: ReturnType<MlsSession['decrypt']>;
+    try {
+      decrypted = this.mls.decrypt(payload.thread, payload.mls);
+    } catch (error) {
+      // It may be for an epoch whose commit has not reached this client yet (Section 8.8 step 5).
+      throw new NotReadableYet(error instanceof Error ? error.message : String(error));
+    }
+    const { sender, plaintext } = decrypted;
     const { directory, member } = await this.checkMember(sender);
     const message = JSON.parse(plaintext.toString('utf8')) as SignedMessage;
     verifyMessage(message, payload.thread, directory, member, this.address);
+    // Once a thread is handed to an account's human, that account's agents and tools may only hand off again (Section 12.6).
+    const held = this.state.needsHuman[payload.thread];
+    if (held && member.kind !== 'device' && message.body.from === held.by && !(message.body.intents.length > 0 && message.body.intents.every((intent) => intent.name.startsWith('handoff.human')))) {
+      throw new Error(`${held.by} handed this thread to a human, so its agents may not send in it`);
+    }
     if (message.body.profile?.label) this.state.labels[member.clientId] = message.body.profile.label.slice(0, 64);
     const events: SignetEvent[] = [{ kind: 'message', thread: payload.thread, message, sender: this.summary(directory, member) }];
     for (const intent of message.body.intents) {
@@ -1144,10 +1427,14 @@ export class SignetClient {
   }
 
   private async onLegacy(sealed: SealedLegacyMail): Promise<LegacyMail> {
-    const parsed = await simpleParser(await openLegacyMail(this.keys, sealed));
+    const raw = await openLegacyMail(this.keys, sealed);
+    const parsed = await simpleParser(raw);
     const from = parsed.from?.value[0]?.address ?? sealed.envelopeFrom;
     const to = (Array.isArray(parsed.to) ? parsed.to : parsed.to ? [parsed.to] : []).flatMap((group) => group.value.map((entry) => entry.address ?? ''));
-    const signet = await this.checkSignetHeader({ from, to, subject: parsed.subject ?? '' }, parsed.headers.get(SIGNET_HEADER.toLowerCase())?.toString());
+    const signet = await this.checkSignetHeader(
+      { from, to, subject: parsed.subject ?? '', bodyHash: hashBody(parsed.text ?? (typeof parsed.html === 'string' ? parsed.html : '')), ...(isHumansOnly(raw) ? { audience: 'humans' as const } : {}) },
+      parsed.headers.get(SIGNET_HEADER.toLowerCase())?.toString(),
+    );
     const lookalike = lookalikeOf(splitAddress(from).domain, knownDomains(this.state.admission, this.address)) ?? undefined;
     const trusted = sealed.auth.dmarc === 'pass' && isTrusted(this.state.admission, this.address, from) !== null;
     return {
@@ -1203,6 +1490,7 @@ export class SignetClient {
   private async fetchDirectory(who: string): Promise<Directory | null> {
     const policy = await this.resolver.policy(splitAddress(who).domain);
     const log = this.trustedLog(policy);
+    await this.checkDomainKey(policy, log);
     let entry = await this.directoryEntry(who);
     const pinned = this.state.pins[who];
 
@@ -1354,6 +1642,7 @@ export class SignetClient {
       if (!(error instanceof UnlistedAddressError)) throw error;
       const policy = await this.resolver.policy(splitAddress(error.principal).domain);
       if (!policy.intake) throw error;
+      await this.checkDomainKey(policy, this.trustedLog(policy));
       return { principal: error.principal, card: { requestKeys: [policy.intake], humanKeys: [policy.intake] } };
     }
   }
@@ -1378,6 +1667,19 @@ export class SignetClient {
     if (others.length > 0) await this.callEach('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
   }
 
+  /**
+   * A domain key this client has not seen is checked against the domain-key leaf in the log the policy names
+   * before the policy is used (Section 6.5). A key the log does not record is refused.
+   */
+  private async checkDomainKey(policy: DomainPolicy, log: TrustedLog): Promise<void> {
+    if (this.state.domainKeys[policy.domain] === policy.domainKey) return;
+    const { leaf } = await this.latestLeaf(log, domainKeyIndex(policy.domain), policy.domain);
+    if (leaf?.kind !== 'domain-key' || leaf.domainKey !== policy.domainKey) {
+      throw new TransparencyError(`${policy.domain}'s domain key is not the one its transparency log records`);
+    }
+    this.state.domainKeys[policy.domain] = policy.domainKey;
+  }
+
   private trustedLog(policy: DomainPolicy): TrustedLog {
     const log = this.options.trustedLogs.find((candidate) => candidate.url === policy.log.url && candidate.key === policy.log.key);
     if (!log) throw new TransparencyError(`${policy.domain} writes to a transparency log this client does not trust`);
@@ -1385,10 +1687,22 @@ export class SignetClient {
   }
 
   private async directoryEntry(who: string): Promise<DirectoryEntry> {
-    if (!this.direct) return (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(who)}`)) as DirectoryEntry;
+    if (!this.direct) {
+      // A lookup in another domain carries proof that this client is the requester it names, so the target
+      // releases its contact view to the right person only (Section 4.7).
+      const headers = splitAddress(who).domain === splitAddress(this.address).domain ? undefined : { 'signet-requester': await this.requesterProof(who) };
+      return (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(who)}`, undefined, headers)) as DirectoryEntry;
+    }
     const { local, domain } = splitAddress(who);
     const { server } = await this.resolver.policy(domain);
     return (await this.getJson(`${server}/v0/directory/${encodeURIComponent(local)}`)) as DirectoryEntry;
+  }
+
+  /** Proof for a lookup of `target`. The log is fetched each time: a cached copy would not match the card once a client is enrolled. */
+  private async requesterProof(target: string): Promise<string> {
+    const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
+    if (!own.log) throw new Error('home server did not return this account’s log');
+    return signRequesterProof(this.keys, this.address, own.log, target);
   }
 
   /** Log queries go through the home server, which authenticates to the log as its domain. */
@@ -1404,6 +1718,11 @@ export class SignetClient {
   /** Every tree head must extend the last one this client saw from that log, or the log has forked. */
   private async checkTreeHead(log: TrustedLog, head: TreeHead): Promise<void> {
     if (!verifyTreeHead(log.key, head)) throw new TransparencyError('tree head is not signed by the log');
+    if (Date.now() - Date.parse(head.ts) > (this.options.maxHeadAgeMs ?? 24 * 3_600_000)) throw new TransparencyError('tree head is too old');
+    const { witnesses } = this.options;
+    if (witnesses && countCosignatures(log.key, head, witnesses.keys) < witnesses.threshold) {
+      throw new TransparencyError(`tree head has fewer than ${witnesses.threshold} witness cosignatures`);
+    }
     const previous = this.state.treeHeads[log.url];
     if (previous && previous.size === head.size && previous.root !== head.root) {
       throw new TransparencyError('log forked: two different trees of the same size');
@@ -1477,7 +1796,7 @@ export class SignetClient {
     // The message names where the ciphertext is, so it goes to every home: one operator being down or
     // withholding must not cost the reader the file.
     const urls = await this.eachHome(async (home) => ((await this.request(home, 'POST', '/v0/blobs', blob)) as { url: string }).url);
-    return { ...ref, url: urls[0], ...(urls.length > 1 ? { copies: urls.slice(1) } : {}) };
+    return { ...ref, url: urls[0], ...(urls.length > 1 ? { mirrors: urls.slice(1) } : {}) };
   }
 
   private thread(thread: string): string {
@@ -1528,12 +1847,13 @@ export class SignetClient {
 
   private preferredHome?: string;
 
-  private async request(base: string, method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async request(base: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
     const binary = body instanceof Uint8Array;
     const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
     const headers = {
       ...clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, payload),
       ...(body === undefined ? {} : { 'content-type': binary ? 'application/octet-stream' : 'application/json' }),
+      ...extra,
     };
     const response = await this.fetchImpl(`${base}${path}`, { method, headers, body: body === undefined ? undefined : payload });
     if (!response.ok) throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
@@ -1555,6 +1875,25 @@ export class SignetClient {
     return results;
   }
 
+  /**
+   * Tell each home how far this client has read, so it can delete what every reading client has (Section 10.7).
+   * It runs after the items were processed. A home that fails is told again at the next sync.
+   */
+  private async acknowledgeMailboxes(): Promise<void> {
+    for (const home of await this.homeBases()) {
+      const through = this.state.cursors[home] ?? 0;
+      if (through === 0 || through <= (this.acked[home] ?? 0)) continue;
+      try {
+        await this.request(home, 'POST', '/v0/mailbox/ack', { through, ...(this.state.epochs[home] ? { epoch: this.state.epochs[home] } : {}) });
+        this.acked[home] = through;
+      } catch {
+        // The next sync tries again.
+      }
+    }
+  }
+
+  private readonly acked: Record<string, number> = {};
+
   /** The mailbox of every home, each from its own cursor. A home that doesn't answer is skipped. */
   private async readMailboxes(): Promise<{ home: string; items: MailItem[] }[]> {
     const bases = await this.homeBases();
@@ -1570,11 +1909,11 @@ export class SignetClient {
   }
 
   /** A call to the first home that answers. */
-  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async call(method: 'GET' | 'POST', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
     let failure: unknown;
     for (const home of await this.homeBases()) {
       try {
-        const result = await this.request(home, method, path, body);
+        const result = await this.request(home, method, path, body, extra);
         this.preferredHome = home;
         return result;
       } catch (error) {

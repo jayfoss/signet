@@ -1,3 +1,4 @@
+import type { MailItem } from '@signet/lib';
 import { Identity, randomToken } from '@signet/lib';
 import { Testbed } from '../testbed';
 
@@ -17,6 +18,17 @@ async function world(limits = {}) {
 describe('sealed sender', () => {
   it("keeps thread traffic from naming its sender to the recipient's server", async () => {
     const { bed, alicePhone, jerzyPhone } = await world();
+    // Clients acknowledge what they read and the servers delete it, so record what each server was handed.
+    const stored: { local: string; item: MailItem }[] = [];
+    for (const domain of ['alpha.test', 'beta.test']) {
+      const { store } = bed.server(domain);
+      const push = store.push.bind(store);
+      store.push = (local, item) => {
+        const result = push(local, item);
+        stored.push({ local, item: result });
+        return result;
+      };
+    }
     try {
       await alicePhone.sendRequest('jerzy@beta.test', { subject: 'Hello' });
       const [incoming] = await jerzyPhone.sync();
@@ -27,8 +39,8 @@ describe('sealed sender', () => {
       await alicePhone.send(thread, { subject: 'Hello', text: 'Thanks' });
       expect((await jerzyPhone.sync()).map((event) => event.kind)).toEqual(['message']);
 
-      const atBeta = bed.server('beta.test').store.mailbox('jerzy');
-      const atAlpha = bed.server('alpha.test').store.mailbox('alice');
+      const atBeta = stored.filter((entry) => entry.local === 'jerzy').map((entry) => entry.item);
+      const atAlpha = stored.filter((entry) => entry.local === 'alice').map((entry) => entry.item);
       const threadItems = [...atBeta, ...atAlpha].filter((item) => item.kind !== 'request');
       expect(threadItems.length).toBeGreaterThanOrEqual(3);
       expect(threadItems.every((item) => item.from === '' && item.sealed === true)).toBe(true);
@@ -84,6 +96,17 @@ describe('anonymous requests (Privacy Pass over Oblivious HTTP)', () => {
 
   it('lets the reply thread be sealed too, so neither request nor thread names Alice to beta.test', async () => {
     const { bed, alicePhone, jerzyPhone } = await world();
+    // Clients acknowledge what they read and the servers delete it, so record what each server was handed.
+    const stored: { local: string; item: MailItem }[] = [];
+    for (const domain of ['alpha.test', 'beta.test']) {
+      const { store } = bed.server(domain);
+      const push = store.push.bind(store);
+      store.push = (local, item) => {
+        const result = push(local, item);
+        stored.push({ local, item: result });
+        return result;
+      };
+    }
     try {
       await alicePhone.sendRequest('jerzy@beta.test', { subject: 'Hello' });
       const [incoming] = await jerzyPhone.sync();
@@ -215,6 +238,17 @@ describe('lookup and claim limits', () => {
 
   it('keeps working after the one-time key packages run out, using the last-resort package', async () => {
     const { bed, alicePhone, jerzyPhone } = await world();
+    // Clients acknowledge what they read and the servers delete it, so record what each server was handed.
+    const stored: { local: string; item: MailItem }[] = [];
+    for (const domain of ['alpha.test', 'beta.test']) {
+      const { store } = bed.server(domain);
+      const push = store.push.bind(store);
+      store.push = (local, item) => {
+        const result = push(local, item);
+        stored.push({ local, item: result });
+        return result;
+      };
+    }
     try {
       await alicePhone.sendRequest('jerzy@beta.test', { subject: 'Hello' });
       const [incoming] = await jerzyPhone.sync();

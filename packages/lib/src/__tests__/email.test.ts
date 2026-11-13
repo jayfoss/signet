@@ -1,6 +1,6 @@
 import { lookalikeOf } from '../admission';
 import { generateSigningKey } from '../crypto';
-import { attestedSignetHeader, formatSignetHeader, parseSignetHeader, verifyAttestation } from '../legacy';
+import { attestedSignetHeader, formatSignetHeader, hashBody, parseSignetHeader, verifyAttestation } from '../legacy';
 import { DnsResolver, NotSignetDomainError, parseSignetTxt } from '../resolver';
 
 const policyFor = (domain: string) => ({ v: 'signet0', domain, server: `https://signet.${domain}`, mode: 'enforce', maxAge: 60 });
@@ -44,7 +44,7 @@ describe('policy discovery', () => {
 
 describe('Signet header on plain email', () => {
   const domainKey = generateSigningKey();
-  const fields = { from: 'alice@alpha.test', to: ['jerzy@beta.test'], subject: 'Docs' };
+  const fields = { from: 'alice@alpha.test', to: ['jerzy@beta.test'], subject: 'Docs', bodyHash: hashBody('See attached.\n') };
 
   it('verifies only for the exact From, To and Subject the domain attested', () => {
     const header = parseSignetHeader(attestedSignetHeader(domainKey, 'https://signet.alpha.test', 'identity-key', fields));
@@ -55,7 +55,20 @@ describe('Signet header on plain email', () => {
     expect(verifyAttestation(header, { ...fields, to: ['someone@else.test'] }, domainKey.publicKey)).toBe(false);
     expect(verifyAttestation(header, { ...fields, from: 'mallory@alpha.test' }, domainKey.publicKey)).toBe(false);
     expect(verifyAttestation(header, fields, generateSigningKey().publicKey)).toBe(false);
-    expect(verifyAttestation(header, fields, domainKey.publicKey, new Date(Date.now() + 8 * 86_400_000))).toBe(false);
+    expect(verifyAttestation(header, fields, domainKey.publicKey, new Date(Date.now() + 2 * 3_600_000))).toBe(false);
+    expect(verifyAttestation(header, fields, domainKey.publicKey, new Date(Date.now() + 30 * 60_000))).toBe(true);
+  });
+
+  it('covers the body and the humans-only audience', () => {
+    const header = parseSignetHeader(attestedSignetHeader(domainKey, 'https://signet.alpha.test', 'identity-key', { ...fields, audience: 'humans' }));
+    if (!header) throw new Error('header did not parse');
+
+    expect(verifyAttestation(header, { ...fields, audience: 'humans' }, domainKey.publicKey)).toBe(true);
+    // Another body, or the audience header removed in transit, no longer authenticates.
+    expect(verifyAttestation(header, { ...fields, audience: 'humans', bodyHash: hashBody('Send the money.') }, domainKey.publicKey)).toBe(false);
+    expect(verifyAttestation(header, fields, domainKey.publicKey)).toBe(false);
+    // Line ending and trailing whitespace differences in transit do not change the hash.
+    expect(hashBody('See attached.\r\n\r\n')).toEqual(hashBody('See attached.'));
   });
 
   it('treats a header with only a fingerprint as unauthenticated', () => {

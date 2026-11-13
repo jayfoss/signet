@@ -13,7 +13,7 @@ export interface AttachmentRef {
   size: number;
   url: string;
   /** The same ciphertext at the sender's other homes, when it has several (Section 6.9.5). */
-  copies?: string[];
+  mirrors?: string[];
   key: string;
   iv: string;
   digest: string;

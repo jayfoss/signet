@@ -1,6 +1,8 @@
-import { randomInt } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { join } from 'node:path';
 import type {
+  Ciphertext,
+  Sealed,
   ClaimedKeyPackage,
   ClientCert,
   DirectoryEntry,
@@ -8,6 +10,7 @@ import type {
   GatewayKey,
   IssuerKey,
   KeyPair,
+  KeyRotation,
   LegacyAuth,
   Operators,
   DomainBinding,
@@ -49,11 +52,16 @@ import {
   checkOperators,
   entryHash,
   attestedSignetHeader,
+  signServerUrls,
+  underDomain,
+  hashBody,
   hasScope,
   cardHash,
   generateVrfKey,
   proveIndex,
   requesterHash,
+  verifyDirectoryEntry,
+  verifyRequesterProof,
   verifyCard,
   verifyView,
   viewHash,
@@ -79,13 +87,19 @@ import {
   signReceipt,
 } from '@signet/lib';
 import { Cluster } from './cluster';
-import type { ClusterOptions } from './cluster';
+import type { ClusterMember, ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
+import { DomainKeyLogger } from './domain-key-log';
 import { HttpError, JsonServer, header, json } from './http';
+
+const optionalHeader = (headers: Record<string, string | string[] | undefined>, name: string): string | undefined => {
+  const value = headers[name];
+  return typeof value === 'string' ? value : undefined;
+};
 import type { Registrar } from './registrar';
 import type { LegacyInbox, OutboundSmtp } from './smtp';
 import type { PublishedKeyPackage } from './store';
-import type { Outbound, Store } from './store';
+import type { ContactsDoc, Outbound, Store } from './store';
 import { MemoryStore, SqliteStore } from './store';
 
 /** Daily limits. Lookups and claims are counted per requesting domain and per (hashed) requesting user. */
@@ -164,6 +178,12 @@ export interface SignetServerOptions {
   /** Defaults to the address the server listens on. */
   publicUrl?: string;
   maxAge?: number;
+  /** Proof that `domainKey` replaces an earlier key, for the policy to carry while clients may still hold the old one (Section 6.5). */
+  rotation?: KeyRotation;
+  /** Seconds a mailbox item is kept at most (Section 10.7). Default 30 days; published in the policy when it differs. */
+  mailboxRetentionSeconds?: number;
+  /** Seconds an attachment is kept at most (Section 8.9). Default 30 days; published in the policy when it differs. */
+  blobRetentionSeconds?: number;
   /** Lets anyone enroll an address over HTTP. Demo only: real enrollment goes through the org's admin. */
   openEnrollment?: boolean;
   /** Keep accounts, mailboxes and this server's keys in this folder, so they survive a restart. In memory if unset. */
@@ -244,6 +264,9 @@ class RelayError extends Error {
 const CLIENT_KINDS: MailKind[] = ['request', 'welcome', 'commit', 'message'];
 const SEALABLE_KINDS: MailKind[] = ['welcome', 'commit', 'message'];
 const HOUR = 3_600_000;
+const DEFAULT_RETENTION_MS = 30 * 24 * HOUR;
+/** The most ciphertext (base64url characters) an account's contacts may take: about 1 MiB. */
+const MAX_CONTACTS_B64 = 1_400_000;
 /** Sealed deliveries wait this long for their recipient to register the token, at most this many per user. */
 const PARK_TTL_MS = 24 * HOUR;
 const PARK_CAP = 500;
@@ -290,6 +313,7 @@ export class SignetServer implements LegacyInbox {
 
   constructor(private readonly options: SignetServerOptions) {
     this.fetchImpl = options.resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
+    if (options.domainKey) this.keyLogger = new DomainKeyLogger({ domain: options.domain, domainKey: options.domainKey, log: options.log, rotation: options.rotation, fetchImpl: options.fetchImpl });
     if (!options.domainKey) {
       if (!options.homeKey || !options.operators || !options.domainPublicKey) throw new Error('a home without the domain key needs homeKey, operators and domainPublicKey');
       const listed = checkOperators(options.operators, options.domain, options.domainPublicKey).some((home) => home.key === options.homeKey?.publicKey);
@@ -361,8 +385,12 @@ export class SignetServer implements LegacyInbox {
       ...(homes && homes.length > 1 ? { replicas: homes } : {}),
       mode: 'enforce',
       maxAge: this.options.maxAge ?? 2_592_000,
+      ...(this.mailboxRetentionMs !== DEFAULT_RETENTION_MS ? { mailboxRetention: this.mailboxRetentionMs / 1000 } : {}),
+      ...(this.blobRetentionMs !== DEFAULT_RETENTION_MS ? { blobRetention: this.blobRetentionMs / 1000 } : {}),
       domainKey: this.options.domainKey?.publicKey ?? (this.options.domainPublicKey as string),
       ...(this.options.operators ? { operators: this.options.operators } : {}),
+      ...(this.options.rotation ? { rotation: this.options.rotation } : {}),
+      ...this.serverSignature(server, homes),
       vrfKey: this.vrfKey.public,
       log: this.options.log,
       ohttp: { gateway: `${server}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey) },
@@ -371,13 +399,71 @@ export class SignetServer implements LegacyInbox {
     };
   }
 
+  /**
+   * Add a replica to this home's cluster, or remove one (Section 6.8.6 step 10). Primary only, and one change at a time.
+   * The operator also publishes the new replica in the DNS record's host list; `policy.replicas` follows the cluster.
+   */
+  async addReplica(member: ClusterMember): Promise<void> {
+    await (this.cluster ?? this.noCluster()).addMember(member);
+  }
+
+  async removeReplica(id: string): Promise<void> {
+    await (this.cluster ?? this.noCluster()).removeMember(id);
+  }
+
+  private noCluster(): never {
+    throw new HttpError(409, 'this home does not run as a cluster');
+  }
+
+  /** `serverSig` for a policy whose server or replicas are outside the domain, which needs the domain key (Section 6.4). */
+  private serverSignature(server: string, homes?: string[]): { serverSig?: string } {
+    const replicas = homes && homes.length > 1 ? homes : undefined;
+    const outside = [server, ...(replicas ?? [])].some((url) => !underDomain(url, this.options.domain));
+    if (!outside || !this.options.domainKey) return {};
+    return { serverSig: signServerUrls(this.options.domainKey, { domain: this.options.domain, server, replicas }) };
+  }
+
+  private readonly keyLogger?: DomainKeyLogger;
+
+  private get mailboxRetentionMs(): number {
+    return (this.options.mailboxRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
+  }
+
+  private get blobRetentionMs(): number {
+    return (this.options.blobRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
+  }
+
+  private sweepTimer?: NodeJS.Timeout;
+
   async listen(port = 0, host = '127.0.0.1'): Promise<string> {
     const url = await this.http.listen(port, host, this.options.publicUrl);
     this.cluster?.start();
+    this.sweepTimer = setInterval(() => void this.sweep(), 10 * 60_000);
+    this.sweepTimer.unref();
     return url;
   }
 
+  /**
+   * Delete what has outlived its retention: mailbox items (Section 10.7) and attachments (Section 8.9).
+   * A standby keeps its own attachments by the same rule and leaves the replicated state to the primary.
+   */
+  async sweep(now = Date.now()): Promise<void> {
+    try {
+      const before = new Date(now - this.mailboxRetentionMs).toISOString();
+      for (const local of this.store.userLocals()) this.store.expireMail(local, before);
+      for (const id of this.store.blobsBefore(now - this.blobRetentionMs)) {
+        await this.cluster?.deleteBlob(id);
+        this.store.deleteBlob(id);
+      }
+      await this.cluster?.expireBlobs(now - this.blobRetentionMs);
+      await this.cluster?.durable();
+    } catch {
+      // Not the primary, or it lost the role mid-sweep: the next one does it.
+    }
+  }
+
   async close(): Promise<void> {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.cluster?.close();
     this.cancelRetries();
     await this.http.close();
@@ -619,11 +705,61 @@ export class SignetServer implements LegacyInbox {
     await this.cluster?.durable();
   }
 
+  /**
+   * Store an account's encrypted contacts (Section 7.9). The home server checks the version and that wraps are for
+   * active clients; it cannot check, and never sees, what is inside.
+   */
+  private putContacts(client: ClientCert, body: { expectedVersion?: number; epoch?: number; data?: Ciphertext; wraps?: Record<string, Sealed> }): { version: number } {
+    const { local } = splitAddress(client.principal);
+    const doc = this.store.contactsDoc(local);
+    const sealed = (value: unknown): value is Sealed => typeof value === 'object' && value !== null && typeof (value as Sealed).enc === 'string' && typeof (value as Sealed).ct === 'string';
+    const cipher = (value: unknown): value is Ciphertext => typeof value === 'object' && value !== null && typeof (value as Ciphertext).iv === 'string' && typeof (value as Ciphertext).ct === 'string';
+    if (!Number.isInteger(body.expectedVersion) || !Number.isInteger(body.epoch)) throw new HttpError(400, 'expectedVersion and epoch are required');
+    if (body.data !== undefined && (!cipher(body.data) || body.data.ct.length > MAX_CONTACTS_B64)) throw new HttpError(400, 'data must be ciphertext of a sensible size');
+    if (body.expectedVersion !== doc.version) throw new HttpError(409, 'the contacts changed; read them again', { 'signet-version': String(doc.version) });
+    const user = this.store.user(local);
+    const active = new Set(user ? activeClients(replayLog(user.log)).map((cert) => cert.clientId) : []);
+    const wraps = body.wraps ?? {};
+    for (const [clientId, wrap] of Object.entries(wraps)) {
+      if (!active.has(clientId) || !sealed(wrap)) throw new HttpError(400, `${clientId} is not an active client with a well-formed wrap`);
+    }
+    let next: ContactsDoc;
+    if (doc.epoch >= 1 && body.epoch === doc.epoch) next = { epoch: doc.epoch, version: doc.version + 1, data: body.data ?? doc.data, wraps: { ...doc.wraps, ...wraps } };
+    else if (body.epoch === doc.epoch + 1) {
+      if (body.data === undefined) throw new HttpError(400, 'a new epoch needs data encrypted under its key');
+      next = { epoch: body.epoch, version: doc.version + 1, data: body.data, wraps };
+    } else throw new HttpError(400, `epoch must be ${doc.epoch}${doc.epoch >= 1 ? ' or ' : ' (none stored) +1 = '}${doc.epoch + 1}`);
+    this.store.putContactsDoc(local, next);
+    return { version: next.version };
+  }
+
+  /**
+   * Record how far a client has read, then delete what every reading client of the account has (Section 10.7).
+   * A client that is revoked or holds no read scope is not waited for.
+   */
+  private acknowledge(client: ClientCert, body: { through?: number; epoch?: string }): { through: number } {
+    const epoch = this.store.epoch();
+    if (typeof body.through !== 'number' || !Number.isInteger(body.through) || body.through < 0) throw new HttpError(400, 'through must be a sequence number');
+    if (body.epoch !== undefined && body.epoch !== epoch) throw new HttpError(409, 'the mailbox store has changed; read it from the start', { 'signet-epoch': epoch ?? '' });
+    const { local } = splitAddress(client.principal);
+    this.store.ackMail(local, client.clientId, body.through);
+    const user = this.store.user(local);
+    if (user) {
+      const readers = activeClients(replayLog(user.log)).filter((cert) => cert.scopes.some((scope) => scope.startsWith('read:')) || cert.kind === 'org-escrow');
+      const acks = this.store.acks(local);
+      const floor = Math.min(...readers.map((cert) => acks[cert.clientId] ?? 0));
+      if (readers.length > 0 && floor > 0) this.store.dropMail(local, floor);
+    }
+    return { through: body.through };
+  }
+
   private limit(key: string, max: number, what: string): void {
     if (this.store.bump(key) > max) throw new HttpError(429, `too many ${what} today`);
   }
 
   private async record(principal: string, kind: LogLeaf['kind'], identityKey: string | null, publication: Publication | null): Promise<void> {
+    // The domain's own key goes into the log before its first change, so a client can check the policy against it (Section 5.3.1).
+    await this.keyLogger?.ensure();
     const leaf: LogLeaf = {
       v: 0,
       index: proveIndex(this.vrfKey, principal).index,
@@ -639,12 +775,13 @@ export class SignetServer implements LegacyInbox {
   }
 
   /** A request to another Signet service, signed with this domain's key over its method, path, query and body. */
-  private signedFetch(method: 'GET' | 'POST', url: string, body = ''): Promise<Response> {
+  private signedFetch(method: 'GET' | 'POST', url: string, body = '', extra?: Record<string, string>): Promise<Response> {
     const { pathname, search } = new URL(url);
     return this.fetchImpl(url, {
       method,
       headers: {
         ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
+        ...extra,
         ...(this.options.domainKey
           ? domainAuthHeaders(this.options.domain, this.options.domainKey, method, `${pathname}${search}`, body)
           : homeAuthHeaders(this.options.domain, this.options.homeKey as KeyPair, method, `${pathname}${search}`, body)),
@@ -718,7 +855,7 @@ export class SignetServer implements LegacyInbox {
       if (this.livePairing(pairing[1]).principal !== client.principal) throw new HttpError(403, 'not your pairing slot');
       return this.postPairing(pairing[1], 'a', json<{ body: string }>(request).body);
     }
-    if (method === 'GET' && path === '/v0/lookup') return this.lookupFor(client, url.searchParams.get('address') ?? '');
+    if (method === 'GET' && path === '/v0/lookup') return this.lookupFor(client, url.searchParams.get('address') ?? '', optionalHeader(request.headers, 'signet-requester'));
     if (method === 'POST' && path === '/v0/claim') return this.claimFor(client, json<{ address: string; clients: string[] }>(request));
     if (method === 'GET' && transparency) return this.logQueryFor(client, transparency[1], url.searchParams);
     if (method === 'POST' && path === '/v0/submit') return this.submit(client, json<Envelope>(request));
@@ -727,14 +864,16 @@ export class SignetServer implements LegacyInbox {
       const epoch = this.store.epoch();
       const known = url.searchParams.get('epoch');
       const after = known !== null && known !== epoch ? 0 : Number(url.searchParams.get('after') ?? 0);
-      return { items: this.store.mailbox(splitAddress(client.principal).local, after), epoch };
+      const { local } = splitAddress(client.principal);
+      this.store.expireMail(local, new Date(Date.now() - this.mailboxRetentionMs).toISOString());
+      return { items: this.store.mailbox(local, after), epoch };
     }
-    if (method === 'GET' && path === '/v0/contacts') return this.store.contactsOf(splitAddress(client.principal).local);
-    if (method === 'POST' && path === '/v0/contacts') {
-      const { contacts = [], trustedDomains = [] } = json<{ contacts?: string[]; trustedDomains?: string[] }>(request);
-      this.store.addContacts(splitAddress(client.principal).local, contacts, trustedDomains);
-      return { ok: true };
+    if (method === 'POST' && path === '/v0/mailbox/ack') return this.acknowledge(client, json<{ through?: number; epoch?: string }>(request));
+    if (method === 'GET' && path === '/v0/contacts') {
+      const doc = this.store.contactsDoc(splitAddress(client.principal).local);
+      return { epoch: doc.epoch, version: doc.version, data: doc.data, wrap: doc.wraps[client.clientId] ?? null, wrapped: Object.keys(doc.wraps) };
     }
+    if (method === 'PUT' && path === '/v0/contacts') return this.putContacts(client, json(request));
     if (method === 'POST' && path === '/v0/contacts/grant') {
       const { add = [], remove = [] } = json<{ add?: string[]; remove?: string[] }>(request);
       this.store.updateViewGrants(splitAddress(client.principal).local, add, remove);
@@ -756,16 +895,28 @@ export class SignetServer implements LegacyInbox {
       return { ok: true };
     }
     if (method === 'POST' && path === '/v0/blobs') {
-      const id = randomId('blob');
+      // Sixteen random bytes: an id is the only thing that stops someone else fetching the ciphertext (Section 8.9).
+      const id = `blob_${randomBytes(16).toString('base64url')}`;
       // A replica keeps blobs beside its log and copies them to another home, so they never enter the log.
       if (this.cluster) await this.cluster.putBlob(id, request.body);
       else this.store.putBlob(id, request.body);
+      this.store.noteBlob(id, client.principal, Date.now());
       return { id, url: `${this.http.publicUrl}/v0/blobs/${id}` };
+    }
+    const owned = path.match(/^\/v0\/blobs\/([^/]+)$/);
+    if (method === 'DELETE' && owned) {
+      const id = decodeURIComponent(owned[1]);
+      const owner = this.store.blobOwner(id);
+      if (owner === undefined) throw new HttpError(404, 'no such blob');
+      if (owner !== client.principal) throw new HttpError(403, 'not your blob');
+      await this.cluster?.deleteBlob(id);
+      this.store.deleteBlob(id);
+      return { ok: true };
     }
     if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request), request);
     if (method === 'POST' && path === '/v0/legacy/attest') {
-      const { to, subject } = json<{ to: string[]; subject: string }>(request);
-      return { header: await this.attestHeader(client, to, subject, request) };
+      const { to, subject, bodyHash, humansOnly } = json<{ to: string[]; subject: string; bodyHash: string; humansOnly?: boolean }>(request);
+      return { header: await this.attestHeader(client, to, subject, request, bodyHash, humansOnly ? 'humans' : undefined) };
     }
     if (method === 'GET' && path === '/v0/issuer') {
       if (!this.options.issuer) throw new HttpError(501, 'this server has no Privacy Pass issuer');
@@ -881,14 +1032,14 @@ export class SignetServer implements LegacyInbox {
    * A signed call to another domain, to the first of its homes that answers. A home that can't be reached, says
    * 421, or fails with a 5xx is skipped; any other answer, including a refusal, is the answer.
    */
-  private async signedFetchHomes(domain: string, method: 'GET' | 'POST', path: string, body = ''): Promise<Response> {
+  private async signedFetchHomes(domain: string, method: 'GET' | 'POST', path: string, body = '', extra?: Record<string, string>): Promise<Response> {
     const policy = await this.options.resolver.policy(domain);
     const bases = policy.operators ? (policy.replicas ?? [policy.server]) : [policy.server];
     let last: Response | undefined;
     let failure: unknown;
     for (const base of bases) {
       try {
-        const response = await this.signedFetch(method, `${base}${path}`, body);
+        const response = await this.signedFetch(method, `${base}${path}`, body, extra);
         if (response.status < 500 && response.status !== 421) return response;
         last = response;
       } catch (error) {
@@ -909,7 +1060,11 @@ export class SignetServer implements LegacyInbox {
       : [[`lookup:ip:${request.remoteAddress}`, this.limits.anonymousLookupsPerIpPerDay, 'anonymous lookups'] as const];
     if (who) this.refuseScanningDomain(who.domain);
     for (const [key, max, what] of keys) if (this.store.count(key) >= max) throw new HttpError(429, `too many ${what} today`);
-    const granted = who !== null && this.store.hasViewGrant(local, who.user);
+    // A release only counts for a requester that proves it is who the hash names (Section 4.7).
+    const granted =
+      who !== null &&
+      this.store.hasViewGrant(local, who.user) &&
+      (await this.requesterProven(optionalHeader(request.headers, 'signet-requester'), who.user, `${local}@${this.options.domain}`));
     const entry = this.directory(local, granted ? 'contact' : 'public');
     // A miss costs more than a hit, and a domain whose lookups mostly miss gets cut off: that is what scanning
     // looks like. The server counts real misses even when its answer doesn't say which it was.
@@ -951,19 +1106,43 @@ export class SignetServer implements LegacyInbox {
     });
   }
 
+  /** How this server names one of its clients to the home of the address it is looking up (Section 4.7). */
   private requesterHash(client: ClientCert): string {
     return requesterHash(client.principal);
   }
 
-  private async lookupFor(client: ClientCert, address: string): Promise<DirectoryEntry> {
+  /**
+   * Whether a lookup that names a requester proves it is that requester (Section 4.7 step 3): the proof is
+   * signed by an active client of the requester's account log, and that log is the one the requester's own
+   * domain vouches for. The answer is remembered for the proof's lifetime.
+   */
+  private async requesterProven(proof: string | undefined, hash: string, target: string): Promise<boolean> {
+    if (!proof) return false;
+    try {
+      const state = verifyRequesterProof(proof, hash, target);
+      const { local, domain } = splitAddress(state.principal);
+      const policy = await this.options.resolver.policy(domain);
+      const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}`);
+      if (!response.ok) return false;
+      const entry = (await response.json()) as DirectoryEntry;
+      if (entry.status !== 'enrolled') return false;
+      const verified = verifyDirectoryEntry(entry, policy);
+      return verified.identityKey === state.identityKey && entry.card.card.logHead === state.head;
+    } catch {
+      return false;
+    }
+  }
+
+  private async lookupFor(client: ClientCert, address: string, proof?: string): Promise<DirectoryEntry> {
     const { local, domain } = splitAddress(address);
+    const target = `${local}@${domain}`;
     if (domain === this.options.domain) {
-      if (`${local}@${domain}` === client.principal) return this.directory(local, 'owner');
+      if (target === client.principal) return this.directory(local, 'owner');
       const colleague = this.options.colleaguesSeeViews ?? true;
       return this.directory(local, colleague || this.store.hasViewGrant(local, this.requesterHash(client)) ? 'contact' : 'public');
     }
     const query = new URLSearchParams({ requester: this.requesterHash(client) });
-    const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}?${query.toString()}`);
+    const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}?${query.toString()}`, '', proof ? { 'signet-requester': proof } : undefined);
     if (!response.ok) throw new HttpError(response.status === 429 ? 429 : 502, `lookup at ${domain} failed: ${response.status} ${await response.text()}`);
     return (await response.json()) as DirectoryEntry;
   }
@@ -1312,18 +1491,19 @@ export class SignetServer implements LegacyInbox {
    * Vouch, with the domain key, that this user is sending plain email with this From, To and Subject.
    * Used for mail this server sends and for mail the client sends itself (Gmail mode).
    */
-  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest): Promise<string> {
+  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest, bodyHash: string, audience?: 'humans'): Promise<string> {
     if (!hasScope(client, 'send')) throw new HttpError(403, `${client.label} may not send`);
     const user = this.store.user(splitAddress(client.principal).local);
     if (!user) throw new HttpError(404, 'sender is not enrolled');
     if (!Array.isArray(to) || to.length === 0 || typeof subject !== 'string') throw new HttpError(400, 'to and subject are required');
+    if (typeof bodyHash !== 'string' || !bodyHash.startsWith('sha256:')) throw new HttpError(400, 'bodyHash must be a sha256: hash of the message body');
     // Without the domain key, the registrar attests, shown the client's own signed request.
     if (!this.options.domainKey && this.options.registrar) {
       const names = ['signet-principal', 'signet-client', 'signet-ts', 'signet-nonce', 'signet-sig'];
       const headers = Object.fromEntries(names.map((name) => [name, header(request.headers, name)]));
-      return this.options.registrar.attest({ principal: client.principal, to, subject, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
+      return this.options.registrar.attest({ principal: client.principal, to, subject, bodyHash, audience, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
     }
-    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject });
+    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject, bodyHash, audience });
   }
 
   private async sendLegacy(
@@ -1340,7 +1520,7 @@ export class SignetServer implements LegacyInbox {
       to: mail.to,
       subject: mail.subject,
       text: mail.text,
-      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
+      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request, hashBody(mail.text), mail.humansOnly ? 'humans' : undefined), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
       attachments: mail.attachments ?? [],
     });
     return { messageId };

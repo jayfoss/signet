@@ -1,10 +1,11 @@
 import type { AddressInfo } from 'node:net';
-import type { ClientKeys, ClientSnapshot, Identity, KeyPair, TrustedLog } from '@signet/lib';
+import type { ClientKeys, ClientSnapshot, Identity, KeyPair, SignetClientOptions, TrustedLog } from '@signet/lib';
 import { SignetClient, StaticResolver, generateSigningKey, splitAddress } from '@signet/lib';
 import { createTransport } from 'nodemailer';
 import { SMTPServer } from 'smtp-server';
 import { IssuerServer } from './issuer-server';
 import { TransparencyLogServer } from './log-server';
+import { LogWitnessServer } from './log-witness';
 import { RelayServer } from './relay-server';
 import type { Limits } from './server';
 import { SignetServer } from './server';
@@ -34,6 +35,8 @@ export class Testbed {
   private readonly broken = new Set<string>();
   private readonly domainKeys = new Map<string, KeyPair>();
   private logServer!: TransparencyLogServer;
+  /** Independent witnesses that cosign the log's tree heads (Section 5.5.1). */
+  readonly witnesses: LogWitnessServer[] = [];
   /** Privacy Pass issuer shared by every domain in the bed. */
   issuer!: IssuerServer;
   /** OHTTP relay every domain sends sealed and anonymous deliveries through. */
@@ -59,11 +62,19 @@ export class Testbed {
 
   static async start(
     domains: string[],
-    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string> } = {},
+    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number } = {},
   ): Promise<Testbed> {
     const bed = new Testbed();
-    bed.logServer = new TransparencyLogServer(generateSigningKey(), bed.resolver);
+    // Witnesses need the log's address and key, and the log needs theirs, so they join the list once running.
+    const witnessUrls: string[] = [];
+    bed.logServer = new TransparencyLogServer(generateSigningKey(), bed.resolver, undefined, undefined, witnessUrls);
     await bed.logServer.listen();
+    for (let i = 0; i < (options.witnesses ?? 0); i += 1) {
+      const witness = new LogWitnessServer(generateSigningKey(), bed.trustedLog);
+      await witness.listen();
+      bed.witnesses.push(witness);
+      witnessUrls.push(witness.url);
+    }
     bed.issuer = new IssuerServer('issuer.signet.test', bed.resolver);
     await bed.issuer.listen();
     bed.relay = new RelayServer(bed.resolver);
@@ -126,8 +137,8 @@ export class Testbed {
   }
 
   /** A client that shares its label in threads, so test output reads "via Clerk". */
-  client(keys: ClientKeys, snapshot?: Partial<ClientSnapshot>): SignetClient {
-    return new SignetClient(keys, this.resolver, { trustedLogs: [this.trustedLog], snapshot, keyPackageTarget: 3, shareLabel: true, ohttpRelay: this.relay.url });
+  client(keys: ClientKeys, snapshot?: Partial<ClientSnapshot>, extra: Partial<SignetClientOptions> = {}): SignetClient {
+    return new SignetClient(keys, this.resolver, { trustedLogs: [this.trustedLog], snapshot, keyPackageTarget: 3, shareLabel: true, ohttpRelay: this.relay.url, ...extra });
   }
 
   /** Make server-to-server delivery into this domain fail with a 503 until `repairDelivery`. */
@@ -176,6 +187,7 @@ export class Testbed {
   async close(): Promise<void> {
     await Promise.all([...this.servers.values()].map((server) => server.close()));
     await Promise.all([...this.inbound.values()].map(({ smtp }) => smtp.close()));
+    await Promise.all(this.witnesses.map((witness) => witness.close()));
     await this.logServer.close();
     await this.issuer.close();
     await this.relay.close();

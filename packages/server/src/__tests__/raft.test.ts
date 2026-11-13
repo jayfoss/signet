@@ -32,7 +32,7 @@ class Sim {
     return this.seed / 2147483648;
   };
 
-  start(id: string, options: { rejoin?: boolean; storage?: RaftStorage<Data> } = {}): RaftNode<Data> {
+  start(id: string, options: { rejoin?: boolean; storage?: RaftStorage<Data>; peers?: string[] } = {}): RaftNode<Data> {
     const storage = options.storage ?? this.storage.get(id) ?? new MemoryRaftStorage<Data>();
     this.storage.set(id, storage);
     this.applied.set(id, []);
@@ -43,7 +43,7 @@ class Sim {
     };
     const node = new RaftNode<Data>({
       id,
-      peers: this.ids.filter((other) => other !== id),
+      peers: options.peers ?? this.ids.filter((other) => other !== id),
       witness: this.witnesses.includes(id),
       rejoin: options.rejoin,
       storage,
@@ -418,5 +418,119 @@ describe('FileRaftStorage', () => {
 
   it('starts empty in a new folder', () => {
     expect(new FileRaftStorage<string>(join(dir, 'fresh')).load()).toEqual({ term: 0, votedFor: null, log: [] });
+  });
+});
+
+describe('Raft membership changes', () => {
+  const ids = (node: RaftNode<Data>) => node.members.map((member) => member.id).sort();
+
+  async function started(snapshotEvery?: number) {
+    const sim = new Sim(['a', 'b', 'c'], [], snapshotEvery);
+    await sim.run(3000);
+    const leader = sim.leader() as RaftNode<Data>;
+    expect(leader).toBeDefined();
+    return { sim, leader };
+  }
+
+  /** Start a replica that knows the old members and does not vote until it has caught up, then add it. */
+  async function join(sim: Sim, leader: RaftNode<Data>, id: string) {
+    const node = sim.start(id, { rejoin: true, peers: ['a', 'b', 'c'] });
+    leader.addLearner(id);
+    await sim.run(1500);
+    expect(leader.learnerCaughtUp(id)).toBe(true);
+    const done = leader.waitCommitted(leader.proposeConfig([...leader.members, { id }]));
+    await sim.run(1000);
+    await done;
+    return node;
+  }
+
+  it('adds a replica that catches up as a learner, and then counts it in the majority', async () => {
+    const { sim, leader } = await started();
+    for (const value of ['one', 'two', 'three']) await sim.commit(leader, value);
+    const d = await join(sim, leader, 'd');
+    await sim.commit(leader, 'four');
+    for (const node of sim.nodes.values()) expect(ids(node)).toEqual(['a', 'b', 'c', 'd']);
+    expect(sim.applied.get('d')).toEqual(['one', 'two', 'three', 'four']);
+    expect(leader.majority).toBe(3);
+    expect(d.majority).toBe(3);
+    // Three of four are needed: losing two stops commits.
+    const others = [...sim.nodes.keys()].filter((id) => id !== leader.id);
+    sim.crash(others[0]);
+    sim.crash(others[1]);
+    const stuck = leader.waitCommitted(leader.propose('five'));
+    await sim.run(500);
+    let settled = false;
+    void stuck.then(() => (settled = true), () => (settled = true));
+    await sim.settle();
+    expect(settled).toBe(false);
+  });
+
+  it('refuses a change that is not exactly one replica, or an unready one, or a second in a row', async () => {
+    const { sim, leader } = await started();
+    expect(() => leader.proposeConfig([{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }, { id: 'e' }])).toThrow('exactly one');
+    expect(() => leader.proposeConfig([{ id: 'a' }])).toThrow('exactly one');
+    // A replica that never caught up as a learner cannot be added.
+    expect(() => leader.proposeConfig([...leader.members, { id: 'd' }])).toThrow('has not caught up');
+    const others = leader.members.filter((member) => member.id !== leader.id);
+    sim.crash(others[0].id);
+    sim.crash(others[1].id);
+    leader.proposeConfig(leader.members.filter((member) => member.id !== others[0].id));
+    // The first change cannot commit without a majority, so a second is refused while it is in the log.
+    expect(() => leader.proposeConfig(leader.members.filter((member) => member.id !== others[1].id))).toThrow('already in progress');
+  });
+
+  it('removes a replica; the removed one stops standing for election', async () => {
+    const { sim, leader } = await started();
+    const gone = [...sim.nodes.keys()].find((id) => id !== leader.id) as string;
+    const done = leader.waitCommitted(leader.proposeConfig(leader.members.filter((member) => member.id !== gone)));
+    await sim.run(1000);
+    await done;
+    expect(ids(leader)).toHaveLength(2);
+    expect(leader.majority).toBe(2);
+    sim.crash(leader.id);
+    const survivor = [...sim.nodes].find(([id]) => id !== leader.id && id !== gone)?.[1] as RaftNode<Data>;
+    await sim.run(5000);
+    expect(survivor.role).not.toBe('leader');
+    const removed = sim.nodes.get(gone) as RaftNode<Data>;
+    expect(removed.role).not.toBe('leader');
+    expect(removed.term).toBeLessThanOrEqual(survivor.term);
+  });
+
+  it('has a leader that removes itself step down once the change commits, and the rest elect another', async () => {
+    const { sim, leader } = await started();
+    const done = leader.waitCommitted(leader.proposeConfig(leader.members.filter((member) => member.id !== leader.id)));
+    await sim.run(500);
+    await done;
+    await sim.run(500);
+    expect(leader.role).toBe('follower');
+    await sim.run(5000);
+    const next = sim.leader() as RaftNode<Data>;
+    expect(next).toBeDefined();
+    expect(next.id).not.toBe(leader.id);
+    expect(ids(next)).toHaveLength(2);
+    await sim.commit(next, 'after');
+  });
+
+  it('rolls back a membership entry that never committed when another leader overwrites it', async () => {
+    const { sim, leader } = await started();
+    const others = leader.members.map((member) => member.id).filter((id) => id !== leader.id);
+    sim.partition([leader.id]);
+    leader.proposeConfig(leader.members.filter((member) => member.id !== others[0]));
+    expect(ids(leader)).toHaveLength(2);
+    await sim.run(5000);
+    sim.heal();
+    await sim.run(5000);
+    expect(ids(leader)).toEqual(['a', 'b', 'c']);
+    const current = sim.leader() as RaftNode<Data>;
+    expect(current.id).not.toBe(leader.id);
+  });
+
+  it('keeps the membership in a snapshot, so a restarted replica still knows who votes', async () => {
+    const { sim, leader } = await started(4);
+    await join(sim, leader, 'd');
+    for (const value of ['1', '2', '3', '4', '5', '6']) await sim.commit(leader, value);
+    expect(leader.compactedThrough).toBeGreaterThan(0);
+    const restarted = sim.start(leader.id, { storage: sim.storage.get(leader.id) });
+    expect(ids(restarted)).toEqual(['a', 'b', 'c', 'd']);
   });
 });

@@ -20,6 +20,8 @@ import { activeClient, activeClients, grantKeys, hasScope, keyHistory } from './
 export interface RequestKey {
   keyId: string;
   agreeKey: string;
+  /** True for an org-escrow client's key: whoever seals to it knows the organisation can read it (Section 4.3). */
+  escrow?: true;
 }
 
 export interface PublicCard {
@@ -116,6 +118,8 @@ export const readsHumansOnly = (log: LogState, cert: ClientCert): boolean =>
 
 const isEscrow = (cert: ClientCert): boolean => cert.kind === 'org-escrow';
 
+const requestKeyFor = (cert: ClientCert): RequestKey => ({ keyId: requestKeyId(cert.agreeKey), agreeKey: cert.agreeKey, ...(isEscrow(cert) ? { escrow: true as const } : {}) });
+
 export function cardFromLog(log: LogState, now = new Date()): PublicCard {
   const active = activeClients(log, now);
   const intakeCert = log.intake ? activeClient(log, log.intake.clientId, now) : undefined;
@@ -128,8 +132,8 @@ export function cardFromLog(log: LogState, now = new Date()): PublicCard {
     principal: log.principal,
     identityKey: log.identityKey,
     logHead: log.head,
-    requestKeys: admitters.map((cert) => ({ keyId: requestKeyId(cert.agreeKey), agreeKey: cert.agreeKey })),
-    humanKeys: active.filter((cert) => readsHumansOnly(log, cert)).map((cert) => ({ keyId: requestKeyId(cert.agreeKey), agreeKey: cert.agreeKey })),
+    requestKeys: admitters.map((cert) => requestKeyFor(cert)),
+    humanKeys: active.filter((cert) => readsHumansOnly(log, cert)).map((cert) => requestKeyFor(cert)),
     intake: intakeCert && log.intake ? { clientId: intakeCert.clientId, agreeKey: intakeCert.agreeKey, intents: log.intake.intents } : undefined,
     keyChain: log.keyChain.length > 0 ? log.keyChain : undefined,
   };

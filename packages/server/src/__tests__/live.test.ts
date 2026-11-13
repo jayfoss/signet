@@ -124,4 +124,18 @@ describe('escalating a thread to a live A2A session', () => {
     expect(w.clerk.needsHuman(w.thread)).toBeUndefined();
     await expect(w.clerk.send(w.thread, { subject: 'Hi', text: 'Booking the call' })).resolves.toBeDefined();
   });
+
+  it("makes receivers reject an agent's message in a thread its account handed off, even when the agent ignores the hold", async () => {
+    await w.clerk.send(w.thread, { subject: 'Over to Jerzy', text: 'This needs a decision', intents: [{ name: 'handoff.human', args: { reason: 'fee negotiation' } }] });
+    expect((await w.desk.sync()).map((event) => event.kind)).toContain('message');
+    // The clerk forgets the hold, as a misbehaving agent might; the other side still holds it.
+    (w.clerk as unknown as { state: { needsHuman: Record<string, unknown> } }).state.needsHuman = {};
+    await w.clerk.send(w.thread, { subject: 'Hi', text: 'Me again' });
+    const events = await w.desk.sync();
+    expect(events.map((event) => event.kind)).toEqual(['error']);
+    expect(events[0].kind === 'error' && events[0].error).toContain('handed this thread to a human');
+    // Handing off again is still allowed, and a human's message ends the hold.
+    await w.clerk.send(w.thread, { subject: 'Still here', text: 'Still needs you', intents: [{ name: 'handoff.human', args: { reason: 'still waiting' } }] });
+    expect((await w.desk.sync()).map((event) => event.kind)).toEqual(['message']);
+  });
 });

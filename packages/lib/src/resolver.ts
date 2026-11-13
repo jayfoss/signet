@@ -3,6 +3,7 @@ import { resolveTxt } from 'node:dns/promises';
 import type { DomainPolicy } from './directory';
 import { HomeRegistry, failoverFetch } from './homes';
 import { OperatorsError, checkOperators } from './operators';
+import { serverUrlProblem, verifyRotation } from './policy';
 
 export interface Resolver {
   policy(domain: string): Promise<DomainPolicy>;
@@ -46,6 +47,13 @@ export class FileSeqStore implements SeqStore {
   }
 }
 
+/** A refreshed policy has a different domain key and no valid proof from the old one (Section 6.5). */
+export class DomainKeyChangedError extends Error {
+  constructor(readonly domain: string) {
+    super(`${domain} changed its domain key without a proof from the old one`);
+  }
+}
+
 export class NotSignetDomainError extends Error {
   constructor(readonly domain: string) {
     super(`${domain} does not support Signet`);
@@ -65,6 +73,9 @@ abstract class CachingResolver implements Resolver {
 
   constructor(protected readonly fetchImpl: typeof fetch = fetch) {}
 
+  /** Whether the server URLs of Section 6.4 are held to the https and off-domain rules. Local resolvers, which map domains by hand, are not. */
+  protected checksServerUrls = true;
+
   /** `base`, but trying a domain's other homes when the one it was aimed at can't answer (Section 6.8.4). */
   failoverFetch(base: typeof fetch = fetch): typeof fetch {
     return failoverFetch(this.homes, base);
@@ -82,6 +93,10 @@ abstract class CachingResolver implements Resolver {
     const cached = this.cache.get(domain);
     try {
       const policy = await this.fetchPolicy(domain);
+      // A new domain key is accepted only with the old key's signature, while the cached policy lasts (Section 6.5).
+      if (cached && cached.until > Date.now() && cached.policy.mode === 'enforce' && policy.domainKey !== cached.policy.domainKey) {
+        if (!verifyRotation(policy.rotation, domain, cached.policy.domainKey, policy.domainKey)) throw new DomainKeyChangedError(domain);
+      }
       this.cache.set(domain, { policy, until: Date.now() + policy.maxAge * 1000 });
       this.homes.register(policy);
       return policy;
@@ -98,7 +113,7 @@ abstract class CachingResolver implements Resolver {
   private vet(domain: string, policy: DomainPolicy): boolean {
     const pin = this.pinnedKey(domain);
     if (pin !== undefined && policy.domainKey !== pin) return false;
-    if (!policy.operators) return true;
+    if (!policy.operators) return !this.checksServerUrls || serverUrlProblem(policy, pin, true) === null;
     if (pin === undefined) return false;
     try {
       const homes = checkOperators(policy.operators, domain, policy.domainKey);
@@ -191,8 +206,11 @@ export class StaticResolver extends CachingResolver {
     fetchImpl: typeof fetch = fetch,
     /** Domain keys to hold policies to, as a `dk` field would in DNS. A domain with operators needs one. */
     private readonly pins: Map<string, string> = new Map(),
+    /** Hold server URLs to the rules of Section 6.4 too. Off by default: a static map names servers by hand, often on localhost. */
+    strictServerUrls = false,
   ) {
     super(fetchImpl);
+    this.checksServerUrls = strictServerUrls;
   }
 
   protected override pinnedKey(domain: string): string | undefined {

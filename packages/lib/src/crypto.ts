@@ -81,9 +81,31 @@ export function decrypt(key: Uint8Array, { iv, ct }: Ciphertext, aad: Uint8Array
 const hpke = new CipherSuite({ kem: new DhkemX25519HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
 
 /** HPKE base-mode single-shot encryption to an X25519 public key. `info` binds the ciphertext to its purpose. */
+/** Sealed payloads are padded to a multiple of this many bytes, so their size says little (Section 7.3). */
+export const SEAL_PAD = 1024;
+
+/** A 4-byte big-endian length, the payload, and zero bytes up to a multiple of `SEAL_PAD`. */
+export function padPlaintext(plaintext: Uint8Array): Buffer {
+  const total = Math.ceil((4 + plaintext.length) / SEAL_PAD) * SEAL_PAD;
+  const padded = Buffer.alloc(total);
+  padded.writeUInt32BE(plaintext.length, 0);
+  Buffer.from(plaintext).copy(padded, 4);
+  return padded;
+}
+
+/** Undo `padPlaintext`. Refuses a length larger than the plaintext, a wrong total size, or a non-zero padding byte. */
+export function unpadPlaintext(padded: Uint8Array): Buffer {
+  const buffer = Buffer.from(padded);
+  if (buffer.length < SEAL_PAD || buffer.length % SEAL_PAD !== 0) throw new Error('sealed payload is not padded');
+  const length = buffer.readUInt32BE(0);
+  if (length > buffer.length - 4) throw new Error('sealed payload names a length larger than itself');
+  if (buffer.subarray(4 + length).some((byte) => byte !== 0)) throw new Error('sealed payload has non-zero padding');
+  return buffer.subarray(4, 4 + length);
+}
+
 export async function seal(recipient: string, plaintext: Uint8Array, info: string): Promise<Sealed> {
   const recipientPublicKey = await hpke.kem.importKey('jwk', { kty: 'OKP', crv: 'X25519', x: recipient }, true);
-  const { enc, ct } = await hpke.seal({ recipientPublicKey, info: utf8(info) }, plaintext);
+  const { enc, ct } = await hpke.seal({ recipientPublicKey, info: utf8(info) }, padPlaintext(plaintext));
   return { enc: b64u(new Uint8Array(enc)), ct: b64u(new Uint8Array(ct)) };
 }
 
@@ -94,7 +116,7 @@ export async function open(mine: KeyPair, sealed: Sealed, info: string): Promise
     false,
   );
   const plaintext = await hpke.open({ recipientKey, enc: fromB64u(sealed.enc), info: utf8(info) }, fromB64u(sealed.ct));
-  return Buffer.from(plaintext);
+  return unpadPlaintext(new Uint8Array(plaintext));
 }
 
 export const sha256 = (data: Uint8Array | string): string =>

@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { DomainBinding, GatewayKey, KeyPair, LogEntry, MailItem, SignedCard, SignedView, VrfKey } from '@signet/lib';
+import type { Ciphertext, DomainBinding, GatewayKey, KeyPair, LogEntry, MailItem, Sealed, SignedCard, SignedView, VrfKey } from '@signet/lib';
 import { AUTH_SKEW_MS, ReplayCache } from '@signet/lib';
 import { decode, encode } from './codec';
 
@@ -38,6 +38,16 @@ export interface Outbound {
   accepted?: boolean;
 }
 
+/** What a home keeps of an account's contacts: the ciphertext, and one wrap of its key for each client. */
+export interface ContactsDoc {
+  epoch: number;
+  version: number;
+  data: Ciphertext | null;
+  wraps: Record<string, Sealed>;
+}
+
+export const emptyContacts = (): ContactsDoc => ({ epoch: 0, version: 0, data: null, wraps: {} });
+
 type Parked = Omit<MailItem, 'seq' | 'receivedAt'>;
 
 /** Something that answers "first time?" for a key, within a time window. */
@@ -61,6 +71,14 @@ export interface Store {
   /** Add an item to a mailbox. An item whose id is already there is not added again; the one already stored is returned (Section 6.9.5). */
   push(local: string, item: Parked): MailItem;
   mailbox(local: string, after?: number): MailItem[];
+  /** Record how far a client has read (Section 10.7). Only a larger value than the last one changes anything. */
+  ackMail(local: string, clientId: string, through: number): void;
+  /** The highest seq each client has acknowledged. */
+  acks(local: string): Record<string, number>;
+  /** Delete the items up to and including seq. Seq numbers are never reused. */
+  dropMail(local: string, through: number): void;
+  /** Delete the items stored before an instant (ISO string). Returns how many. */
+  expireMail(local: string, before: string): number;
 
   addKeyPackages(clientId: string, packages: PublishedKeyPackage[]): void;
   countKeyPackages(clientId: string): number;
@@ -82,13 +100,20 @@ export interface Store {
 
   putBlob(id: string, data: Buffer): void;
   blob(id: string): Buffer | undefined;
+  /** Who uploaded a blob and when, kept for deletion and expiry (Section 8.9). */
+  noteBlob(id: string, owner: string, at: number): void;
+  blobOwner(id: string): string | undefined;
+  /** Blobs uploaded before an instant (ms). */
+  blobsBefore(at: number): string[];
+  /** Forget a blob: its bytes, if the store holds them, and its owner. */
+  deleteBlob(id: string): void;
 
   /** Record a Privacy Pass token nonce. False if it was already spent. */
   spend(nonce: string): boolean;
 
-  /** A user's contacts and trusted domains, shared by all their clients. */
-  addContacts(local: string, contacts: string[], trustedDomains: string[]): void;
-  contactsOf(local: string): { contacts: string[]; trustedDomains: string[] };
+  /** A user's contacts and trusted domains, encrypted by their clients; the server never sees them (Section 7.9). */
+  contactsDoc(local: string): ContactsDoc;
+  putContactsDoc(local: string, doc: ContactsDoc): void;
 
   /** Hashed requesters a user has released their contact view to. */
   updateViewGrants(local: string, add: string[], remove: string[]): void;
@@ -142,10 +167,13 @@ export class MemoryStore implements SnapshotStore {
   private readonly tokens = new Map<string, Set<string>>();
   private readonly parked = new Map<string, { hash: string; item: Parked; until: number }[]>();
   private readonly blobs = new Map<string, Buffer>();
+  private readonly blobMeta = new Map<string, { owner: string; at: number }>();
+  private readonly mailNext = new Map<string, number>();
+  private readonly mailAcks = new Map<string, Record<string, number>>();
   private readonly counters = new Map<string, number>();
   private readonly spent = new Set<string>();
   private readonly viewGrants = new Map<string, Set<string>>();
-  private readonly contacts = new Map<string, { contacts: Set<string>; trustedDomains: Set<string> }>();
+  private readonly contacts = new Map<string, ContactsDoc>();
   private readonly orgClaims = new Map<string, string[]>();
   private readonly pending = new Map<string, Outbound>();
   private keys?: ServerKeys;
@@ -162,10 +190,13 @@ export class MemoryStore implements SnapshotStore {
       tokens: [...this.tokens].map(([key, set]) => [key, [...set]]),
       parked: [...this.parked],
       blobs: [...this.blobs],
+      blobMeta: [...this.blobMeta],
+      mailNext: [...this.mailNext],
+      mailAcks: [...this.mailAcks],
       counters: [...this.counters],
       spent: [...this.spent],
       viewGrants: [...this.viewGrants].map(([key, set]) => [key, [...set]]),
-      contacts: [...this.contacts].map(([key, value]) => [key, { contacts: [...value.contacts], trustedDomains: [...value.trustedDomains] }]),
+      contacts: [...this.contacts],
       orgClaims: [...this.orgClaims],
       pending: [...this.pending],
       keys: this.keys ?? null,
@@ -192,6 +223,12 @@ export class MemoryStore implements SnapshotStore {
     pairs<{ hash: string; item: Parked; until: number }[]>('parked').forEach(([key, value]) => this.parked.set(key, value));
     this.blobs.clear();
     pairs<Buffer>('blobs').forEach(([key, value]) => this.blobs.set(key, value));
+    this.blobMeta.clear();
+    pairs<{ owner: string; at: number }>('blobMeta').forEach(([key, value]) => this.blobMeta.set(key, value));
+    this.mailNext.clear();
+    pairs<number>('mailNext').forEach(([key, value]) => this.mailNext.set(key, value));
+    this.mailAcks.clear();
+    pairs<Record<string, number>>('mailAcks').forEach(([key, value]) => this.mailAcks.set(key, value));
     this.counters.clear();
     pairs<number>('counters').forEach(([key, value]) => this.counters.set(key, value));
     this.spent.clear();
@@ -199,9 +236,7 @@ export class MemoryStore implements SnapshotStore {
     this.viewGrants.clear();
     pairs<string[]>('viewGrants').forEach(([key, value]) => this.viewGrants.set(key, new Set(value)));
     this.contacts.clear();
-    pairs<{ contacts: string[]; trustedDomains: string[] }>('contacts').forEach(([key, value]) =>
-      this.contacts.set(key, { contacts: new Set(value.contacts), trustedDomains: new Set(value.trustedDomains) }),
-    );
+    pairs<ContactsDoc>('contacts').forEach(([key, value]) => this.contacts.set(key, value));
     this.orgClaims.clear();
     pairs<string[]>('orgClaims').forEach(([key, value]) => this.orgClaims.set(key, value));
     this.pending.clear();
@@ -237,10 +272,33 @@ export class MemoryStore implements SnapshotStore {
     const mailbox = this.mailboxes.get(local) ?? [];
     const existing = mailbox.find((entry) => entry.id === item.id);
     if (existing) return existing;
-    const stored = { ...item, seq: mailbox.length + 1, receivedAt: new Date().toISOString() };
+    const seq = this.mailNext.get(local) ?? (mailbox.at(-1)?.seq ?? 0) + 1;
+    const stored = { ...item, seq, receivedAt: new Date().toISOString() };
     mailbox.push(stored);
     this.mailboxes.set(local, mailbox);
+    this.mailNext.set(local, seq + 1);
     return stored;
+  }
+
+  ackMail(local: string, clientId: string, through: number): void {
+    const acks = this.mailAcks.get(local) ?? {};
+    if (through > (acks[clientId] ?? 0)) acks[clientId] = through;
+    this.mailAcks.set(local, acks);
+  }
+
+  acks(local: string): Record<string, number> {
+    return { ...(this.mailAcks.get(local) ?? {}) };
+  }
+
+  dropMail(local: string, through: number): void {
+    this.mailboxes.set(local, (this.mailboxes.get(local) ?? []).filter((item) => item.seq > through));
+  }
+
+  expireMail(local: string, before: string): number {
+    const all = this.mailboxes.get(local) ?? [];
+    const kept = all.filter((item) => item.receivedAt >= before);
+    this.mailboxes.set(local, kept);
+    return all.length - kept.length;
   }
 
   mailbox(local: string, after = 0): MailItem[] {
@@ -304,22 +362,35 @@ export class MemoryStore implements SnapshotStore {
     return this.blobs.get(id);
   }
 
+  noteBlob(id: string, owner: string, at: number): void {
+    this.blobMeta.set(id, { owner, at });
+  }
+
+  blobOwner(id: string): string | undefined {
+    return this.blobMeta.get(id)?.owner;
+  }
+
+  blobsBefore(at: number): string[] {
+    return [...this.blobMeta].filter(([, meta]) => meta.at < at).map(([id]) => id);
+  }
+
+  deleteBlob(id: string): void {
+    this.blobs.delete(id);
+    this.blobMeta.delete(id);
+  }
+
   spend(nonce: string): boolean {
     if (this.spent.has(nonce)) return false;
     this.spent.add(nonce);
     return true;
   }
 
-  addContacts(local: string, contacts: string[], trustedDomains: string[]): void {
-    const entry = this.contacts.get(local) ?? { contacts: new Set<string>(), trustedDomains: new Set<string>() };
-    contacts.forEach((address) => entry.contacts.add(address.toLowerCase()));
-    trustedDomains.forEach((domain) => entry.trustedDomains.add(domain.toLowerCase()));
-    this.contacts.set(local, entry);
+  contactsDoc(local: string): ContactsDoc {
+    return structuredClone(this.contacts.get(local) ?? emptyContacts());
   }
 
-  contactsOf(local: string): { contacts: string[]; trustedDomains: string[] } {
-    const entry = this.contacts.get(local);
-    return { contacts: [...(entry?.contacts ?? [])], trustedDomains: [...(entry?.trustedDomains ?? [])] };
+  putContactsDoc(local: string, doc: ContactsDoc): void {
+    this.contacts.set(local, structuredClone(doc));
   }
 
   updateViewGrants(local: string, add: string[], remove: string[]): void {
@@ -413,8 +484,11 @@ CREATE TABLE IF NOT EXISTS tokens (local TEXT NOT NULL, hash TEXT NOT NULL, PRIM
 CREATE TABLE IF NOT EXISTS parked (id INTEGER PRIMARY KEY AUTOINCREMENT, local TEXT NOT NULL, hash TEXT NOT NULL, item TEXT NOT NULL, until INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS parked_local ON parked (local, until);
 CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS blob_meta (id TEXT PRIMARY KEY, owner TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mail_seq (local TEXT PRIMARY KEY, next INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mail_acks (local TEXT NOT NULL, client_id TEXT NOT NULL, through INTEGER NOT NULL, PRIMARY KEY (local, client_id));
 CREATE TABLE IF NOT EXISTS spent (nonce TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS contacts (local TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (local, kind, value));
+CREATE TABLE IF NOT EXISTS contacts_doc (local TEXT PRIMARY KEY, doc TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS view_grants (local TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (local, hash));
 CREATE TABLE IF NOT EXISTS counters (bucket TEXT PRIMARY KEY, total INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS seen (scope TEXT NOT NULL, key TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY (scope, key));
@@ -478,7 +552,10 @@ export class SqliteStore implements Store {
   private pushNow(local: string, item: Parked): MailItem {
     const existing = this.db.prepare("SELECT item FROM mail WHERE local = ? AND json_extract(item, '$.id') = ?").get(local, item.id) as { item: string } | undefined;
     if (existing) return JSON.parse(existing.item) as MailItem;
-    const { next } = this.db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM mail WHERE local = ?').get(local) as { next: number };
+    const { next } = this.db
+      .prepare('SELECT MAX(COALESCE((SELECT next FROM mail_seq WHERE local = ?), 1), COALESCE((SELECT MAX(seq) FROM mail WHERE local = ?), 0) + 1) AS next')
+      .get(local, local) as { next: number };
+    this.db.prepare('INSERT INTO mail_seq (local, next) VALUES (?, ?) ON CONFLICT (local) DO UPDATE SET next = excluded.next').run(local, Number(next) + 1);
     const stored = { ...item, seq: Number(next), receivedAt: new Date().toISOString() } as MailItem;
     this.db.prepare('INSERT INTO mail (local, seq, item) VALUES (?, ?, ?)').run(local, stored.seq, JSON.stringify(stored));
     return stored;
@@ -492,6 +569,25 @@ export class SqliteStore implements Store {
     return (this.db.prepare('SELECT item FROM mail WHERE local = ? AND seq > ? ORDER BY seq').all(local, after) as { item: string }[]).map(
       (row) => JSON.parse(row.item) as MailItem,
     );
+  }
+
+  ackMail(local: string, clientId: string, through: number): void {
+    this.db
+      .prepare('INSERT INTO mail_acks (local, client_id, through) VALUES (?, ?, ?) ON CONFLICT (local, client_id) DO UPDATE SET through = MAX(through, excluded.through)')
+      .run(local, clientId, through);
+  }
+
+  acks(local: string): Record<string, number> {
+    const rows = this.db.prepare('SELECT client_id, through FROM mail_acks WHERE local = ?').all(local) as { client_id: string; through: number }[];
+    return Object.fromEntries(rows.map((row) => [row.client_id, Number(row.through)]));
+  }
+
+  dropMail(local: string, through: number): void {
+    this.db.prepare('DELETE FROM mail WHERE local = ? AND seq <= ?').run(local, through);
+  }
+
+  expireMail(local: string, before: string): number {
+    return Number(this.db.prepare("DELETE FROM mail WHERE local = ? AND json_extract(item, '$.receivedAt') < ?").run(local, before).changes);
   }
 
   addKeyPackages(clientId: string, packages: PublishedKeyPackage[]): void {
@@ -576,21 +672,36 @@ export class SqliteStore implements Store {
     return row ? Buffer.from(row.data) : undefined;
   }
 
+  noteBlob(id: string, owner: string, at: number): void {
+    this.db.prepare('INSERT OR REPLACE INTO blob_meta (id, owner, at) VALUES (?, ?, ?)').run(id, owner, at);
+  }
+
+  blobOwner(id: string): string | undefined {
+    return (this.db.prepare('SELECT owner FROM blob_meta WHERE id = ?').get(id) as { owner: string } | undefined)?.owner;
+  }
+
+  blobsBefore(at: number): string[] {
+    return (this.db.prepare('SELECT id FROM blob_meta WHERE at < ?').all(at) as { id: string }[]).map((row) => row.id);
+  }
+
+  deleteBlob(id: string): void {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM blobs WHERE id = ?').run(id);
+      this.db.prepare('DELETE FROM blob_meta WHERE id = ?').run(id);
+    });
+  }
+
   spend(nonce: string): boolean {
     return Number(this.db.prepare('INSERT OR IGNORE INTO spent (nonce) VALUES (?)').run(nonce).changes) === 1;
   }
 
-  addContacts(local: string, contacts: string[], trustedDomains: string[]): void {
-    this.transaction(() => {
-      const insert = this.db.prepare('INSERT OR IGNORE INTO contacts (local, kind, value) VALUES (?, ?, ?)');
-      for (const address of contacts) insert.run(local, 'contact', address.toLowerCase());
-      for (const domain of trustedDomains) insert.run(local, 'domain', domain.toLowerCase());
-    });
+  contactsDoc(local: string): ContactsDoc {
+    const row = this.db.prepare('SELECT doc FROM contacts_doc WHERE local = ?').get(local) as { doc: string } | undefined;
+    return row ? (JSON.parse(row.doc) as ContactsDoc) : emptyContacts();
   }
 
-  contactsOf(local: string): { contacts: string[]; trustedDomains: string[] } {
-    const rows = this.db.prepare('SELECT kind, value FROM contacts WHERE local = ?').all(local) as { kind: string; value: string }[];
-    return { contacts: rows.filter((row) => row.kind === 'contact').map((row) => row.value), trustedDomains: rows.filter((row) => row.kind === 'domain').map((row) => row.value) };
+  putContactsDoc(local: string, doc: ContactsDoc): void {
+    this.db.prepare('INSERT INTO contacts_doc (local, doc) VALUES (?, ?) ON CONFLICT (local) DO UPDATE SET doc = excluded.doc').run(local, JSON.stringify(doc));
   }
 
   updateViewGrants(local: string, add: string[], remove: string[]): void {

@@ -3500,7 +3500,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | A hostile operator  | Why                                       |
    +=====================+===========================================+
    | cannot read         | Messages, attachments and legacy mail are |
-   | content             | encrypted to client keys.                 |
+   | message content     | encrypted to client keys. One exception:  |
+   |                     | a domain with an intake shares the intake |
+   |                     | key with every home, so each home can     |
+   |                     | open first-contact requests to unlisted   |
+   |                     | addresses (Section 4.11).                 |
    +---------------------+-------------------------------------------+
    | cannot forge a      | Messages and requests are signed by       |
    | message or identity | client and identity keys; account logs    |

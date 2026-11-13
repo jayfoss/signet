@@ -195,6 +195,8 @@ function describe(event: SignetEvent): string {
       return `bounced ${event.id} to ${event.to.join(', ')}: ${event.reason}`;
     case 'handoff':
       return `handed to you in ${event.thread}: ${event.reason}`;
+    case 'home-missing':
+      return `WARNING ${event.home} has not delivered ${event.itemId}, which your other homes have; it may be withholding mail`;
     case 'error':
       return `could not process ${event.item.kind} ${event.item.id}: ${event.error}`;
   }

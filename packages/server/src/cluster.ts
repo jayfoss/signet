@@ -1,11 +1,12 @@
 import type { KeyPair } from '@signet/lib';
-import { domainAuthHeaders, verifyDomainAuth } from '@signet/lib';
+import { ReplayCache, domainAuthHeaders, verifyDomainAuth } from '@signet/lib';
+import { decode, encode } from './codec';
 import type { HttpRequest, HttpResult } from './http';
 import { HttpError, header, json } from './http';
-import type { AppendRequest, AppendResponse, RaftEntry, RaftStorage, RaftTransport, VoteRequest, VoteResponse } from './raft';
+import type { AppendRequest, AppendResponse, RaftEntry, RaftStorage, RaftTransport, SnapshotRequest, SnapshotResponse, VoteRequest, VoteResponse } from './raft';
 import { MemoryRaftStorage, RaftNode } from './raft';
 import { FileRaftStorage } from './raft-storage';
-import type { Store } from './store';
+import type { SnapshotStore, Store } from './store';
 import { MemoryStore } from './store';
 
 export interface ClusterMember {
@@ -33,6 +34,8 @@ export interface ClusterOptions {
   electionMs?: number;
   /** This replica lost its storage and rejoins under its old identifier (Section 6.8.8). */
   rejoin?: boolean;
+  /** Compact the log into a snapshot after this many applied entries. Defaults to 1000; 0 turns compaction off. */
+  snapshotEvery?: number;
   fetchImpl?: typeof fetch;
   now?: () => number;
   random?: () => number;
@@ -66,27 +69,6 @@ const MUTATORS = new Set([
   'removeOutbound',
 ]);
 
-const encode = (value: unknown): unknown =>
-  JSON.parse(
-    JSON.stringify(value, function (this: Record<string, unknown>, key: string, current: unknown) {
-      const original = this[key];
-      if (Buffer.isBuffer(original)) return { $b: original.toString('base64') };
-      if (original instanceof Date) return { $d: original.toISOString() };
-      return current;
-    }),
-  );
-
-const decode = (value: unknown): unknown => {
-  if (Array.isArray(value)) return value.map(decode);
-  if (value && typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    if (typeof record.$b === 'string' && Object.keys(record).length === 1) return Buffer.from(record.$b, 'base64');
-    if (typeof record.$d === 'string' && Object.keys(record).length === 1) return new Date(record.$d);
-    return Object.fromEntries(Object.entries(record).map(([key, item]) => [key, decode(item)]));
-  }
-  return value;
-};
-
 /** Apply one replicated change to a store. */
 function applyCommand(store: Store, command: Command): void {
   const args = decode(command.a) as unknown[];
@@ -117,7 +99,7 @@ export class Cluster {
   /** The store the home server uses: reads go to the current copy, changes are recorded for replication. */
   readonly store: Store;
   private readonly members = new Map<string, ClusterMember>();
-  private readonly holder: { store: Store };
+  private readonly holder: { store: SnapshotStore };
   private readonly electionMs: number;
   private ticker?: NodeJS.Timeout;
   private ready = false;
@@ -127,13 +109,15 @@ export class Cluster {
   private localApplied = 0;
   private waiters: { mark: number; resolve: () => void; reject: (error: Error) => void }[] = [];
   private flushQueued = false;
+  /** Signatures of cluster calls already accepted, so a captured call can't be played again. */
+  private readonly callReplays = new ReplayCache();
   private primaryHooks: (() => void)[] = [];
   private standbyHooks: (() => void)[] = [];
 
   /** @param factory Makes an empty store. A witness, which keeps no state, passes none. */
   constructor(
     private readonly options: ClusterOptions,
-    private readonly factory?: () => Store,
+    private readonly factory?: () => SnapshotStore,
   ) {
     for (const member of options.members) this.members.set(member.id, member);
     const self = this.members.get(options.id);
@@ -156,6 +140,9 @@ export class Cluster {
       now: options.now,
       random: options.random,
       apply: (index, entry) => this.onApply(index, entry),
+      snapshot: () => this.takeSnapshot(),
+      restore: (data) => this.holder.store.restore(data),
+      snapshotEvery: options.snapshotEvery ?? 1000,
       onRole: (role, _term, previous) => this.onRole(role, previous),
     });
   }
@@ -233,7 +220,7 @@ export class Cluster {
   /** A signed call from another replica: POST /v0/cluster/vote or /v0/cluster/append. */
   handle(request: HttpRequest): HttpResult {
     const path = request.url.pathname;
-    if (request.method !== 'POST' || (path !== '/v0/cluster/vote' && path !== '/v0/cluster/append')) throw new HttpError(404, 'no such cluster route');
+    if (request.method !== 'POST' || !['/v0/cluster/vote', '/v0/cluster/append', '/v0/cluster/snapshot'].includes(path)) throw new HttpError(404, 'no such cluster route');
     const ok = verifyDomainAuth(
       header(request.headers, 'signet-domain'),
       this.options.domainKey.publicKey,
@@ -244,11 +231,17 @@ export class Cluster {
       request.path,
       request.body,
     );
-    if (!ok || request.headers['signet-domain'] !== this.options.domain) throw new HttpError(401, 'cluster calls are signed with the domain key');
+    if (!ok || request.headers['signet-domain'] !== this.options.domain) throw new HttpError(401, 'cluster calls are signed with the replicas\' shared key');
+    if (!this.callReplays.firstUse(String(request.headers['signet-sig']))) throw new HttpError(401, 'this cluster call was already used');
     if (path === '/v0/cluster/vote') {
       const body = json<VoteRequest>(request);
       this.requireMember(body.candidate);
       return this.raft.handleVote(body);
+    }
+    if (path === '/v0/cluster/snapshot') {
+      const snapshot = json<SnapshotRequest>(request);
+      this.requireMember(snapshot.leader);
+      return this.raft.handleInstallSnapshot(snapshot);
     }
     const body = json<AppendRequest<Batch>>(request);
     this.requireMember(body.leader);
@@ -261,7 +254,7 @@ export class Cluster {
 
   private transport(): RaftTransport<Batch> {
     const fetchImpl = this.options.fetchImpl ?? fetch;
-    const post = async <R>(to: string, route: 'vote' | 'append', request: VoteRequest | AppendRequest<Batch>): Promise<R> => {
+    const post = async <R>(to: string, route: 'vote' | 'append' | 'snapshot', request: VoteRequest | AppendRequest<Batch> | SnapshotRequest): Promise<R> => {
       const member = this.members.get(to) as ClusterMember;
       const path = `/v0/cluster/${route}`;
       const body = JSON.stringify(request);
@@ -277,6 +270,7 @@ export class Cluster {
     return {
       vote: (to, request) => post<VoteResponse>(to, 'vote', request),
       append: (to, request) => post<AppendResponse>(to, 'append', request),
+      installSnapshot: (to, request) => post<SnapshotResponse>(to, 'snapshot', request),
     };
   }
 
@@ -358,6 +352,16 @@ export class Cluster {
     const waiters = this.waiters;
     this.waiters = [];
     for (const waiter of waiters) waiter.reject(error);
+  }
+
+  /**
+   * The store as of the last applied entry. The primary's store also holds changes it hasn't committed, so it
+   * only snapshots when everything it applied is committed.
+   */
+  private takeSnapshot(): unknown {
+    if (!this.factory) return null;
+    if (this.ready && (this.pending.length > 0 || this.localApplied > this.raft.lastApplied)) return undefined;
+    return this.holder.store.snapshot();
   }
 
   private onApply(index: number, entry: RaftEntry<Batch>): void {

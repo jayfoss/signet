@@ -27,7 +27,7 @@ async function until(condition: () => boolean, ms = 8000): Promise<void> {
 }
 
 /** alpha.test runs two homes and a witness; beta.test is an ordinary single home that talks to it. */
-async function world() {
+async function world(options: { snapshotEvery?: number } = {}) {
   const urls = new Map<string, string | string[]>();
   const resolver = new StaticResolver(urls);
   const logServer = new TransparencyLogServer(generateSigningKey(), resolver);
@@ -42,7 +42,7 @@ async function world() {
   ];
   const alphaKey = generateSigningKey();
   const shared = { vrfKey: generateVrfKey(), gatewayKey: generateGatewayKey() };
-  const home = (id: string) =>
+  const home = (id: string, rejoin = false) =>
     new SignetServer({
       domain: 'alpha.test',
       domainKey: alphaKey,
@@ -50,9 +50,9 @@ async function world() {
       log,
       openEnrollment: true,
       ...shared,
-      cluster: { id, members, electionMs: T, volatileLog: true },
+      cluster: { id, members, electionMs: T, volatileLog: true, snapshotEvery: options.snapshotEvery, rejoin },
     });
-  const homes = { h1: home('h1'), h2: home('h2') };
+  const homes: Record<'h1' | 'h2', SignetServer> = { h1: home('h1'), h2: home('h2') };
   const witness = new ClusterWitness({ domain: 'alpha.test', domainKey: alphaKey, id: 'w', members, electionMs: T, volatileLog: true });
   await homes.h1.listen(ports.h1);
   await homes.h2.listen(ports.h2);
@@ -88,6 +88,13 @@ async function world() {
     aliceClient,
     jerzyClient,
     standby: () => Object.values(homes).find((server) => !server.isPrimary()) as SignetServer,
+    /** Replace a home with a new one that has lost everything, as after a disk failure. */
+    rebuild: async (id: 'h1' | 'h2') => {
+      const fresh = home(id, true);
+      await fresh.listen(ports[id]);
+      homes[id] = fresh;
+      return fresh;
+    },
     close: async () => {
       await Promise.all([homes.h1.close(), homes.h2.close(), witness.close(), beta.close(), logServer.close()].map((closing) => closing.catch(() => undefined)));
     },
@@ -122,6 +129,24 @@ describe('a domain with two homes and a witness', () => {
     expect(await fetch(`${w.witness.url}/.well-known/signet.json`).then((response) => response.status)).toBe(404);
   });
 
+  it('brings a rebuilt replica up from a snapshot once the primary has compacted its log', async () => {
+    await w.close();
+    w = await world({ snapshotEvery: 3 });
+    await until(() => w.standby().store.hasUser('alice'));
+    const standby = w.standby();
+    const id = standby === w.homes.h1 ? 'h1' : 'h2';
+    await standby.close();
+    for (let i = 1; i <= 5; i++) await w.jerzyClient.sendRequest('alice@alpha.test', { subject: `Request ${i}`, intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    const primary = w.primary();
+    expect(primary.store.mailbox('alice')).toHaveLength(5);
+    const raft = (primary as unknown as { cluster: { raft: { compactedThrough: number } } }).cluster.raft;
+    expect(raft.compactedThrough).toBeGreaterThan(0);
+    // The new replica starts with nothing, so it can only get the compacted part as a snapshot.
+    const rebuilt = await w.rebuild(id);
+    await until(() => rebuilt.store.hasUser('alice') && rebuilt.store.mailbox('alice').length === 5);
+    expect(rebuilt.store.mailbox('alice').map((item) => item.id)).toEqual(primary.store.mailbox('alice').map((item) => item.id));
+  });
+
   it('answers a cluster call only when it is signed with the domain key by a member', async () => {
     const body = JSON.stringify({ term: 1, candidate: 'h2', lastIndex: 0, lastTerm: 0 });
     const call = (key: KeyPair, candidate = 'h2') => {
@@ -133,6 +158,11 @@ describe('a domain with two homes and a witness', () => {
       });
     };
     expect(body).toContain('candidate');
+    // A captured call can't be played again.
+    const once = JSON.stringify({ term: 0, candidate: 'h2', lastIndex: 0, lastTerm: 0, pre: true });
+    const headers = { 'content-type': 'application/json', ...domainAuthHeaders('alpha.test', w.alphaKey, 'POST', '/v0/cluster/vote', once) };
+    expect((await fetch(`${w.witness.url}/v0/cluster/vote`, { method: 'POST', headers, body: once })).status).toBe(200);
+    expect((await fetch(`${w.witness.url}/v0/cluster/vote`, { method: 'POST', headers, body: once })).status).toBe(401);
     expect((await call(generateSigningKey())).status).toBe(401);
     expect((await call(w.alphaKey, 'intruder')).status).toBe(403);
     expect((await fetch(`${w.witness.url}/v0/cluster/vote`, { method: 'POST', body })).status).toBeGreaterThanOrEqual(400);

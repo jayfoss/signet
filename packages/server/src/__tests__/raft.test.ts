@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, appendFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RaftEntry, RaftStorage, RaftTransport } from '../raft';
@@ -22,6 +22,7 @@ class Sim {
   constructor(
     readonly ids: string[],
     private readonly witnesses: string[] = [],
+    private readonly snapshotEvery?: number,
   ) {
     for (const id of ids) this.start(id);
   }
@@ -38,6 +39,7 @@ class Sim {
     const transport: RaftTransport<Data> = {
       vote: async (to, request) => this.call(id, to, () => this.nodes.get(to)!.handleVote(request)),
       append: async (to, request) => this.call(id, to, () => this.nodes.get(to)!.handleAppend(request)),
+      installSnapshot: async (to, request) => this.call(id, to, () => this.nodes.get(to)!.handleInstallSnapshot(request)),
     };
     const node = new RaftNode<Data>({
       id,
@@ -52,6 +54,10 @@ class Sim {
       apply: (_index, entry) => {
         if (entry.data !== null) this.applied.get(id)!.push(entry.data);
       },
+      // The state machine is the list of applied values.
+      snapshot: () => [...this.applied.get(id)!],
+      restore: (data) => this.applied.set(id, Array.isArray(data) ? [...(data as string[])] : []),
+      snapshotEvery: this.snapshotEvery,
       onRole: (role, term) => {
         if (role !== 'leader') return;
         const leaders = this.leadersByTerm.get(term) ?? new Set<string>();
@@ -242,6 +248,21 @@ describe('Raft election and replication', () => {
     expect(reborn.role).toBe('follower');
   });
 
+  it('does not raise its term while cut off, so rejoining disturbs nobody', async () => {
+    const sim = new Sim(['a', 'b', 'c']);
+    await sim.run(4000);
+    const leader = sim.leader()!;
+    const termBefore = leader.term;
+    const cutOff = sim.nodes.get(sim.ids.find((id) => id !== leader.id)!)!;
+    sim.partition([cutOff.id]);
+    await sim.run(8000);
+    expect(cutOff.term).toBe(termBefore);
+    sim.heal();
+    await sim.run(3000);
+    expect(sim.leader()!.id).toBe(leader.id);
+    expect(sim.leader()!.term).toBe(termBefore);
+  });
+
   it('never has two primaries in one term across repeated failures and partitions', async () => {
     const sim = new Sim(['a', 'b', 'c', 'd', 'e']);
     await sim.run(3000);
@@ -258,6 +279,74 @@ describe('Raft election and replication', () => {
     await sim.run(1000);
     const logs = sim.ids.map((id) => sim.applied.get(id)!);
     for (const log of logs) expect(log[log.length - 1]).toBe('final');
+  });
+});
+
+describe('Raft snapshots', () => {
+  const values = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `v${from + i}`);
+
+  it('compacts the log once enough has been applied, and keeps working', async () => {
+    const sim = new Sim(['a', 'b', 'c'], [], 5);
+    await sim.run(4000);
+    const leader = sim.leader()!;
+    for (const value of values(1, 12)) await sim.commit(leader, value);
+    await sim.run(500);
+    for (const id of sim.ids) {
+      expect(sim.nodes.get(id)!.compactedThrough).toBeGreaterThan(0);
+      expect((sim.storage.get(id) as MemoryRaftStorage<string>).length).toBeLessThan(8);
+      expect(sim.applied.get(id)).toEqual(values(1, 12));
+    }
+  });
+
+  it('brings a replica that fell behind the compacted log up to date from a snapshot', async () => {
+    const sim = new Sim(['a', 'b', 'c'], [], 4);
+    await sim.run(4000);
+    const leader = sim.leader()!;
+    const behind = sim.ids.find((id) => id !== leader.id)!;
+    await sim.commit(leader, 'v0');
+    sim.crash(behind);
+    for (const value of values(1, 15)) await sim.commit(leader, value);
+    expect(leader.compactedThrough).toBeGreaterThan(sim.nodes.get(behind)!.lastIndex);
+    const reborn = sim.start(behind);
+    await sim.run(3000);
+    expect(sim.applied.get(behind)).toEqual(['v0', ...values(1, 15)]);
+    expect(reborn.compactedThrough).toBeGreaterThan(0);
+    await sim.commit(sim.leader()!, 'after');
+    await sim.run(500);
+    expect(sim.applied.get(behind)?.slice(-1)).toEqual(['after']);
+  });
+
+  it('restarts from its snapshot and catches up on what it missed', async () => {
+    const sim = new Sim(['a', 'b', 'c'], [], 4);
+    await sim.run(4000);
+    const leader = sim.leader()!;
+    for (const value of values(1, 10)) await sim.commit(leader, value);
+    await sim.run(500);
+    const follower = sim.ids.find((id) => id !== leader.id)!;
+    sim.crash(follower);
+    await sim.commit(leader, 'while-down');
+    const restarted = sim.start(follower);
+    // Its state came back from the snapshot before any entry was fetched.
+    expect(restarted.compactedThrough).toBeGreaterThan(0);
+    // (The snapshot's index counts the leader's no-op entries too, so it can exceed the number of values.)
+    const restored = sim.applied.get(follower) ?? [];
+    expect(restored.length).toBeGreaterThan(0);
+    expect(restored.length).toBeLessThanOrEqual(restarted.compactedThrough);
+    await sim.run(3000);
+    expect(sim.applied.get(follower)).toEqual([...values(1, 10), 'while-down']);
+  });
+
+  it('lets a witness compact too, and still vote', async () => {
+    const sim = new Sim(['h1', 'h2', 'w'], ['w'], 4);
+    await sim.run(4000);
+    const first = sim.leader()!;
+    for (const value of values(1, 9)) await sim.commit(first, value);
+    expect(sim.nodes.get('w')!.compactedThrough).toBeGreaterThan(0);
+    sim.crash(first.id);
+    await sim.run(6000);
+    const second = sim.leader()!;
+    await sim.commit(second, 'after');
+    expect(sim.applied.get(second.id)).toEqual([...values(1, 9), 'after']);
   });
 });
 
@@ -297,6 +386,34 @@ describe('FileRaftStorage', () => {
     expect(reopened.load().log).toEqual([entry(1, 'a')]);
     reopened.replaceFrom(2, [entry(1, 'b')]);
     expect(new FileRaftStorage<string>(dir).load().log).toEqual([entry(1, 'a'), entry(1, 'b')]);
+  });
+
+  it('keeps a snapshot and the log after it across a restart', () => {
+    const storage = new FileRaftStorage<string>(dir);
+    storage.load();
+    storage.replaceFrom(1, [entry(1, 'a'), entry(1, 'b'), entry(2, 'c'), entry(2, 'd')]);
+    storage.saveSnapshot({ index: 2, term: 1, data: ['a', 'b'] }, [entry(2, 'c'), entry(2, 'd')]);
+    storage.replaceFrom(5, [entry(3, 'e')]);
+    const loaded = new FileRaftStorage<string>(dir).load();
+    expect(loaded.snapshot).toEqual({ index: 2, term: 1, data: ['a', 'b'] });
+    expect(loaded.log).toEqual([entry(2, 'c'), entry(2, 'd'), entry(3, 'e')]);
+    // A conflicting tail after a snapshot is cut at the right absolute index.
+    const again = new FileRaftStorage<string>(dir);
+    again.load();
+    again.replaceFrom(4, [entry(4, 'x')]);
+    expect(new FileRaftStorage<string>(dir).load().log).toEqual([entry(2, 'c'), entry(4, 'x')]);
+  });
+
+  it('skips entries a snapshot covers when a crash left the log uncut', () => {
+    const storage = new FileRaftStorage<string>(dir);
+    storage.load();
+    storage.replaceFrom(1, [entry(1, 'a'), entry(1, 'b'), entry(1, 'c')]);
+    // The snapshot file was written; the crash came before the log was rewritten.
+    writeFileSync(join(dir, 'raft-snapshot.json'), JSON.stringify({ index: 2, term: 1, data: ['a', 'b'] }));
+    const loaded = new FileRaftStorage<string>(dir);
+    expect(loaded.load().log).toEqual([entry(1, 'c')]);
+    loaded.replaceFrom(4, [entry(1, 'd')]);
+    expect(new FileRaftStorage<string>(dir).load().log).toEqual([entry(1, 'c'), entry(1, 'd')]);
   });
 
   it('starts empty in a new folder', () => {

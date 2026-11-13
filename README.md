@@ -33,7 +33,7 @@ Tests run per file, for example `pnpm jest packages/server/src/__tests__/server.
 
 **Several operators.** A domain can also spread across operators who don't trust each other (Section 6.9). Each runs an independent home with its own key and state, and none holds the domain key. The domain owner signs a statement listing the homes and pins the domain key in DNS (`dk=`). A sending home delivers to every home of the recipient at the same time, a client reads from all of its homes and shows each message once, and a home that is down is caught up by retries. Discovery doesn't use MX, so an outage at the domain's mail provider doesn't touch any of this.
 
-The tests `cluster.test.ts` and `operators.test.ts` build both in code; there is no command-line configuration for them yet.
+Both are configured through environment variables; the list is at the top of `packages/server/src/main.ts`. Replicas keep their log in `SIGNET_DATA_DIR` and compact it with snapshots. `SIGNET_ROLE=witness` runs a witness, `registrar` runs the domain owner's registrar, and `sign-operators` signs the statement that lists the homes. `cluster.test.ts` and `operators.test.ts` build both setups in code.
 
 ## Licence
 

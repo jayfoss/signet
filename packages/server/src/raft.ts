@@ -1,11 +1,14 @@
 /**
  * The Raft algorithm (Ongaro and Ousterhout, 2014) in the profile of Section 6.8.6: leader election with
- * terms, log replication, commit by majority, a no-op entry for each new leader, and a leader that steps
- * down when it hasn't heard from a majority for one election timeout. There is no snapshotting and no
- * membership change.
+ * terms and a pre-vote round, log replication, commit by majority, a no-op entry for each new leader, a
+ * leader that steps down when it hasn't heard from a majority for one election timeout, and snapshots that
+ * compact the log. There is no membership change.
  *
  * The node does no I/O of its own. The host gives it a transport, durable storage, a clock and an
  * `apply` function, and calls `tick` often (every tenth of the election timeout is plenty).
+ *
+ * Log indexes are absolute and start at 1. After a snapshot, the log holds only the entries after the
+ * snapshot's index.
  */
 
 export type Role = 'follower' | 'candidate' | 'leader';
@@ -16,21 +19,31 @@ export interface RaftEntry<T = unknown> {
   data: T | null;
 }
 
+/** The state machine as of `index`, replacing every entry up to and including it. `data` is null for a witness. */
+export interface RaftSnapshot {
+  index: number;
+  term: number;
+  data: unknown;
+}
+
 export interface RaftStorage<T = unknown> {
-  load(): { term: number; votedFor: string | null; log: RaftEntry<T>[] };
+  load(): { term: number; votedFor: string | null; log: RaftEntry<T>[]; snapshot?: RaftSnapshot };
   /** Must be durable when it returns. */
   saveHard(term: number, votedFor: string | null): void;
-  /** Keep entries before `from` (1-based), drop the rest, then add `entries`. Must be durable when it returns. */
+  /** Keep entries before absolute index `from`, drop the rest, then add `entries`. Must be durable when it returns. */
   replaceFrom(from: number, entries: RaftEntry<T>[]): void;
+  /** Keep this snapshot and, after it, exactly `remaining`, which starts at index `snapshot.index + 1`. Must be durable when it returns. */
+  saveSnapshot(snapshot: RaftSnapshot, remaining: RaftEntry<T>[]): void;
 }
 
 export class MemoryRaftStorage<T = unknown> implements RaftStorage<T> {
   private term = 0;
   private votedFor: string | null = null;
   private log: RaftEntry<T>[] = [];
+  private snapshot?: RaftSnapshot;
 
   load() {
-    return { term: this.term, votedFor: this.votedFor, log: structuredClone(this.log) };
+    return { term: this.term, votedFor: this.votedFor, log: structuredClone(this.log), snapshot: structuredClone(this.snapshot) };
   }
 
   saveHard(term: number, votedFor: string | null): void {
@@ -39,7 +52,18 @@ export class MemoryRaftStorage<T = unknown> implements RaftStorage<T> {
   }
 
   replaceFrom(from: number, entries: RaftEntry<T>[]): void {
-    this.log = [...this.log.slice(0, from - 1), ...structuredClone(entries)];
+    const base = this.snapshot?.index ?? 0;
+    this.log = [...this.log.slice(0, from - base - 1), ...structuredClone(entries)];
+  }
+
+  saveSnapshot(snapshot: RaftSnapshot, remaining: RaftEntry<T>[]): void {
+    this.snapshot = structuredClone(snapshot);
+    this.log = structuredClone(remaining);
+  }
+
+  /** How many entries the log holds beyond the snapshot, for tests. */
+  get length(): number {
+    return this.log.length;
   }
 }
 
@@ -48,6 +72,8 @@ export interface VoteRequest {
   candidate: string;
   lastIndex: number;
   lastTerm: number;
+  /** A pre-vote: would you vote for me in this term? It changes nothing on the voter, and the candidate's term doesn't rise unless a majority says yes. */
+  pre?: boolean;
 }
 
 export interface VoteResponse {
@@ -71,9 +97,24 @@ export interface AppendResponse {
   matchIndex: number;
 }
 
+/** The leader's snapshot, for a follower that needs entries the leader has compacted away. */
+export interface SnapshotRequest {
+  term: number;
+  leader: string;
+  index: number;
+  snapshotTerm: number;
+  data: unknown;
+}
+
+export interface SnapshotResponse {
+  term: number;
+  matchIndex: number;
+}
+
 export interface RaftTransport<T = unknown> {
   vote(to: string, request: VoteRequest): Promise<VoteResponse>;
   append(to: string, request: AppendRequest<T>): Promise<AppendResponse>;
+  installSnapshot(to: string, request: SnapshotRequest): Promise<SnapshotResponse>;
 }
 
 export class NotLeaderError extends Error {
@@ -104,6 +145,15 @@ export interface RaftOptions<T> {
   transport: RaftTransport<T>;
   /** Called once per committed entry, in order, including no-ops. Not called on a witness. */
   apply: (index: number, entry: RaftEntry<T>) => void;
+  /**
+   * The state machine as of the last applied entry, to compact the log. Return undefined if it can't be taken
+   * right now (say, because it holds changes that aren't committed yet); the node tries again later.
+   */
+  snapshot?: () => unknown;
+  /** Replace the state machine with a snapshot's data, or with nothing (null) when there is no snapshot. */
+  restore?: (data: unknown) => void;
+  /** Compact the log once this many entries have been applied since the last snapshot. Off if unset. */
+  snapshotEvery?: number;
   /** Called when the role changes. */
   onRole?: (role: Role, term: number, previous: Role) => void;
   /** Election timeout T in milliseconds. Elections start after T to 2T; heartbeats go every T/5. */
@@ -130,7 +180,11 @@ export class RaftNode<T = unknown> {
 
   private term_ = 0;
   private votedFor: string | null = null;
-  private readonly log: RaftEntry<T>[];
+  /** Entries after `snapshotIndex`. */
+  private log: RaftEntry<T>[];
+  private snapshotIndex = 0;
+  private snapshotTerm = 0;
+  private snapshotData: unknown = null;
   private readonly peers: string[];
   private readonly witness: boolean;
   private readonly electionMs: number;
@@ -138,6 +192,9 @@ export class RaftNode<T = unknown> {
   private readonly random: () => number;
   private caughtUp: boolean;
   private electionDeadline = 0;
+  /** When a leader last reached this replica, so a pre-vote isn't granted while one is alive. */
+  private lastLeaderContact = Number.NEGATIVE_INFINITY;
+  private preVoting = false;
   private nextHeartbeat = 0;
   private noopIndex = 0;
   private readonly nextIndex = new Map<string, number>();
@@ -158,6 +215,13 @@ export class RaftNode<T = unknown> {
     this.term_ = saved.term;
     this.votedFor = saved.votedFor;
     this.log = saved.log;
+    if (saved.snapshot) {
+      this.snapshotIndex = saved.snapshot.index;
+      this.snapshotTerm = saved.snapshot.term;
+      this.snapshotData = saved.snapshot.data;
+      this.commitIndex = this.lastApplied = saved.snapshot.index;
+      if (!this.witness) options.restore?.(saved.snapshot.data);
+    }
     this.resetElection();
   }
 
@@ -166,7 +230,12 @@ export class RaftNode<T = unknown> {
   }
 
   get lastIndex(): number {
-    return this.log.length;
+    return this.snapshotIndex + this.log.length;
+  }
+
+  /** The index the log starts after: everything up to it is in the snapshot. */
+  get compactedThrough(): number {
+    return this.snapshotIndex;
   }
 
   /** Voters needed for a decision: more than half of everyone. */
@@ -175,11 +244,13 @@ export class RaftNode<T = unknown> {
   }
 
   entryAt(index: number): RaftEntry<T> | undefined {
-    return this.log[index - 1];
+    return index > this.snapshotIndex ? this.log[index - this.snapshotIndex - 1] : undefined;
   }
 
   private termAt(index: number): number {
-    return index === 0 ? 0 : (this.log[index - 1]?.term ?? 0);
+    if (index === 0) return 0;
+    if (index === this.snapshotIndex) return this.snapshotTerm;
+    return this.entryAt(index)?.term ?? 0;
   }
 
   private resetElection(): void {
@@ -210,7 +281,7 @@ export class RaftNode<T = unknown> {
       return;
     }
     if (this.witness || !this.caughtUp) return;
-    if (now >= this.electionDeadline) this.startElection();
+    if (now >= this.electionDeadline) this.startPreVote();
   }
 
   /** Leader only: add an entry to the log. Await `waitCommitted` for the result. */
@@ -230,16 +301,18 @@ export class RaftNode<T = unknown> {
     });
   }
 
-  /** Apply the committed log again from the start, after the host threw its state away. */
+  /** The host threw its state away: restore the snapshot into it and apply the committed log after the snapshot again. */
   resetApplied(): void {
-    this.lastApplied = 0;
+    if (!this.witness && this.snapshotIndex > 0) this.options.restore?.(this.snapshotData);
+    this.lastApplied = this.snapshotIndex;
     this.applyCommitted();
   }
 
   handleVote(request: VoteRequest): VoteResponse {
+    if (request.pre) return this.handlePreVote(request);
     if (request.term < this.term_) return { term: this.term_, granted: false };
     if (request.term > this.term_) this.stepDown(request.term);
-    const upToDate = request.lastTerm > this.termAt(this.lastIndex) || (request.lastTerm === this.termAt(this.lastIndex) && request.lastIndex >= this.lastIndex);
+    const upToDate = this.upToDate(request);
     const free = this.votedFor === null || this.votedFor === request.candidate;
     if (!this.caughtUp || !free || !upToDate) return { term: this.term_, granted: false };
     this.votedFor = request.candidate;
@@ -248,12 +321,20 @@ export class RaftNode<T = unknown> {
     return { term: this.term_, granted: true };
   }
 
+  private upToDate(request: VoteRequest): boolean {
+    const lastTerm = this.termAt(this.lastIndex);
+    return request.lastTerm > lastTerm || (request.lastTerm === lastTerm && request.lastIndex >= this.lastIndex);
+  }
+
   handleAppend(request: AppendRequest<T>): AppendResponse {
     if (request.term < this.term_) return { term: this.term_, success: false, matchIndex: 0 };
     if (request.term > this.term_ || this.role !== 'follower') this.stepDown(request.term);
     this.leaderId = request.leader;
+    this.lastLeaderContact = this.now();
     this.resetElection();
-    if (request.prevIndex > this.lastIndex || this.termAt(request.prevIndex) !== request.prevTerm) {
+    // Anything before our snapshot is committed, so the leader's log agrees with ours there.
+    const matches = request.prevIndex < this.snapshotIndex || (request.prevIndex <= this.lastIndex && this.termAt(request.prevIndex) === request.prevTerm);
+    if (!matches) {
       return { term: this.term_, success: false, matchIndex: Math.min(this.lastIndex, Math.max(0, request.prevIndex - 1)) };
     }
     let index = request.prevIndex;
@@ -261,11 +342,12 @@ export class RaftNode<T = unknown> {
     let from = 0;
     for (const entry of request.entries) {
       index++;
+      if (index <= this.snapshotIndex) continue;
       if (added.length === 0) {
         if (index <= this.lastIndex) {
           if (this.termAt(index) === entry.term) continue;
           if (index <= this.commitIndex) throw new Error(`leader ${request.leader} contradicts committed entry ${index}`);
-          this.log.length = index - 1;
+          this.log.length = index - 1 - this.snapshotIndex;
         }
         from = index;
       }
@@ -275,18 +357,79 @@ export class RaftNode<T = unknown> {
     if (added.length > 0) this.options.storage.replaceFrom(from, added);
     const last = request.prevIndex + request.entries.length;
     if (request.commit > this.commitIndex) {
-      this.commitIndex = Math.min(request.commit, last);
+      this.commitIndex = Math.max(this.commitIndex, Math.min(request.commit, last));
       this.applyCommitted();
     }
     if (!this.caughtUp && this.commitIndex >= request.commit) this.caughtUp = true;
     this.settle();
-    return { term: this.term_, success: true, matchIndex: last };
+    return { term: this.term_, success: true, matchIndex: Math.max(last, this.snapshotIndex) };
+  }
+
+  /** Take the leader's snapshot in place of everything this replica holds up to it. */
+  handleInstallSnapshot(request: SnapshotRequest): SnapshotResponse {
+    if (request.term < this.term_) return { term: this.term_, matchIndex: 0 };
+    if (request.term > this.term_ || this.role !== 'follower') this.stepDown(request.term);
+    this.leaderId = request.leader;
+    this.lastLeaderContact = this.now();
+    this.resetElection();
+    // Already past it: nothing to take.
+    if (request.index <= this.commitIndex) return { term: this.term_, matchIndex: this.commitIndex };
+    this.options.storage.saveSnapshot({ index: request.index, term: request.snapshotTerm, data: request.data }, []);
+    this.log = [];
+    this.snapshotIndex = request.index;
+    this.snapshotTerm = request.snapshotTerm;
+    this.snapshotData = request.data;
+    this.commitIndex = this.lastApplied = request.index;
+    if (!this.witness) this.options.restore?.(request.data);
+    this.settle();
+    return { term: this.term_, matchIndex: request.index };
   }
 
   private appendLocal(entry: RaftEntry<T>): number {
     this.log.push(entry);
-    this.options.storage.replaceFrom(this.log.length, [entry]);
-    return this.log.length;
+    this.options.storage.replaceFrom(this.lastIndex, [entry]);
+    return this.lastIndex;
+  }
+
+  /** A pre-vote is granted if the candidate's log is current and no leader has been heard from for an election timeout. Nothing is recorded. */
+  private handlePreVote(request: VoteRequest): VoteResponse {
+    const leaderless = this.role !== 'leader' && this.now() - this.lastLeaderContact >= this.electionMs;
+    return { term: this.term_, granted: request.term >= this.term_ && this.upToDate(request) && leaderless && this.caughtUp };
+  }
+
+  /** Ask whether a majority would vote for this replica before raising the term, so a replica that is merely cut off doesn't disturb a working primary. */
+  private startPreVote(): void {
+    this.resetElection();
+    if (this.peers.length === 0) {
+      this.startElection();
+      return;
+    }
+    if (this.preVoting) return;
+    this.preVoting = true;
+    const term = this.term_ + 1;
+    const request: VoteRequest = { term, candidate: this.id, lastIndex: this.lastIndex, lastTerm: this.termAt(this.lastIndex), pre: true };
+    let yes = 1;
+    let answered = 0;
+    const settle = () => {
+      if (++answered === this.peers.length) this.preVoting = false;
+    };
+    for (const peer of this.peers) {
+      this.options.transport.vote(peer, request).then(
+        (response) => {
+          settle();
+          if (response.term > this.term_) {
+            this.stepDown(response.term);
+            return;
+          }
+          if (!response.granted || this.role === 'leader' || this.term_ + 1 !== term) return;
+          if (++yes === this.majority) {
+            this.preVoting = false;
+            this.startElection();
+          }
+        },
+        settle,
+      );
+    }
   }
 
   private startElection(): void {
@@ -357,33 +500,58 @@ export class RaftNode<T = unknown> {
   private replicate(peer: string): void {
     if (this.role !== 'leader' || this.inflight.has(peer)) return;
     const next = this.nextIndex.get(peer) ?? this.lastIndex + 1;
+    if (next <= this.snapshotIndex) {
+      this.sendSnapshot(peer);
+      return;
+    }
     const prevIndex = next - 1;
     const term = this.term_;
     this.inflight.add(peer);
-    this.options.transport
-      .append(peer, { term, leader: this.id, prevIndex, prevTerm: this.termAt(prevIndex), entries: this.log.slice(prevIndex, prevIndex + MAX_BATCH), commit: this.commitIndex })
-      .then(
-        (response) => {
-          this.inflight.delete(peer);
-          if (response.term > this.term_) {
-            this.stepDown(response.term);
-            return;
-          }
-          if (this.role !== 'leader' || this.term_ !== term) return;
-          this.lastAck.set(peer, this.now());
-          if (response.success) {
-            const matched = Math.max(this.matchIndex.get(peer) ?? 0, response.matchIndex);
-            this.matchIndex.set(peer, matched);
-            this.nextIndex.set(peer, matched + 1);
-            this.advanceCommit();
-            if (matched < this.lastIndex) this.replicate(peer);
-          } else {
-            this.nextIndex.set(peer, Math.max(1, Math.min(next - 1, response.matchIndex + 1)));
-            this.replicate(peer);
-          }
-        },
-        () => this.inflight.delete(peer),
-      );
+    const entries = this.log.slice(prevIndex - this.snapshotIndex, prevIndex - this.snapshotIndex + MAX_BATCH);
+    this.options.transport.append(peer, { term, leader: this.id, prevIndex, prevTerm: this.termAt(prevIndex), entries, commit: this.commitIndex }).then(
+      (response) => {
+        this.inflight.delete(peer);
+        if (response.term > this.term_) {
+          this.stepDown(response.term);
+          return;
+        }
+        if (this.role !== 'leader' || this.term_ !== term) return;
+        this.lastAck.set(peer, this.now());
+        if (response.success) {
+          const matched = Math.max(this.matchIndex.get(peer) ?? 0, response.matchIndex);
+          this.matchIndex.set(peer, matched);
+          this.nextIndex.set(peer, matched + 1);
+          this.advanceCommit();
+          if (matched < this.lastIndex) this.replicate(peer);
+        } else {
+          this.nextIndex.set(peer, Math.max(1, Math.min(next - 1, response.matchIndex + 1)));
+          this.replicate(peer);
+        }
+      },
+      () => this.inflight.delete(peer),
+    );
+  }
+
+  private sendSnapshot(peer: string): void {
+    const term = this.term_;
+    this.inflight.add(peer);
+    this.options.transport.installSnapshot(peer, { term, leader: this.id, index: this.snapshotIndex, snapshotTerm: this.snapshotTerm, data: this.snapshotData }).then(
+      (response) => {
+        this.inflight.delete(peer);
+        if (response.term > this.term_) {
+          this.stepDown(response.term);
+          return;
+        }
+        if (this.role !== 'leader' || this.term_ !== term) return;
+        this.lastAck.set(peer, this.now());
+        const matched = Math.max(this.matchIndex.get(peer) ?? 0, response.matchIndex);
+        this.matchIndex.set(peer, matched);
+        this.nextIndex.set(peer, matched + 1);
+        this.advanceCommit();
+        if (matched < this.lastIndex) this.replicate(peer);
+      },
+      () => this.inflight.delete(peer),
+    );
   }
 
   /** Commit the highest entry of this term that a majority holds. Older entries commit with it. */
@@ -404,8 +572,26 @@ export class RaftNode<T = unknown> {
   private applyCommitted(): void {
     while (this.lastApplied < this.commitIndex) {
       this.lastApplied++;
-      if (!this.witness) this.options.apply(this.lastApplied, this.log[this.lastApplied - 1]);
+      const entry = this.entryAt(this.lastApplied) as RaftEntry<T>;
+      if (!this.witness) this.options.apply(this.lastApplied, entry);
     }
+    if (this.options.snapshotEvery && this.lastApplied - this.snapshotIndex >= this.options.snapshotEvery) this.compact();
+  }
+
+  /** Replace the applied part of the log with a snapshot of the state machine. */
+  private compact(): void {
+    const data = this.witness ? null : this.options.snapshot?.();
+    if (data === undefined) return;
+    // Settle callers waiting on entries about to be compacted, while their terms can still be checked.
+    this.settle();
+    const index = this.lastApplied;
+    const term = this.termAt(index);
+    const remaining = this.log.slice(index - this.snapshotIndex);
+    this.options.storage.saveSnapshot({ index, term, data }, remaining);
+    this.log = remaining;
+    this.snapshotIndex = index;
+    this.snapshotTerm = term;
+    this.snapshotData = data;
   }
 
   private settle(): void {

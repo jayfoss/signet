@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { DomainBinding, GatewayKey, KeyPair, LogEntry, MailItem, SignedCard, SignedView, VrfKey } from '@signet/lib';
 import { AUTH_SKEW_MS, ReplayCache } from '@signet/lib';
+import { decode, encode } from './codec';
 
 export interface UserRecord {
   binding: DomainBinding;
@@ -116,10 +117,17 @@ export interface Store {
   close(): void;
 }
 
+/** A store that can be written out whole and read back, so a replica can compact its log (Section 6.8.6). */
+export interface SnapshotStore extends Store {
+  snapshot(): unknown;
+  /** Replace everything with a snapshot, or with nothing for null. */
+  restore(data: unknown): void;
+}
+
 const today = (now: Date) => now.toISOString().slice(0, 10);
 
 /** Everything in memory, for tests and local demos. Gone on restart. */
-export class MemoryStore implements Store {
+export class MemoryStore implements SnapshotStore {
   private readonly users = new Map<string, UserRecord>();
   private readonly mailboxes = new Map<string, MailItem[]>();
   private readonly keyPackages = new Map<string, PublishedKeyPackage[]>();
@@ -134,8 +142,65 @@ export class MemoryStore implements Store {
   private readonly orgClaims = new Map<string, string[]>();
   private readonly pending = new Map<string, Outbound>();
   private keys?: ServerKeys;
-  readonly replays = new ReplayCache();
-  readonly recoveryProofs = new ReplayCache();
+  replays = new ReplayCache();
+  recoveryProofs = new ReplayCache();
+
+  snapshot(): unknown {
+    return encode({
+      users: [...this.users],
+      mailboxes: [...this.mailboxes],
+      keyPackages: [...this.keyPackages],
+      lastResort: [...this.lastResort],
+      tokens: [...this.tokens].map(([key, set]) => [key, [...set]]),
+      parked: [...this.parked],
+      blobs: [...this.blobs],
+      counters: [...this.counters],
+      spent: [...this.spent],
+      viewGrants: [...this.viewGrants].map(([key, set]) => [key, [...set]]),
+      contacts: [...this.contacts].map(([key, value]) => [key, { contacts: [...value.contacts], trustedDomains: [...value.trustedDomains] }]),
+      orgClaims: [...this.orgClaims],
+      pending: [...this.pending],
+      keys: this.keys ?? null,
+      replays: this.replays.entries(),
+      recoveryProofs: this.recoveryProofs.entries(),
+    });
+  }
+
+  restore(data: unknown): void {
+    const saved = (data === null ? {} : decode(data)) as Record<string, [string, unknown][] | string[] | ServerKeys | null | undefined>;
+    const pairs = <V>(name: string): [string, V][] => (saved[name] ?? []) as [string, V][];
+    this.users.clear();
+    pairs<UserRecord>('users').forEach(([key, value]) => this.users.set(key, value));
+    this.mailboxes.clear();
+    pairs<MailItem[]>('mailboxes').forEach(([key, value]) => this.mailboxes.set(key, value));
+    this.keyPackages.clear();
+    pairs<PublishedKeyPackage[]>('keyPackages').forEach(([key, value]) => this.keyPackages.set(key, value));
+    this.lastResort.clear();
+    pairs<PublishedKeyPackage>('lastResort').forEach(([key, value]) => this.lastResort.set(key, value));
+    this.tokens.clear();
+    pairs<string[]>('tokens').forEach(([key, value]) => this.tokens.set(key, new Set(value)));
+    this.parked.clear();
+    pairs<{ hash: string; item: Parked; until: number }[]>('parked').forEach(([key, value]) => this.parked.set(key, value));
+    this.blobs.clear();
+    pairs<Buffer>('blobs').forEach(([key, value]) => this.blobs.set(key, value));
+    this.counters.clear();
+    pairs<number>('counters').forEach(([key, value]) => this.counters.set(key, value));
+    this.spent.clear();
+    ((saved.spent ?? []) as string[]).forEach((nonce) => this.spent.add(nonce));
+    this.viewGrants.clear();
+    pairs<string[]>('viewGrants').forEach(([key, value]) => this.viewGrants.set(key, new Set(value)));
+    this.contacts.clear();
+    pairs<{ contacts: string[]; trustedDomains: string[] }>('contacts').forEach(([key, value]) =>
+      this.contacts.set(key, { contacts: new Set(value.contacts), trustedDomains: new Set(value.trustedDomains) }),
+    );
+    this.orgClaims.clear();
+    pairs<string[]>('orgClaims').forEach(([key, value]) => this.orgClaims.set(key, value));
+    this.pending.clear();
+    pairs<Outbound>('pending').forEach(([key, value]) => this.pending.set(key, value));
+    this.keys = (saved.keys as ServerKeys | null | undefined) ?? undefined;
+    this.replays = new ReplayCache(undefined, (saved.replays ?? []) as unknown as [string, number][]);
+    this.recoveryProofs = new ReplayCache(undefined, (saved.recoveryProofs ?? []) as unknown as [string, number][]);
+  }
 
   user(local: string): UserRecord | undefined {
     const record = this.users.get(local);

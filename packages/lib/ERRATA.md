@@ -52,7 +52,6 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 | --- | --- | --- | --- | --- |
 | 10.5.1 | `token_key_id` as in RFC 9578, over the `id-RSASSA-PSS` SubjectPublicKeyInfo | Hashes the plain `rsaEncryption` SubjectPublicKeyInfo, so tokens don't interoperate with other Privacy Pass implementations | `packages/lib/src/privacypass.ts` (`tokenKeyId`) | medium |
 | 10.7, 15 | Delete mailbox items once read, expire parked items, keep counters only for their window | Mailbox items, parked items and counters live in memory until restart | `packages/server/src/store.ts` | low |
-| 10.6 | (documentation accuracy) | The server README says retries last "about five days"; the schedule totals about 4.4 days | `packages/server/README.md`, `packages/server/src/server.ts` | low |
 
 ## 12. Live sessions and handoff
 
@@ -71,26 +70,19 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 
 | Section | Spec requires | Reference does | Where | Severity |
 | --- | --- | --- | --- | --- |
-| 6.8.6 | (no protocol rule; Section 6.8.10 lists it as open) | The log is never compacted and a restart replays all of it; membership is fixed at start | `packages/server/src/cluster.ts`, `packages/server/src/raft.ts` | medium |
-| 6.8.4 | A home ignores a delivery whose id is already in the recipient's mailbox | Repeated deliveries after an ambiguous failure are stored again | `packages/server/src/server.ts` (`deliverLocal`) | medium |
-| 6.3, 10.4 | Callers find a working home | The OHTTP relay and the policy's `ohttp.gateway` name only the first home, so sealed deliveries through a relay don't fail over | `packages/server/src/relay-server.ts`, `packages/server/src/server.ts` (`policy`) | medium |
-| 6.8.5 | Everything a request changes is committed before it is answered | `SignetServer.setClaims` changes the store without waiting for the commit; a failover just after it can lose the claim | `packages/server/src/server.ts` | low |
+| 6.8.10 | (open issue) | Membership is fixed at start; adding or removing a replica isn't supported | `packages/server/src/cluster.ts`, `packages/server/src/raft.ts` | medium |
 | 6.8.5 | (no protocol rule) | Replicas apply batches with their own clock, so `receivedAt` and the expiry of parked deliveries differ by the replication delay | `packages/server/src/cluster.ts` | low |
-| 6.8.6 | Cluster calls are signed as server requests (Section 4.6) | They are checked for the domain key and a fresh timestamp but not for a repeated nonce; Raft tolerates a replayed call | `packages/server/src/cluster.ts` (`handle`) | low |
-| 6.8.6 | (no protocol rule) | No pre-vote: a replica cut off from the others raises its term and forces an election when it returns | `packages/server/src/raft.ts` | low |
-| 6.8 | A deployment can run a cluster | No command-line or environment configuration for `signet server`; clusters are built in code (`SignetServer` with `cluster`, `ClusterWitness`), and an operator copies the domain, VRF, gateway and intake keys to each replica | `packages/server/src/main.ts` | medium |
+| 6.8.6 | A snapshot holds the whole state | A snapshot is one JSON document of the whole in-memory store sent in one request, so a large mailbox store makes a large snapshot | `packages/server/src/store.ts` (`snapshot`), `packages/server/src/raft.ts` | low |
+| 6.8.4 | Callers find a working home | For a domain without operators, the policy and the relay name one OHTTP gateway; sealed deliveries don't fail over between a home's replicas through OHTTP | `packages/server/src/relay-server.ts` | low |
 
 ## 6.9 Multi-operator domains
 
 | Section | Spec requires | Reference does | Where | Severity |
 | --- | --- | --- | --- | --- |
-| 6.9.4 | A home reaches the owner's registrar over some channel | `LocalRegistrar` runs in the home's own process, so a home that isn't run by the domain owner can't bind addresses; there is no network registrar | `packages/server/src/registrar.ts` | high |
-| 6.9.4 | Claims and legacy attestation go through the registrar | A home without the domain key answers 501 for organisation claims and for legacy-mail attestation | `packages/server/src/server.ts` | medium |
-| 6.9.6 | A client repeats a registration with a home that was down | Key packages are topped up at every sync, but delivery tokens, contacts and view grants a down home missed are not repeated | `packages/lib/src/client.ts` | medium |
-| 6.9.6 | A client compares what its homes return and flags one that is missing items | Not done; the spec doesn't define the comparison | `packages/lib/src/client.ts` | medium |
-| 6.9.2 | A client refuses a lower `seq` than any it has held | The highest `seq` is kept in the resolver's memory only, so a restarted client forgets it | `packages/lib/src/resolver.ts` | medium |
-| 6.9.7 | (open issue) | Each home accepts a Privacy Pass token once, so one token can be spent at each home | `packages/server/src/server.ts` (`deliverAnonymous`) | low |
-| 6.9.5 | A client resends through another home when its own can't be reached | Done for any failure of the call. A home that accepts and then drops the message isn't noticed | `packages/lib/src/client.ts` (`call`) | medium |
-| 6.9 | A deployment can run a multi-operator domain | There is no command-line or environment configuration for operator mode; it is built in code, and the owner signs the statement with `signOperators` | `packages/server/src/main.ts` | medium |
+| 6.9.4 | The registrar remembers the logs it bound | They are kept in memory, so a restarted registrar accepts a first publication for a known address as new (after the owner approves it again) | `packages/server/src/registrar.ts` | medium |
+| 6.9.4 | The owner signs claims before the old ones expire | Nothing reminds the owner or renews claims; an unrenewed claim just stops being served | `packages/server/src/server.ts` | low |
 | 6.9.7 | (open issue) | The VRF key, and the intake key with an intake, are given to every home | `packages/server/src/server.ts` | medium |
+| 6.9.7 | (open issue) | Each home accepts a Privacy Pass token once, so one token can be spent at each home | `packages/server/src/server.ts` (`deliverAnonymous`) | low |
+| 6.9.7 | (open issue) | A blob lives at the home that received it; if that home is down its attachments can't be fetched | `packages/server/src/server.ts` | medium |
+| 6.9.7 | (open issue) | A sender can't tell that its own submitting home accepted a message and then dropped it | `packages/lib/src/client.ts` (`call`) | medium |
 

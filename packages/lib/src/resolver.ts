@@ -1,3 +1,4 @@
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolveTxt } from 'node:dns/promises';
 import type { DomainPolicy } from './directory';
 import { HomeRegistry, failoverFetch } from './homes';
@@ -7,6 +8,42 @@ export interface Resolver {
   policy(domain: string): Promise<DomainPolicy>;
   /** `base`, but falling back across a domain's homes (Section 6.8.4). Resolvers that know no homes leave it out. */
   failoverFetch?(base?: typeof fetch): typeof fetch;
+}
+
+/** Where a resolver keeps the highest operators `seq` it has seen for each domain (Section 6.9.2). */
+export interface SeqStore {
+  get(domain: string): number;
+  set(domain: string, seq: number): void;
+}
+
+export class MemorySeqStore implements SeqStore {
+  private readonly seqs = new Map<string, number>();
+
+  get(domain: string): number {
+    return this.seqs.get(domain) ?? 0;
+  }
+
+  set(domain: string, seq: number): void {
+    this.seqs.set(domain, seq);
+  }
+}
+
+/** The highest sequence numbers in a JSON file, so a restart can't be handed an older statement. */
+export class FileSeqStore implements SeqStore {
+  private seqs: Record<string, number> = {};
+
+  constructor(private readonly path: string) {
+    if (existsSync(path)) this.seqs = JSON.parse(readFileSync(path, 'utf8')) as Record<string, number>;
+  }
+
+  get(domain: string): number {
+    return this.seqs[domain] ?? 0;
+  }
+
+  set(domain: string, seq: number): void {
+    this.seqs[domain] = seq;
+    writeFileSync(this.path, JSON.stringify(this.seqs));
+  }
 }
 
 export class NotSignetDomainError extends Error {
@@ -23,8 +60,8 @@ abstract class CachingResolver implements Resolver {
   private readonly cache = new Map<string, { policy: DomainPolicy; until: number }>();
   /** The homes of every domain this resolver has seen, so a fetch aimed at one can fall back to the others. */
   readonly homes = new HomeRegistry();
-  /** The highest operators statement seen for each domain; a lower one is refused (Section 6.9.2). */
-  private readonly seqs = new Map<string, number>();
+  /** The highest operators statement seen for each domain; a lower one is refused (Section 6.9.2). Set a file-backed store to survive restarts. */
+  seqStore: SeqStore = new MemorySeqStore();
 
   constructor(protected readonly fetchImpl: typeof fetch = fetch) {}
 
@@ -66,8 +103,8 @@ abstract class CachingResolver implements Resolver {
     try {
       const homes = checkOperators(policy.operators, domain, policy.domainKey);
       const seq = policy.operators.body.seq;
-      if (seq < (this.seqs.get(domain) ?? 0)) return false;
-      this.seqs.set(domain, seq);
+      if (seq < this.seqStore.get(domain)) return false;
+      this.seqStore.set(domain, seq);
       policy.homes = homes.map((home) => home.url);
       policy.server = homes[0].url;
       // The first home's gateway, from the owner's statement rather than the operator's word.

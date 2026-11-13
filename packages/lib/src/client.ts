@@ -45,6 +45,7 @@ import type { IssuerKey } from './privacypass';
 import { blindTokenRequest, finalizeToken } from './privacypass';
 import type { Introduction, SealedRequest, SignedRequest } from './request';
 import { createIntroduction, createRequest, myCopy, openRequest } from './request';
+import { homeGateway } from './operators';
 import type { Resolver } from './resolver';
 import { NotSignetDomainError } from './resolver';
 import { DELIVERY_LABEL, TOKEN_EPOCHS_KEPT, deliveryTokenHash, randomToken } from './sealed';
@@ -139,6 +140,8 @@ export type SignetEvent =
   | { kind: 'key-changed'; principal: string; how: 'rotated' | 'recovered'; from: string; to: string }
   /** A domain told this client's server one thing about an address and anonymous lookups another. */
   | { kind: 'directory-alert'; principal: string; alert: string }
+  /** A home of this client's domain still lacks an item that others delivered, after the grace period: it may be withholding mail (Section 6.9.6). */
+  | { kind: 'home-missing'; home: string; itemId: string }
   | { kind: 'error'; item: MailItem; error: string };
 
 export interface ThreadMeta {
@@ -153,6 +156,10 @@ export interface ClientSnapshot {
   cursors: Record<string, number>;
   /** Ids of mail already processed, so an item that came from more than one home is handled once (Section 6.9.6). */
   seen: string[];
+  /** Registrations a home missed because it was down, repeated at the next sync (Section 6.9.6). */
+  pending: { home: string; path: string; body: unknown }[];
+  /** Items seen at some homes but not yet all: which homes had each, and when it first showed up. */
+  homeWatch: Record<string, { homes: string[]; at: number; alerted?: boolean }>;
   pins: Record<string, string>;
   admission: AdmissionPolicy;
   mls: string;
@@ -212,6 +219,11 @@ export interface SignetClientOptions {
    * owner's check of what strangers see. Without one those lookups go direct, from this client's address.
    */
   ohttpRelay?: string;
+  /**
+   * How long an item may be missing from one home, when others have it, before the client reports that home
+   * (`home-missing`). Defaults to ten minutes, longer than a sender's first retry.
+   */
+  homeGraceMs?: number;
 }
 
 export interface MonitorReport {
@@ -241,6 +253,8 @@ const emptySnapshot = (): ClientSnapshot => ({
   cursor: 0,
   cursors: {},
   seen: [],
+  pending: [],
+  homeWatch: {},
   pins: {},
   admission: { contacts: [], trustedDomains: [] },
   mls: '',
@@ -264,6 +278,9 @@ const emptySnapshot = (): ClientSnapshot => ({
 
 const SENT_IDS_KEPT = 1000;
 const SEEN_IDS_KEPT = 5000;
+const PENDING_KEPT = 200;
+const WATCH_KEPT = 500;
+const WATCH_MAX_AGE_MS = 24 * 3_600_000;
 
 const joinerTag = (clientId: string): string => sha256(`signet joiner ${clientId}`);
 const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }): WelcomePayload => ({
@@ -844,14 +861,18 @@ export class SignetClient {
   /** Pull new mail from the home server and turn it into events. Bad items become error events. */
   async sync(): Promise<SignetEvent[]> {
     this.directories.clear();
+    await this.flushPending();
     await this.pullContacts();
     const events: SignetEvent[] = [];
+    let lastAnswered: string[] = [];
     // Joining a thread registers its token, which can release deliveries the server parked; fetch again for those.
     for (let round = 0; round < 3; round += 1) {
       this.released = 0;
       const seen = new Set(this.state.seen);
-      for (const { home, items } of await this.readMailboxes()) {
+      const mailboxes = await this.readMailboxes();
+      for (const { home, items } of mailboxes) {
         for (const item of items) {
+          this.watch(item.id, home);
           this.state.cursors[home] = item.seq;
           this.state.cursor = item.seq;
           if (seen.has(item.id)) continue;
@@ -865,8 +886,10 @@ export class SignetClient {
           }
         }
       }
+      lastAnswered = mailboxes.map((mailbox) => mailbox.home);
       if (this.released === 0) break;
     }
+    events.push(...(await this.laggingHomes(lastAnswered)));
     await this.topUpKeyPackages();
     events.push(...this.state.keyChanges.splice(0), ...this.state.directoryAlerts.splice(0));
     return events;
@@ -1187,10 +1210,24 @@ export class SignetClient {
     const { local, domain } = splitAddress(who);
     const policy = await this.resolver.policy(domain);
     const path = `/v0/directory/${encodeURIComponent(local)}`;
-    if (!this.ohttpRelay || !policy.ohttp) return (await this.getJson(`${policy.server}${path}`)) as DirectoryEntry;
-    const inner = encodeRequest({ method: 'GET', scheme: 'https', authority: new URL(policy.server).host, path, headers: [], body: Buffer.alloc(0) });
-    const { message, pending } = await encapsulateRequest(policy.ohttp.keys, inner);
-    const relayed = await this.fetchImpl(`${this.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}`, {
+    // Any home of the domain can answer; try them in the policy's order.
+    let failure: unknown;
+    for (const base of policy.operators ? (policy.homes ?? [policy.server]) : [policy.server]) {
+      try {
+        return await this.anonymousAt(base, domain, policy, path);
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
+  }
+
+  private async anonymousAt(base: string, domain: string, policy: DomainPolicy, path: string): Promise<DirectoryEntry> {
+    const gateway = homeGateway(policy, base);
+    if (!this.ohttpRelay || !gateway) return (await this.getJson(`${base}${path}`)) as DirectoryEntry;
+    const inner = encodeRequest({ method: 'GET', scheme: 'https', authority: new URL(base).host, path, headers: [], body: Buffer.alloc(0) });
+    const { message, pending } = await encapsulateRequest(gateway.keys, inner);
+    const relayed = await this.fetchImpl(`${this.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}&home=${encodeURIComponent(base)}`, {
       method: 'POST',
       headers: { 'content-type': OHTTP_REQUEST_TYPE },
       body: message,
@@ -1484,9 +1521,76 @@ export class SignetClient {
     throw failure;
   }
 
-  /** A call to every home, for state each of them keeps: tokens, contacts and grants. Throws only if every home failed. */
+  /**
+   * A call to every home, for state each of them keeps: tokens, contacts and grants. A home that fails gets the
+   * call again at the next sync. Throws only if every home failed.
+   */
   private async callEach(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown[]> {
-    return this.eachHome((home) => this.request(home, method, path, body));
+    const results: unknown[] = [];
+    const failed: string[] = [];
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        results.push(await this.request(home, method, path, body));
+      } catch (error) {
+        failed.push(home);
+        failure = error;
+      }
+    }
+    if (results.length === 0) throw failure;
+    if (method === 'POST' && body !== undefined && !(body instanceof Uint8Array)) {
+      for (const home of failed) this.state.pending.push({ home, path, body });
+      this.state.pending = this.state.pending.slice(-PENDING_KEPT);
+    }
+    return results;
+  }
+
+  /** Repeat registrations that a home missed, oldest first, and keep the ones that still can't be delivered. */
+  private async flushPending(): Promise<void> {
+    if (this.state.pending.length === 0) return;
+    const stuck: ClientSnapshot['pending'] = [];
+    const blocked = new Set<string>();
+    for (const entry of this.state.pending) {
+      if (blocked.has(entry.home)) {
+        stuck.push(entry);
+        continue;
+      }
+      try {
+        await this.request(entry.home, 'POST', entry.path, entry.body);
+      } catch {
+        blocked.add(entry.home);
+        stuck.push(entry);
+      }
+    }
+    this.state.pending = stuck;
+  }
+
+  /** Note that `home` had the item, for comparing homes (Section 6.9.6). */
+  private watch(id: string, home: string): void {
+    const entry = (this.state.homeWatch[id] ??= { homes: [], at: Date.now() });
+    if (!entry.homes.includes(home)) entry.homes.push(home);
+  }
+
+  /** Homes that answered this sync but still lack an item others delivered, once the grace period has passed. */
+  private async laggingHomes(answered: string[]): Promise<SignetEvent[]> {
+    const events: SignetEvent[] = [];
+    const bases = await this.homeBases();
+    const now = Date.now();
+    const grace = this.options.homeGraceMs ?? 600_000;
+    for (const [id, entry] of Object.entries(this.state.homeWatch)) {
+      // Done once every home has it; forgotten once too old to matter.
+      if (bases.every((home) => entry.homes.includes(home)) || now - entry.at > WATCH_MAX_AGE_MS) {
+        delete this.state.homeWatch[id];
+        continue;
+      }
+      if (!entry.alerted && now - entry.at >= grace) {
+        entry.alerted = true;
+        for (const home of answered) if (!entry.homes.includes(home)) events.push({ kind: 'home-missing', home, itemId: id });
+      }
+    }
+    const ids = Object.keys(this.state.homeWatch);
+    for (const id of ids.slice(0, Math.max(0, ids.length - WATCH_KEPT))) delete this.state.homeWatch[id];
+    return events;
   }
 }
 

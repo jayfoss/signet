@@ -143,7 +143,8 @@ export class Testbed {
     const url = String(input);
     for (const domain of this.broken) {
       const direct = url.startsWith(`${this.urls.get(domain)}/v0/deliver`);
-      const relayed = url === `${this.relay.url}/v0/relay?domain=${encodeURIComponent(domain)}`;
+      // The relay URL may carry more parameters, such as the home a delivery is for.
+      const relayed = url.startsWith(`${this.relay.url}/v0/relay?domain=${encodeURIComponent(domain)}`);
       if (direct || relayed) return Promise.resolve(new Response('down for maintenance', { status: 503 }));
     }
     return fetch(input, init);

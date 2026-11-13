@@ -1,8 +1,22 @@
 import { createServer } from 'node:net';
 import type { SignetEvent } from '@signet/lib';
-import { Identity, SignetClient, StaticResolver, encodeKeyConfig, generateGatewayKey, generateSigningKey, generateVrfKey, homeAuthHeaders, signOperators } from '@signet/lib';
+import {
+  Identity,
+  SignetClient,
+  StaticResolver,
+  clientAuthHeaders,
+  encodeKeyConfig,
+  generateGatewayKey,
+  generateSigningKey,
+  generateVrfKey,
+  homeAuthHeaders,
+  parseSignetHeader,
+  signOperators,
+  signOrgClaim,
+  verifyAttestation,
+} from '@signet/lib';
 import { TransparencyLogServer } from '../log-server';
-import { LocalRegistrar } from '../registrar';
+import { HttpRegistrar, LocalRegistrar, RegistrarServer } from '../registrar';
 import { RelayServer } from '../relay-server';
 import { SignetServer } from '../server';
 
@@ -42,9 +56,13 @@ async function world() {
   // Calls to a blocked origin get a 503, as if that operator were down; a delivery-blocked one refuses only deliveries.
   const blocked = new Set<string>();
   const deliveryBlocked = new Set<string>();
+  // A dropping home says it accepted a delivery and keeps nothing.
+  const dropping = new Set<string>();
   const gate = ((input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
-    const down = blocked.has(url.origin) || (deliveryBlocked.has(url.origin) && url.pathname.startsWith('/v0/deliver'));
+    const delivery = url.pathname.startsWith('/v0/deliver');
+    if (dropping.has(url.origin) && delivery) return Promise.resolve(new Response(JSON.stringify({ unknown: [], rejected: [], queued: [] }), { status: 200 }));
+    const down = blocked.has(url.origin) || (deliveryBlocked.has(url.origin) && delivery);
     return down ? Promise.resolve(new Response('down', { status: 503 })) : fetch(input, init);
   }) as typeof fetch;
 
@@ -63,14 +81,18 @@ async function world() {
     notAfter: '2099-01-01T00:00:00.000Z',
     homes: homeUrls.map((url, i) => ({ url, key: homeKeys[i].publicKey, ohttp: { gateway: `${url}/v0/ohttp`, keys: encodeKeyConfig(gatewayKeys[i]) } })),
   });
-  const registrar = new LocalRegistrar({ domain: DOMAIN, domainKey: owner, log, vrfKey });
+  // The owner runs the registrar as its own service; the homes only call it.
+  const registrarLogic = new LocalRegistrar({ domain: DOMAIN, domainKey: owner, log, vrfKey });
+  const registrarServer = new RegistrarServer({ domain: DOMAIN, registrar: registrarLogic, operators, domainPublicKey: owner.publicKey });
+  await registrarServer.listen();
+  const registrarFor = (i: number) => new HttpRegistrar({ url: registrarServer.url, domain: DOMAIN, homeKey: homeKeys[i] });
   const home = (i: number) =>
     new SignetServer({
       domain: DOMAIN,
       homeKey: homeKeys[i],
       operators,
       domainPublicKey: owner.publicKey,
-      registrar,
+      registrar: registrarFor(i),
       resolver,
       log,
       vrfKey,
@@ -92,7 +114,9 @@ async function world() {
   const bobKeys = bob.enrollClient({ kind: 'device', label: 'Phone', scopes: ['read:*', 'send', 'admit'] });
   const jerzy = Identity.create('jerzy@beta.test');
   const jerzyKeys = jerzy.enrollClient({ kind: 'device', label: 'Phone', scopes: ['read:*', 'send', 'admit'] });
-  // The owner enrolls each address at every home.
+  // The owner approves each address and enrolls it at every home.
+  registrarServer.approve(`alice@${DOMAIN}`);
+  registrarServer.approve(`bob@${DOMAIN}`);
   for (const server of homes) {
     await server.enroll(alice.publication());
     await server.enroll(bob.publication());
@@ -100,7 +124,8 @@ async function world() {
   await beta.enroll(jerzy.publication());
 
   const trustedLogs = [log];
-  const make = (keys: typeof aliceKeys) => new SignetClient(keys, resolver, { trustedLogs, keyPackageTarget: 3 });
+  const make = (keys: typeof aliceKeys, extra: Partial<ConstructorParameters<typeof SignetClient>[2]> = {}) =>
+    new SignetClient(keys, resolver, { trustedLogs, keyPackageTarget: 3, fetchImpl: gate, ...extra });
   const clients = { alice: make(aliceKeys), bob: make(bobKeys), jerzy: make(jerzyKeys) };
   await Promise.all(Object.values(clients).map((client) => client.ready()));
 
@@ -111,17 +136,23 @@ async function world() {
     homeKeys,
     beta,
     relay,
+    make,
+    dropping,
     blocked,
     deliveryBlocked,
     owner,
     log,
-    registrar,
+    aliceKeys,
+    registrarServer,
+    registrarFor,
+    registrar: registrarLogic,
     operators,
     clients,
     has,
     close: async () => {
       await Promise.all([...homes, beta].map((server) => server.close().catch(() => undefined)));
       await relay.close();
+      await registrarServer.close();
       await logServer.close();
     },
   };
@@ -183,6 +214,33 @@ describe('a domain run by three operators who share nothing', () => {
     expect(kinds(await w.clients.bob.sync())).toEqual(['request']);
   });
 
+  it('repeats a registration a home missed, so it takes sealed mail again', async () => {
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Thread', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    const [incoming] = await w.clients.alice.sync();
+    if (incoming?.kind !== 'request') throw new Error('expected a request');
+    // Alice joins a thread while the third operator is down: it never hears of her delivery token.
+    w.blocked.add(w.homeUrls[2]);
+    const thread = await w.clients.alice.accept(incoming.request);
+    w.blocked.delete(w.homeUrls[2]);
+    await w.clients.alice.sync();
+    await w.clients.jerzy.sync();
+    const before = w.has(w.homes[2], 'alice');
+    await w.clients.jerzy.send(thread, { subject: 'Thread', text: 'Anyone there?' });
+    // Without the repeat, the third home would park the message instead of keeping it in her mailbox.
+    await until(() => w.has(w.homes[2], 'alice') === before + 1);
+  });
+
+  it('tells the client when one operator says it took mail but kept nothing', async () => {
+    w.dropping.add(w.homeUrls[1]);
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Dropped', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    const watching = w.make(w.aliceKeys, { homeGraceMs: 50, snapshot: w.clients.alice.snapshot() });
+    expect(kinds(await watching.sync())).toEqual(['request']);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const events = await watching.sync();
+    expect(events).toEqual([{ kind: 'home-missing', home: w.homeUrls[1], itemId: expect.any(String) }]);
+    expect(await watching.sync()).toEqual([]);
+  });
+
   it('sends a sealed message to each home through that home\'s own gateway', async () => {
     await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Sealed', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
     const [incoming] = await w.clients.alice.sync();
@@ -199,6 +257,55 @@ describe('a domain run by three operators who share nothing', () => {
     expect(w.relay.forwarded - forwarded).toBeGreaterThanOrEqual(3);
     const events = await w.clients.alice.sync();
     expect(events.filter((event) => event.kind === 'message')).toHaveLength(1);
+  });
+
+  it('lets a home reach the registrar only as the owner allows', async () => {
+    // A home can't create an account the owner didn't approve.
+    const stranger = Identity.create(`stranger@${DOMAIN}`);
+    stranger.enrollClient({ kind: 'device', label: 'Phone', scopes: ['read:*', 'send'] });
+    await expect(w.homes[0].enroll(stranger.publication())).rejects.toThrow('not been approved');
+
+    // Nor swap in a different log for an address the registrar has bound.
+    const impostor = Identity.create(`alice@${DOMAIN}`);
+    impostor.enrollClient({ kind: 'device', label: 'Phone', scopes: ['read:*', 'send'] });
+    await expect(w.registrarFor(0).bind(impostor.publication())).rejects.toThrow('extend');
+
+    // Nor release an address; only the owner does.
+    await expect(w.registrarFor(0).unbind(`alice@${DOMAIN}`)).rejects.toThrow('only the domain owner');
+
+    // And a key the owner didn't list isn't a home.
+    const unlisted = new HttpRegistrar({ url: w.registrarServer.url, domain: DOMAIN, homeKey: generateSigningKey() });
+    await expect(unlisted.unbind(`alice@${DOMAIN}`)).rejects.toThrow('signed by a home the owner listed');
+  });
+
+  it('serves only claims the owner signed, and attests mail only for a request the registrar can check', async () => {
+    const principal = `alice@${DOMAIN}`;
+    // A home without the domain key keeps claims the owner signed, and turns away anything else.
+    const claim = signOrgClaim(w.owner, principal, 'team:corporate');
+    await expect(w.homes[0].setClaims('alice', ['team:corporate'])).rejects.toThrow('does not hold the domain key');
+    await expect(w.homes[0].setClaims('alice', [JSON.stringify(signOrgClaim(generateSigningKey(), principal, 'team:corporate'))])).rejects.toThrow('does not hold the domain key');
+    await w.homes[0].setClaims('alice', [JSON.stringify(claim)]);
+    const headers = clientAuthHeaders(principal, w.aliceKeys.cert.clientId, w.aliceKeys.signing, 'GET', '/v0/claims', '');
+    const served = (await (await fetch(`${w.homes[0].url}/v0/claims`, { headers })).json()) as { claims: unknown[] };
+    expect(served.claims).toEqual([claim]);
+
+    // The registrar attests outgoing plain email for a request alice's client signed.
+    const to = ['carol@example.com'];
+    const header = await w.clients.alice.signetHeader({ to, subject: 'Hello' });
+    expect(verifyAttestation(parseSignetHeader(header) as NonNullable<ReturnType<typeof parseSignetHeader>>, { from: principal, to, subject: 'Hello' }, w.owner.publicKey)).toBe(true);
+
+    // A home can't use that proof for different mail, can't use it twice, and can't make one up.
+    const proofFor = (subject: string, signer = w.aliceKeys.signing) => {
+      const body = JSON.stringify({ to, subject });
+      const signed = clientAuthHeaders(principal, w.aliceKeys.cert.clientId, signer, 'POST', '/v0/legacy/attest', body);
+      return { method: 'POST', path: '/v0/legacy/attest', body, headers: signed };
+    };
+    const ask = (subject: string, proof: ReturnType<typeof proofFor>) => w.registrarFor(0).attest({ principal, to, subject, server: w.homeUrls[0], proof });
+    await expect(ask('Two', proofFor('One'))).rejects.toThrow('different mail');
+    const once = proofFor('Once');
+    await ask('Once', once);
+    await expect(ask('Once', once)).rejects.toThrow('already used');
+    await expect(ask('Fake', proofFor('Fake', generateSigningKey()))).rejects.toThrow('signature');
   });
 
   it('refuses what an operator is not allowed to do', async () => {

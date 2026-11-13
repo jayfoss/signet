@@ -71,6 +71,7 @@ import {
   signNotEnrolled,
   splitAddress,
   verifyClientAuth,
+  verifyOrgClaim,
   verifyDomainCall,
   homeGroups,
   homeGateway,
@@ -520,13 +521,36 @@ export class SignetServer implements LegacyInbox {
   }
 
   /** The organisation's admin sets what it vouches for about a user; its clients fetch them signed. */
-  setClaims(local: string, claims: string[]): void {
+  async setClaims(local: string, claims: string[]): Promise<void> {
+    // Without the domain key a home keeps only claims the owner has already signed, and checks each one.
+    if (!this.options.domainKey) for (const claim of claims) this.checkSignedClaim(`${local}@${this.options.domain}`, claim);
     this.store.setClaims(local, claims);
+    await this.cluster?.durable();
   }
 
   private setListing(local: string, unlisted: boolean): void {
     if (unlisted) this.unlisted.add(local);
     else this.unlisted.delete(local);
+  }
+
+  private signedClaim(principal: string, claim: string): ReturnType<typeof signOrgClaim> | undefined {
+    try {
+      const parsed = JSON.parse(claim) as ReturnType<typeof signOrgClaim>;
+      const policy = { domain: this.options.domain, domainKey: this.options.domainKey?.publicKey ?? (this.options.domainPublicKey as string) } as DomainPolicy;
+      return verifyOrgClaim(parsed, principal, policy) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private checkSignedClaim(principal: string, claim: string): void {
+    if (!this.signedClaim(principal, claim)) throw new HttpError(400, 'this home does not hold the domain key, so it keeps only unexpired claims the domain owner has signed');
+  }
+
+  /** A stored claim as the client gets it: one the owner signed, if it is still current; otherwise a plain one, signed with the domain key. */
+  private orgClaimFor(principal: string, claim: string): ReturnType<typeof signOrgClaim>[] {
+    if (claim.startsWith('{')) return [this.signedClaim(principal, claim)].filter((signed) => signed !== undefined) as ReturnType<typeof signOrgClaim>[];
+    return [signOrgClaim(this.domainSigner(), principal, claim)];
   }
 
   /** Whether a request was sealed to this domain's intake rather than to a user's own keys. */
@@ -677,7 +701,7 @@ export class SignetServer implements LegacyInbox {
     if (method === 'POST' && path === '/v0/pairing') return this.openPairing(client);
     if (method === 'GET' && path === '/v0/claims') {
       const local = splitAddress(client.principal).local;
-      return { claims: this.store.claims(local).map((claim) => signOrgClaim(this.domainSigner(), client.principal, claim)) };
+      return { claims: this.store.claims(local).flatMap((claim) => this.orgClaimFor(client.principal, claim)) };
     }
     if (method === 'POST' && pairing && pairing[2] === 'a') {
       if (this.livePairing(pairing[1]).principal !== client.principal) throw new HttpError(403, 'not your pairing slot');
@@ -721,10 +745,10 @@ export class SignetServer implements LegacyInbox {
       this.store.putBlob(id, request.body);
       return { id, url: `${this.http.publicUrl}/v0/blobs/${id}` };
     }
-    if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request));
+    if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request), request);
     if (method === 'POST' && path === '/v0/legacy/attest') {
       const { to, subject } = json<{ to: string[]; subject: string }>(request);
-      return { header: this.attestHeader(client, to, subject) };
+      return { header: await this.attestHeader(client, to, subject, request) };
     }
     if (method === 'GET' && path === '/v0/issuer') {
       if (!this.options.issuer) throw new HttpError(501, 'this server has no Privacy Pass issuer');
@@ -1245,17 +1269,24 @@ export class SignetServer implements LegacyInbox {
    * Vouch, with the domain key, that this user is sending plain email with this From, To and Subject.
    * Used for mail this server sends and for mail the client sends itself (Gmail mode).
    */
-  private attestHeader(client: ClientCert, to: string[], subject: string): string {
+  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest): Promise<string> {
     if (!hasScope(client, 'send')) throw new HttpError(403, `${client.label} may not send`);
     const user = this.store.user(splitAddress(client.principal).local);
     if (!user) throw new HttpError(404, 'sender is not enrolled');
     if (!Array.isArray(to) || to.length === 0 || typeof subject !== 'string') throw new HttpError(400, 'to and subject are required');
+    // Without the domain key, the registrar attests, shown the client's own signed request.
+    if (!this.options.domainKey && this.options.registrar) {
+      const names = ['signet-principal', 'signet-client', 'signet-ts', 'signet-nonce', 'signet-sig'];
+      const headers = Object.fromEntries(names.map((name) => [name, header(request.headers, name)]));
+      return this.options.registrar.attest({ principal: client.principal, to, subject, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
+    }
     return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject });
   }
 
   private async sendLegacy(
     client: ClientCert,
     mail: { to: string[]; subject: string; text: string; humansOnly?: boolean; attachments?: { filename: string; contentType: string; content: string }[] },
+    request: HttpRequest,
   ): Promise<{ messageId: string }> {
     if (!hasScope(client, 'send')) throw new HttpError(403, `${client.label} may not send`);
     if (!this.options.outbound) throw new HttpError(501, 'this server does not send plain email');
@@ -1266,7 +1297,7 @@ export class SignetServer implements LegacyInbox {
       to: mail.to,
       subject: mail.subject,
       text: mail.text,
-      headers: { Signet: this.attestHeader(client, mail.to, mail.subject), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
+      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
       attachments: mail.attachments ?? [],
     });
     return { messageId };

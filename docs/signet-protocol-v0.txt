@@ -3321,9 +3321,16 @@ Experimental           Signet Protocol, Version 0          November 2026
        as its own. Witnesses grant votes the same way and never
        stand as candidates.
 
-   4.  An election starts when a home hears nothing from a primary for
-       a random time between T and 2T. T is 1000 milliseconds unless
-       configured. The primary sends a heartbeat every T/5.
+   4.  A home that hears nothing from a primary for a random time
+       between T and 2T first asks the others for a pre-vote: would
+       they vote for it in the next term? A replica grants one only if
+       the candidate's log is at least as up to date as its own, it
+       has not heard from a primary for T, and it is not a primary
+       itself. A pre-vote changes nothing on the replica that grants
+       it. Only if a majority grants does the home raise its term and
+       start an election, so a replica that is merely cut off does
+       not force an election when it returns. T is 1000 milliseconds
+       unless configured. The primary sends a heartbeat every T/5.
 
    5.  An entry is committed once the primary has stored it on a
        majority of replicas and it, or a later entry, is from the
@@ -3339,22 +3346,42 @@ Experimental           Signet Protocol, Version 0          November 2026
        or answer. Every answer a primary gives to a client includes the
        header Signet-Term with its term.
 
-   Replicas call each other at two routes. Both are POST, send JSON, and
-   are authenticated like calls between servers (Section 4.6) with
-   the domain key. The body names the sender's identifier, and a
-   replica rejects a call whose sender is not in its configured
-   membership.
+   8.  A replica MAY compact its log. It takes a snapshot of its
+       state as of the last entry it applied, keeps the snapshot with
+       the index and term of that entry, and drops the entries it
+       covers. A snapshot is only taken when the state holds nothing
+       that is not committed, so a primary waits until its own changes
+       are committed. A witness applies nothing; its snapshot is only
+       an index and a term. The snapshot is written durably before the
+       log is cut down to match it.
+
+   9.  A primary that needs to send a replica entries it has dropped
+       sends its snapshot instead. The replica discards its log and
+       state and takes the snapshot, then receives the entries after
+       it. A replica that restarts loads its snapshot before it
+       applies anything else.
+
+   Replicas call each other at three routes. All are POST, send JSON,
+   and are authenticated like calls between servers (Section 4.6)
+   with the key the replicas of a home share. The body names the
+   sender's identifier, and a replica rejects a call whose sender is
+   not in its configured membership. It also rejects a call whose
+   signature it has already seen.
 
    +=====================+===========================================+
    | Route               | Meaning                                   |
    +=====================+===========================================+
-   | /v0/cluster/vote    | { term, candidate, lastIndex, lastTerm }  |
-   |                     | → { term, granted }                       |
+   | /v0/cluster/vote    | { term, candidate, lastIndex, lastTerm,   |
+   |                     | pre? } → { term, granted }. With pre set  |
+   |                     | it is a pre-vote.                         |
    +---------------------+-------------------------------------------+
    | /v0/cluster/append  | { term, leader, prevIndex, prevTerm,      |
    |                     | entries, commit } → { term, success,      |
    |                     | matchIndex }. Empty entries make it a     |
    |                     | heartbeat.                                |
+   +---------------------+-------------------------------------------+
+   | /v0/cluster/        | { term, leader, index, snapshotTerm,      |
+   | snapshot            | data } → { term, matchIndex }             |
    +---------------------+-------------------------------------------+
 
 6.8.7.  Failure Behaviour
@@ -3420,10 +3447,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 6.8.10.  Open Issues
 
-   *  *Membership changes and compaction.* Version 0 has fixed
-      membership and an ever-growing log. Replacing a replica keeps
-      its identifier. Adding or removing one, and snapshotting the
-      log, are not specified.
+   *  *Membership changes.* Version 0 has fixed membership.
+      Replacing a replica keeps its identifier. Adding or removing
+      one is not specified.
 
    *  *No follower reads.* Standbys could answer reads with a note of
       how far they have applied. Version 0 sends all client traffic to
@@ -3494,7 +3520,8 @@ Experimental           Signet Protocol, Version 0          November 2026
             { "url": "https://home.alpha.example",
               "key": "b64u Ed25519 public key",
               "replicas": ["https://r2.alpha.example"],
-              "ohttp": { "gateway": "https://home.alpha.example/v0/ohttp",
+              "ohttp": {
+                "gateway": "https://home.alpha.example/v0/ohttp",
                 "keys": "b64u key configuration" } },
             { "url": "https://home.beta.example",
               "key": "b64u Ed25519 public key" } ] },
@@ -3505,7 +3532,8 @@ Experimental           Signet Protocol, Version 0          November 2026
    +==========+========+=============================================+
    | seq      | number | Increases with every statement. A client    |
    |          |        | that holds a higher seq for the domain MUST |
-   |          |        | refuse a lower one.                         |
+   |          |        | refuse a lower one, and SHOULD keep the     |
+   |          |        | highest seq across restarts.                |
    +----------+--------+---------------------------------------------+
    | notAfter | string | When the statement expires. A client MUST   |
    |          |        | refuse an expired statement. This is how an |
@@ -3584,14 +3612,62 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  Attesting legacy mail (Section 13.2.2).
 
-   A home that needs one of these asks the owner's registrar. The
-   registrar checks the user-signed publication for itself, as a home
-   does today, and returns the binding or makes the log append. A home
-   never gives the registrar a leaf or a binding to sign. How a home
-   reaches the registrar is not specified.
+   A home that needs one of these asks the owner's registrar. A home
+   never gives the registrar a leaf or a binding to sign.
 
-   Until the registrar covers it, a home in this mode does not offer
-   organisation claims or legacy-mail attestation.
+   The registrar is a service the owner runs. A home calls it with a
+   POST, signed with its home key as Section 6.9.3 describes. The
+   registrar accepts a call only from a home in the owner's current
+   statement and refuses a signature it has already seen.
+
+   +=======================+=========================================+
+   | Route                 | Meaning                                 |
+   +=======================+=========================================+
+   | /v0/registrar/bind    | A publication (Section 3.10) →          |
+   |                       | the domain binding. The registrar       |
+   |                       | checks the log, card and view itself,   |
+   |                       | appends a leaf to the transparency log  |
+   |                       | if the card or view changed, and signs  |
+   |                       | the binding.                            |
+   +-----------------------+-----------------------------------------+
+   | /v0/registrar/unbind  | { principal } → {}. Appends an          |
+   |                       | unbound leaf.                           |
+   +-----------------------+-----------------------------------------+
+   | /v0/registrar/attest  | { principal, to, subject, server,       |
+   |                       | proof } → { header }. The attested      |
+   |                       | Signet header for plain email.          |
+   +-----------------------+-----------------------------------------+
+
+   The registrar enforces these rules, so that a hostile home gets
+   nothing from it that it could not already do for its own users:
+
+   *  It binds a new address only after the owner has approved that
+      address. A home cannot create an account.
+
+   *  It remembers the account log of every address it has bound. A
+      later publication must extend that log, and any key change in
+      it must be one the log's own signatures allow. A home cannot
+      swap in a different log or identity key.
+
+   *  It releases an address only when the owner's rule allows it.
+      With no rule, no home can.
+
+   *  It attests mail only for a request one of the user's own clients
+      signed. proof is that client's own request to its home, passed
+      on unchanged: the method, path, body and the signet-principal,
+      signet-client, signet-ts, signet-nonce and signet-sig headers. The
+      registrar checks, against the log it bound, that the client is
+      active and may send, that the signature verifies and has not been
+      used before, that the path is /v0/legacy/attest or
+      /v0/legacy/send, and that the body names the same recipients and
+      subject as the request. A home cannot attest mail nobody asked
+      to send, or reuse a proof for different mail.
+
+   Organisation claims (Section 9.3.2) are signed by the owner ahead
+   of time, not by a home. The owner gives a home the signed claims,
+   and the home keeps only claims that verify under the domain key
+   for the address and have not expired. It serves them as they are.
+   The owner signs new claims before the old ones expire.
 
 6.9.5.  Delivery to Many Homes
 
@@ -3641,14 +3717,22 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    2.  Registers delivery tokens, key packages, contacts and view
        grants with every home. A home that was unreachable misses the
-       registration; clients SHOULD repeat it when the home returns.
+       registration. The client keeps it and repeats it, in order, at
+       its next sync, until the home answers. Key packages are counted
+       at each home on every sync, so a home that missed an upload
+       is topped up.
 
    3.  Expects every home to know its account. The domain owner
        enrolls an address at every home.
 
-   A client SHOULD compare what its homes return and treat a home that
-   is missing items the others hold as suspect. Version 0 does not
-   define the comparison.
+   A client compares what its homes return. It notes, for each item,
+   which homes delivered it. Once an item has been missing from a home
+   that answered for longer than a grace period, while another home
+   delivered it, the client reports that home once for that item. The
+   grace period SHOULD be longer than a sender's first retry; the
+   reference client uses ten minutes. A home that did not answer is not
+   reported, and an item every home has is forgotten. Reports are
+   evidence that a home is withholding mail or is behind, not proof.
 
 6.9.7.  Security Considerations and Open Issues
 
@@ -3659,19 +3743,16 @@ Experimental           Signet Protocol, Version 0          November 2026
       weakens the enumeration protection of the whole domain. Per-home
       keys are not specified.
 
-   *  *Withholding is not detected.* A home that quietly drops
-      what it receives, or the submitting home that drops what a
-      client gave it, is covered only because other homes hold the
-      delivery. Delivery receipts and head comparison would let a
-      client notice.
+   *  *Withholding by the sending home.* A recipient's client can
+      notice a home that holds less than the others (Section 6.9.6).
+      A sender cannot notice that its own submitting home dropped a
+      message: it is covered only because the client resends through
+      another home when a call fails. Delivery receipts would let the
+      sender notice.
 
-   *  *Registrar transport.* The wire form of Section 6.9.4 is not
-      specified, nor is how a domain with no always-on registrar
-      binds new addresses.
-
-   *  *Claims and legacy attestation.* They need the domain key
-      (Section 6.9.4) and are unavailable to a home without a
-      registrar.
+   *  *The registrar is always on.* A home needs it to bind or
+      attest. While it is down, enrollment and attested mail wait;
+      mail that is already flowing does not.
 
    *  *Attachments.* A blob lives at the home that received it.
 

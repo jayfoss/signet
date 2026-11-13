@@ -4156,6 +4156,51 @@ Experimental           Signet Protocol, Version 0          November 2026
    6.  Otherwise registers the new delivery-token hash and reports
        rekeyed with the new epoch, members and participants.
 
+   Concurrent commits.  Two members can commit from the same epoch
+   before either has seen the other's commit. There is no ordering
+   service, so every client applies the same deterministic rule and all
+   converge on one commit:
+
+   1.  Commits are compared only when they start from the same epoch of
+       the same thread. The commit with the numerically smallest
+       SHA-256 hash of its MLSMessage bytes, compared as unsigned
+       big-endian integers, wins. The hash is of the bytes as submitted,
+       so every recipient computes the same value.
+
+   2.  A client keeps the group state of the epoch before the latest
+       commit it applied, and the secrets needed to decrypt that
+       epoch's messages, until it has held the later epoch for 5
+       minutes. It then discards them.
+
+   3.  A client that receives a competing commit during that time,
+       whose hash is smaller than the commit it applied, rolls back to
+       the saved state, applies the winning commit instead, and then
+       decrypts again any message it could not read. A competing commit
+       with a larger hash is ignored.
+
+   4.  The member whose commit lost recomputes the changes it still
+       needs (Section 8.8 steps 1 to 4) against the winning epoch and,
+       if any remain, submits a new commit.
+
+   5.  A client that cannot decrypt a message from an epoch it has
+       already left MUST retain the message for the same 5 minutes
+       before reporting an error, because the winning commit can arrive
+       after the message does.
+
+   A commit that wins still has to pass the checks in steps 2 and 3
+   above. A client that has discarded its saved state and then receives
+   a competing commit for an epoch it has left MUST ignore it. If its
+   group state has diverged in a way it cannot repair, the client MUST
+   report the thread as forked and MUST NOT send further messages in it
+   until it has rejoined by a new welcome.
+
+   A member can choose its commit to have a small hash, for example by
+   varying its key package choices or proposal order, and so win a
+   race. This lets a member decide between two valid commits at the
+   same epoch, but any member can already commit, and every commit is
+   checked against the owners' contact views, so it gains nothing a
+   single commit would not.
+
 8.9.  Attachments
 
    Attachments are encrypted by the sender and uploaded as opaque blobs.
@@ -4225,12 +4270,15 @@ Experimental           Signet Protocol, Version 0          November 2026
 8.11.  Open Issues
 
    *  *Commit ordering.* MLS needs the delivery service to order commits
-      within an epoch. Signet version 0 has no ordering service: if two
-      members commit in the same epoch, members may apply different
-      commits and the group forks. A conforming implementation SHOULD
-      designate a committer per thread (for example the thread creator's
-      home server) or adopt a resolution rule, and members MUST detect
-      and recover from a fork.
+      within an epoch. Signet version 0 has none, so Section 8.8 uses a
+      deterministic tie-break (smallest commit hash wins) with a
+      5-minute rollback window. This converges only if every member
+      receives every commit inside that window. A member that is
+      offline longer than the window can end on a losing commit, and
+      messages sent in the losing epoch are lost to it. A fork that
+      exceeds the window is detected but is not repaired except by a
+      new welcome. An ordering service, or a designated committer per
+      thread, would remove the window and is left to a later version.
 
    *  *Thread ids are visible to servers.* The thread field of the
       payload and the welcome is sent in the clear. Servers can link all

@@ -93,6 +93,7 @@ import type { ClusterMember, ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
 import { DomainKeyLogger } from './domain-key-log';
 import { HttpError, JsonServer, header, json } from './http';
+import { Mix } from './mix';
 
 const optionalHeader = (headers: Record<string, string | string[] | undefined>, name: string): string | undefined => {
   const value = headers[name];
@@ -182,6 +183,11 @@ export interface SignetServerOptions {
   maxAge?: number;
   /** Proof that `domainKey` replaces an earlier key, for the policy to carry while clients may still hold the old one (Section 6.5). */
   rotation?: KeyRotation;
+  /**
+   * Hold deliveries to other domains until the end of a clock-aligned window of this many milliseconds, and send a
+   * window's deliveries together in random order of sender (Section 10.6.1). 0, the default, sends at once.
+   */
+  batchMs?: number;
   /** Seconds a mailbox item is kept at most (Section 10.7). Default 30 days; published in the policy when it differs. */
   mailboxRetentionSeconds?: number;
   /** Seconds an attachment is kept at most (Section 8.9). Default 30 days; published in the policy when it differs. */
@@ -315,6 +321,7 @@ export class SignetServer implements LegacyInbox {
 
   constructor(private readonly options: SignetServerOptions) {
     this.fetchImpl = options.resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
+    this.mix = new Mix(options.batchMs ?? 0);
     if (options.domainKey) this.keyLogger = new DomainKeyLogger({ domain: options.domain, domainKey: options.domainKey, log: options.log, rotation: options.rotation, fetchImpl: options.fetchImpl });
     if (!options.domainKey) {
       if (!options.homeKey || !options.operators || !options.domainPublicKey) throw new Error('a home without the domain key needs homeKey, operators and domainPublicKey');
@@ -426,6 +433,7 @@ export class SignetServer implements LegacyInbox {
   }
 
   private readonly keyLogger?: DomainKeyLogger;
+  private readonly mix: Mix;
 
   private get mailboxRetentionMs(): number {
     return (this.options.mailboxRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
@@ -466,6 +474,8 @@ export class SignetServer implements LegacyInbox {
 
   async close(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    // What is held goes out now, so no client is left waiting on a server that has stopped.
+    await this.mix.flush();
     this.cluster?.close();
     this.cancelRetries();
     await this.http.close();
@@ -1250,10 +1260,10 @@ export class SignetServer implements LegacyInbox {
 
   /** Deliver to a domain: here if it is this one, to its other homes as well when it has several, and by relay if it is another. */
   private async deliverToDomain(domain: string, delivery: Delivery, sender: string): Promise<DeliveryResult> {
-    if (domain !== this.options.domain) return this.relay(domain, delivery, sender);
+    if (domain !== this.options.domain) return this.mix.run(sender, () => this.relay(domain, delivery, sender));
     const local = () => (delivery.anonymousToken ? this.deliverAnonymous(delivery) : this.deliverLocal(delivery));
     const peers = this.peerHomes();
-    return peers.length === 0 ? local() : this.fanOut(domain, delivery, sender, peers, local);
+    return peers.length === 0 ? local() : this.mix.run(sender, () => this.fanOut(domain, delivery, sender, peers, local));
   }
 
   /**

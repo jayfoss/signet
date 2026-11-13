@@ -35,6 +35,8 @@ import { ClusterWitness } from './witness';
  * SIGNET_DKIM            JSON {"selector","privateKey"} to DKIM-sign outbound plain email
  * SIGNET_ISSUER          JSON {"url","key":{"name","publicKey"}} of the Privacy Pass issuer (anonymous requests)
  * SIGNET_OHTTP_RELAY     URL of the Oblivious HTTP relay for sealed and anonymous deliveries
+ * SIGNET_BATCH_MS        a home or relay holds deliveries to other servers for up to this long and sends them together
+ *                        in random order (2000; 0 sends at once). It helps only as much as there are senders to mix.
  * SIGNET_LIMITS          JSON of daily limits to change, e.g. {"requestsPerSenderPerDay":2}. Each home counts its own,
  *                        so a domain with N homes can accept up to N times a limit; an owner who minds sets it lower
  *
@@ -62,6 +64,8 @@ import { ClusterWitness } from './witness';
  * and SIGNET_OPERATORS_HOMES (JSON [{"url","key","replicas","ohttp"}]).
  */
 const env = (name: string): string | undefined => process.env[name] || undefined;
+/** How long a home or relay holds deliveries to mix them (Section 10.6.1): 2 seconds unless SIGNET_BATCH_MS says otherwise. */
+const batchMs = (): number => Number(env('SIGNET_BATCH_MS') ?? 2000);
 const jsonEnv = <T>(name: string): T | undefined => {
   const value = env(name);
   return value ? (JSON.parse(value) as T) : undefined;
@@ -150,7 +154,7 @@ async function main(): Promise<void> {
     return;
   }
   if (env('SIGNET_ROLE') === 'relay') {
-    const relay = new RelayServer(resolver());
+    const relay = new RelayServer(resolver(), undefined, batchMs());
     console.log(`signet OHTTP relay at ${await relay.listen(port, '0.0.0.0', env('SIGNET_PUBLIC_URL'))}`);
     return;
   }
@@ -209,6 +213,7 @@ async function main(): Promise<void> {
     log,
     publicUrl: env('SIGNET_PUBLIC_URL'),
     openEnrollment: env('SIGNET_OPEN_ENROLLMENT') === '1',
+    batchMs: batchMs(),
     dataDir: cluster ? undefined : dataDir(),
     intake: env('SIGNET_INTAKE') === '1',
     outbound: new OutboundSmtp(domain, { relay: jsonEnv('SIGNET_SMTP_RELAY'), dkim: jsonEnv('SIGNET_DKIM') }),

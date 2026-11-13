@@ -110,6 +110,13 @@ export interface Store {
   serverKeys(): ServerKeys | undefined;
   setServerKeys(keys: ServerKeys): void;
 
+  /**
+   * Names this mailbox store. It changes if the store is lost and started over, so a client whose cursor
+   * points into the old one notices (Section 6.9.6).
+   */
+  epoch(): string | undefined;
+  setEpoch(id: string): void;
+
   saveOutbound(entry: Outbound): void;
   removeOutbound(id: string): void;
   outbound(): Outbound[];
@@ -142,6 +149,7 @@ export class MemoryStore implements SnapshotStore {
   private readonly orgClaims = new Map<string, string[]>();
   private readonly pending = new Map<string, Outbound>();
   private keys?: ServerKeys;
+  private epochId?: string;
   replays = new ReplayCache();
   recoveryProofs = new ReplayCache();
 
@@ -161,13 +169,14 @@ export class MemoryStore implements SnapshotStore {
       orgClaims: [...this.orgClaims],
       pending: [...this.pending],
       keys: this.keys ?? null,
+      epoch: this.epochId ?? null,
       replays: this.replays.entries(),
       recoveryProofs: this.recoveryProofs.entries(),
     });
   }
 
   restore(data: unknown): void {
-    const saved = (data === null ? {} : decode(data)) as Record<string, [string, unknown][] | string[] | ServerKeys | null | undefined>;
+    const saved = (data === null ? {} : decode(data)) as Record<string, [string, unknown][] | string[] | ServerKeys | string | null | undefined>;
     const pairs = <V>(name: string): [string, V][] => (saved[name] ?? []) as [string, V][];
     this.users.clear();
     pairs<UserRecord>('users').forEach(([key, value]) => this.users.set(key, value));
@@ -198,6 +207,7 @@ export class MemoryStore implements SnapshotStore {
     this.pending.clear();
     pairs<Outbound>('pending').forEach(([key, value]) => this.pending.set(key, value));
     this.keys = (saved.keys as ServerKeys | null | undefined) ?? undefined;
+    this.epochId = (saved.epoch as string | null | undefined) ?? undefined;
     this.replays = new ReplayCache(undefined, (saved.replays ?? []) as unknown as [string, number][]);
     this.recoveryProofs = new ReplayCache(undefined, (saved.recoveryProofs ?? []) as unknown as [string, number][]);
   }
@@ -344,6 +354,14 @@ export class MemoryStore implements SnapshotStore {
 
   serverKeys(): ServerKeys | undefined {
     return this.keys;
+  }
+
+  epoch(): string | undefined {
+    return this.epochId;
+  }
+
+  setEpoch(id: string): void {
+    this.epochId = id;
   }
 
   setServerKeys(keys: ServerKeys): void {
@@ -610,6 +628,14 @@ export class SqliteStore implements Store {
   serverKeys(): ServerKeys | undefined {
     const row = this.db.prepare("SELECT value FROM settings WHERE name = 'server-keys'").get() as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as ServerKeys) : undefined;
+  }
+
+  epoch(): string | undefined {
+    return (this.db.prepare("SELECT value FROM settings WHERE name = 'epoch'").get() as { value: string } | undefined)?.value;
+  }
+
+  setEpoch(id: string): void {
+    this.db.prepare("INSERT INTO settings (name, value) VALUES ('epoch', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value").run(id);
   }
 
   setServerKeys(keys: ServerKeys): void {

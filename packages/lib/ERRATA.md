@@ -84,4 +84,6 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 | 6.9.7 | (open issue) | The VRF key, and the intake key with an intake, are given to every home | `packages/server/src/server.ts` | medium |
 | 6.9.7 | (open issue) | Each home accepts a Privacy Pass token once, so one token can be spent at each home | `packages/server/src/server.ts` (`deliverAnonymous`) | low |
 | 6.9.5 | A receipt for a delivery held for a token or queued behind a retry reaches the sender | A queued retry's receipts are delivered as a mailbox item through the home that queued it; if that home is the one withholding, the sender hears nothing and falls back to resending | `packages/server/src/server.ts` (`schedule`) | low |
+| 6.8.5 | (no protocol rule) | A blob is copied to one other home when uploaded and never copied again, so after both holders are lost it is gone; a replica that lost its disk gets blobs back only by asking the others on demand | `packages/server/src/cluster.ts` (`putBlob`, `getBlob`) | medium |
+| 6.9.7 | (open issue) | Daily limits are per home, so a hostile sending server can get up to N times a limit through an N-home domain; `SIGNET_LIMITS` lets the owner set them lower | `packages/server/src/server.ts` | low |
 

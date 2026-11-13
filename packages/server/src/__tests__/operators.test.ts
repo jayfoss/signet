@@ -147,6 +147,14 @@ async function world() {
     beta,
     relay,
     make,
+    restartHome: async (i: number) => {
+      await homes[i].close();
+      const fresh = home(i);
+      await fresh.listen(ports[i]);
+      homes[i] = fresh;
+      await fresh.enroll(alice.publication());
+      await fresh.enroll(bob.publication());
+    },
     dropping,
     submitDropped,
     forgeReceipts,
@@ -251,6 +259,51 @@ describe('a domain run by three operators who share nothing', () => {
     const events = await watching.sync();
     expect(events).toEqual([{ kind: 'home-missing', home: w.homeUrls[1], itemId: expect.any(String) }]);
     expect(await watching.sync()).toEqual([]);
+  });
+
+  it('reads a home that started over from its beginning, not from a cursor into the mailbox it lost', async () => {
+    const ask = (path: string) => fetch(`${w.homeUrls[1]}${path}`, { headers: clientAuthHeaders(`alice@${DOMAIN}`, w.aliceKeys.cert.clientId, w.aliceKeys.signing, 'GET', path, '') });
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'One', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    const { epoch, items } = (await (await ask('/v0/mailbox?after=0')).json()) as { epoch: string; items: unknown[] };
+    expect(items).toHaveLength(1);
+    // A client holding another epoch is answered from the start, whatever cursor it sends.
+    const stale = (await (await ask(`/v0/mailbox?after=99&epoch=old`)).json()) as { epoch: string; items: unknown[] };
+    expect(stale.epoch).toBe(epoch);
+    expect(stale.items).toHaveLength(1);
+
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Two', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    expect(kinds(await w.clients.alice.sync())).toEqual(['request', 'request']);
+    const before = w.clients.alice.snapshot();
+    expect(before.cursors[w.homeUrls[0]]).toBe(2);
+
+    // The first home loses everything and starts numbering from 1 again.
+    await w.restartHome(0);
+    // Alice syncs while the restarted home is still empty, so nothing comes back to move her cursor for it.
+    expect(await w.clients.alice.sync()).toEqual([]);
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Three', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    expect(w.has(w.homes[0], 'alice')).toBe(1);
+    expect(kinds(await w.clients.alice.sync())).toEqual(['request']);
+    const after = w.clients.alice.snapshot();
+    // Its epoch changed, its cursor followed it down, and its copy of the new mail was seen, so no home looks behind.
+    expect(after.epochs[w.homeUrls[0]]).not.toBe(before.epochs[w.homeUrls[0]]);
+    expect(after.cursors[w.homeUrls[0]]).toBe(1);
+    expect(after.homeWatch).toEqual({});
+  });
+
+  it('remembers processed ids for thirty days, however many there are, and reads older snapshots', async () => {
+    const day = 86_400_000;
+    const lists = w.make(w.aliceKeys, { snapshot: { ...w.clients.alice.snapshot(), seen: { 'id:ancient': Date.now() - 31 * day, 'id:recent': Date.now() - day } } });
+    await lists.sync();
+    // Past thirty days goes; an id isn't dropped just because many newer ones came after it.
+    expect(Object.keys(lists.snapshot().seen)).toEqual(['id:recent']);
+    const many = Object.fromEntries(Array.from({ length: 6_000 }, (_, i) => [`id:m${i}`, Date.now() - i]));
+    const big = w.make(w.aliceKeys, { snapshot: { ...w.clients.alice.snapshot(), seen: many } });
+    await big.sync();
+    expect(Object.keys(big.snapshot().seen)).toHaveLength(6_000);
+    // A snapshot from when this was a list still works.
+    const old = w.make(w.aliceKeys, { snapshot: { ...w.clients.alice.snapshot(), seen: ['a', 'b'] as unknown as Record<string, number> } });
+    await old.sync();
+    expect(Object.keys(old.snapshot().seen).sort()).toEqual(['id:a', 'id:b']);
   });
 
   it('proves a send reached its recipients, so nothing is left to resend', async () => {

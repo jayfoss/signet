@@ -169,8 +169,13 @@ export interface ClientSnapshot {
   cursor: number;
   /** A mailbox cursor for each home of a domain with several (their `seq` values differ), by home URL. */
   cursors: Record<string, number>;
-  /** Ids of mail already processed, so an item that came from more than one home is handled once (Section 6.9.6). */
-  seen: string[];
+  /**
+   * Mail already processed, by id and when, so an item that comes from more than one home, or comes late, is
+   * handled once (Section 6.9.6). Entries are kept for thirty days, longer than any sender retries.
+   */
+  seen: Record<string, number>;
+  /** The epoch each home last gave for its mailbox. A different one means the home started over, so its cursor is void. */
+  epochs: Record<string, string>;
   /** Registrations a home missed because it was down, repeated at the next sync (Section 6.9.6). */
   pending: { home: string; path: string; body: unknown }[];
   /** Sends no recipient home has yet proved it received, kept to send again (Section 6.9.5). */
@@ -273,7 +278,8 @@ interface MlsPayload {
 const emptySnapshot = (): ClientSnapshot => ({
   cursor: 0,
   cursors: {},
-  seen: [],
+  seen: {},
+  epochs: {},
   pending: [],
   unconfirmed: [],
   homeWatch: {},
@@ -299,7 +305,9 @@ const emptySnapshot = (): ClientSnapshot => ({
 });
 
 const SENT_IDS_KEPT = 1000;
-const SEEN_IDS_KEPT = 5000;
+/** How long, and at most how many, processed ids are remembered. */
+const SEEN_MAX_AGE_MS = 30 * 86_400_000;
+const SEEN_MAX = 200_000;
 const PENDING_KEPT = 200;
 const UNCONFIRMED_KEPT = 200;
 const WATCH_KEPT = 500;
@@ -346,6 +354,8 @@ export class SignetClient {
     private readonly options: SignetClientOptions,
   ) {
     this.state = { ...emptySnapshot(), ...structuredClone(options.snapshot ?? {}) };
+    // A snapshot from before ids carried times held them as a list.
+    if (Array.isArray(this.state.seen)) this.state.seen = Object.fromEntries((this.state.seen as string[]).map((id) => [`id:${id}`, Date.now()]));
     this.mls = new MlsSession(keys, this.state.mls);
     this.fetchImpl = resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
     this.ohttpRelay = options.ohttpRelay;
@@ -893,6 +903,7 @@ export class SignetClient {
   /** Pull new mail from the home server and turn it into events. Bad items become error events. */
   async sync(): Promise<SignetEvent[]> {
     this.directories.clear();
+    this.forgetOldIds();
     await this.flushPending();
     await this.pullContacts();
     const events: SignetEvent[] = [];
@@ -900,16 +911,16 @@ export class SignetClient {
     // Joining a thread registers its token, which can release deliveries the server parked; fetch again for those.
     for (let round = 0; round < 3; round += 1) {
       this.released = 0;
-      const seen = new Set(this.state.seen);
       const mailboxes = await this.readMailboxes();
       for (const { home, items } of mailboxes) {
         for (const item of items) {
           this.watch(item.id, home);
           this.state.cursors[home] = item.seq;
           this.state.cursor = item.seq;
-          if (seen.has(item.id)) continue;
-          seen.add(item.id);
-          this.state.seen = [...this.state.seen, item.id].slice(-SEEN_IDS_KEPT);
+          // The prefix keeps an id like __proto__ an ordinary key.
+          const key = `id:${item.id}`;
+          if (Object.hasOwn(this.state.seen, key)) continue;
+          this.state.seen[key] = Date.now();
           if (this.state.sentIds.includes(item.id)) continue;
           try {
             events.push(...(await this.process(item)));
@@ -1549,7 +1560,11 @@ export class SignetClient {
     const bases = await this.homeBases();
     return this.eachHome(async (home) => {
       const cursor = this.state.cursors[home] ?? (bases.length === 1 ? this.state.cursor : 0);
-      const { items } = (await this.request(home, 'GET', `/v0/mailbox?after=${cursor}`)) as { items: MailItem[] };
+      const known = this.state.epochs[home];
+      const { items, epoch } = (await this.request(home, 'GET', `/v0/mailbox?after=${cursor}${known ? `&epoch=${encodeURIComponent(known)}` : ''}`)) as { items: MailItem[]; epoch?: string };
+      // The home started over: it has answered from the start, and our cursor was into a mailbox that is gone.
+      if (epoch && known && epoch !== known) this.state.cursors[home] = 0;
+      if (epoch) this.state.epochs[home] = epoch;
       return { home, items };
     });
   }
@@ -1658,6 +1673,15 @@ export class SignetClient {
       }
     }
     return events;
+  }
+
+  /** Drop processed ids older than thirty days, and the oldest beyond the cap. */
+  private forgetOldIds(): void {
+    const cutoff = Date.now() - SEEN_MAX_AGE_MS;
+    const entries = Object.entries(this.state.seen);
+    for (const [key, at] of entries) if (at < cutoff) delete this.state.seen[key];
+    if (entries.length <= SEEN_MAX) return;
+    for (const [key] of entries.sort((a, b) => a[1] - b[1]).slice(0, entries.length - SEEN_MAX)) delete this.state.seen[key];
   }
 
   /** Repeat registrations that a home missed, oldest first, and keep the ones that still can't be delivered. */

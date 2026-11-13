@@ -3271,12 +3271,25 @@ Experimental           Signet Protocol, Version 0          November 2026
 6.8.5.  Replicated State
 
    The primary replicates every change to its store: accounts,
-   mailboxes, key packages, delivery tokens, parked deliveries, blobs,
-   spent Privacy Pass nonces, contacts, view grants, daily counters,
-   organisation claims, accepted request replays and the queue of
-   deliveries waiting for a retry. Pairing slots (Section 3.4.4) last
-   ten minutes and are not replicated; a failover loses them, and the
-   owner opens a new one.
+   mailboxes, key packages, delivery tokens, parked deliveries, spent
+   Privacy Pass nonces, contacts, view grants, daily counters,
+   organisation claims, accepted request replays, the epoch of the
+   mailbox store (Section 10.7) and the queue of deliveries waiting
+   for a retry. Pairing slots (Section 3.4.4) last ten minutes and
+   are not replicated; a failover loses them, and the owner opens a
+   new one.
+
+   Attachment ciphertext (Section 8.9) is not part of the log, since
+   a file of tens of megabytes would otherwise sit in every replica's
+   log and every snapshot. The primary keeps each blob beside its
+   log and copies it to the other homes with a signed
+   POST /v0/cluster/blob/{id}, and answers the upload only once at
+   least one other home has acknowledged, if the cluster has one. If
+   none can be reached it answers 503. Any home serves GET
+   /v0/blobs/{id}, and a home that lacks a blob asks the others for it
+   with a signed GET /v0/cluster/blob/{id} and keeps what it gets. A
+   witness holds no blobs. Version 0 does not copy a blob again once
+   the replicas that held it are gone.
 
    Changes travel as batches of commands. Every replica applies the
    same batches in the same order, so a mailbox item has the same seq
@@ -3764,8 +3777,14 @@ Experimental           Signet Protocol, Version 0          November 2026
        cursor for each, because seq values differ between homes. It
        processes an item only if it has not processed the item's id,
        whichever home it came from, and remembers processed ids with
-       the rest of its state. If some homes fail it uses the others; it
-       reports an error only if none answered.
+       the rest of its state. It remembers each id with the time it
+       was processed and forgets it after thirty days, longer than a
+       sender retries (about five days), so an item that arrives late
+       is still recognised however much mail came after it. It also
+       remembers the epoch each home gave for its mailbox (Section
+       10.7) and starts that home's cursor over when the epoch
+       changes. If some homes fail it uses the others; it reports an
+       error only if none answered.
 
    2.  Registers delivery tokens, key packages, contacts and view
        grants with every home. A home that was unreachable misses the
@@ -3794,6 +3813,15 @@ Experimental           Signet Protocol, Version 0          November 2026
       with an intake, its intake key. An operator that leaks either
       weakens the enumeration protection of the whole domain. Per-home
       keys are not specified.
+
+   *  *Limits are per home.* A home counts its own daily limits, and
+      sharing counts between homes would need the coordination
+      this design avoids. A legitimate sender's delivery reaches
+      every home, so each counts it once; a hostile sending server
+      can choose to give different items to different homes, and a
+      domain with N homes can then accept up to N times a limit. The
+      owner sets each home's limits knowing N. Dividing a limit by N
+      would instead cut a legitimate sender to one Nth of it.
 
    *  *Receipts show delivery, not reading.* A receipt says a home
       stored the delivery. It says nothing about whether the
@@ -5910,8 +5938,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 10.7.  Mailbox
 
-      GET /v0/mailbox?after={seq}        (client-authenticated)
-      → { "items": [ MailItem, … ] }
+      GET /v0/mailbox?after={seq}[&epoch={epoch}]
+        (client-authenticated)
+      → { "items": [ MailItem, … ], "epoch": "e_…" }
 
    +============+=========+==========+=================================+
    | Field      | Type    | Required | Meaning                         |
@@ -5940,6 +5969,15 @@ Experimental           Signet Protocol, Version 0          November 2026
    keeps its own cursor and skips items it cannot open or that are not
    for it. A client SHOULD skip items whose id matches a delivery it
    submitted itself.
+
+   epoch names the mailbox store. It is made when the store is, and
+   changes if the store is lost and started over, so seq values restart
+   from 1. A client that knows an epoch sends it. If it differs from the
+   server's, the server ignores after and answers from the start, and
+   the client sets its cursor for that home to the start. Without
+   this, a client whose cursor was past the new store's seq would
+   skip that home's new mail. The replicas of a home share one epoch,
+   since they keep the same seq values.
 
 10.8.  Open Issues
 

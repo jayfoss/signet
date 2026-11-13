@@ -1,5 +1,8 @@
+import { join } from 'node:path';
 import type { KeyPair } from '@signet/lib';
 import { ReplayCache, domainAuthHeaders, verifyDomainAuth } from '@signet/lib';
+import type { BlobStore } from './blobs';
+import { BLOB_ID, FileBlobStore, MemoryBlobStore } from './blobs';
 import { decode, encode } from './codec';
 import type { HttpRequest, HttpResult } from './http';
 import { HttpError, header, json } from './http';
@@ -65,6 +68,7 @@ const MUTATORS = new Set([
   'bump',
   'setClaims',
   'setServerKeys',
+  'setEpoch',
   'saveOutbound',
   'removeOutbound',
 ]);
@@ -100,6 +104,8 @@ export class Cluster {
   readonly store: Store;
   private readonly members = new Map<string, ClusterMember>();
   private readonly holder: { store: SnapshotStore };
+  /** Attachment ciphertext, kept beside the log and copied to the other homes directly. A witness has none. */
+  private readonly blobs?: BlobStore;
   private readonly electionMs: number;
   private ticker?: NodeJS.Timeout;
   private ready = false;
@@ -126,6 +132,7 @@ export class Cluster {
     if (self.role === 'witness' && factory) throw new Error('a witness keeps no store');
     this.electionMs = options.electionMs ?? 1000;
     this.holder = { store: factory ? factory() : new MemoryStore() };
+    if (factory) this.blobs = options.dataDir ? new FileBlobStore(join(options.dataDir, 'blobs')) : new MemoryBlobStore();
     this.store = this.recordingStore();
     if (!options.dataDir && !options.volatileLog) throw new Error('a cluster replica needs dataDir: without durable storage it can vote twice in one term');
     const storage: RaftStorage<Batch> = options.dataDir ? new FileRaftStorage<Batch>(options.dataDir) : new MemoryRaftStorage<Batch>();
@@ -217,10 +224,57 @@ export class Cluster {
     await new Promise<void>((resolve, reject) => this.waiters.push({ mark, resolve, reject }));
   }
 
-  /** A signed call from another replica: POST /v0/cluster/vote or /v0/cluster/append. */
+  /**
+   * Keep an attachment's ciphertext here and on at least one other home before the upload is answered. It is not
+   * part of the replicated log: a 25 MiB file would otherwise sit in every replica's log and every snapshot.
+   */
+  async putBlob(id: string, data: Buffer): Promise<void> {
+    const store = this.blobs as BlobStore;
+    store.put(id, data);
+    const others = this.options.members.filter((member) => member.role === 'home' && member.id !== this.options.id);
+    if (others.length === 0) return;
+    const sent = await Promise.allSettled(others.map((member) => this.blobCall(member, 'POST', id, data)));
+    if (!sent.some((outcome) => outcome.status === 'fulfilled')) throw new HttpError(503, 'could not keep the attachment on a second replica', { 'retry-after': '1' });
+  }
+
+  /** A stored attachment, from this replica or, failing that, from another home, which is then kept here. */
+  async getBlob(id: string): Promise<Buffer | undefined> {
+    const store = this.blobs as BlobStore;
+    const here = store.get(id);
+    if (here) return here;
+    for (const member of this.options.members.filter((candidate) => candidate.role === 'home' && candidate.id !== this.options.id)) {
+      try {
+        const data = await this.blobCall(member, 'GET', id);
+        if (data) {
+          store.put(id, data);
+          return data;
+        }
+      } catch {
+        // Try the next replica.
+      }
+    }
+    return undefined;
+  }
+
+  private async blobCall(member: ClusterMember, method: 'GET' | 'POST', id: string, data?: Buffer): Promise<Buffer | undefined> {
+    const path = `/v0/cluster/blob/${id}`;
+    const response = await (this.options.fetchImpl ?? fetch)(`${member.url}${path}`, {
+      method,
+      headers: { ...domainAuthHeaders(this.options.domain, this.options.domainKey, method, path, data ?? '') },
+      body: data,
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (response.status === 404) return undefined;
+    if (!response.ok) throw new Error(`${member.id} answered ${response.status}`);
+    return method === 'GET' ? Buffer.from(await response.arrayBuffer()) : undefined;
+  }
+
+  /** A signed call from another replica: the votes, appends and snapshots of Section 6.8.6, or a blob copied between homes. */
   handle(request: HttpRequest): HttpResult {
     const path = request.url.pathname;
-    if (request.method !== 'POST' || !['/v0/cluster/vote', '/v0/cluster/append', '/v0/cluster/snapshot'].includes(path)) throw new HttpError(404, 'no such cluster route');
+    const blobId = /^\/v0\/cluster\/blob\/([^/]+)$/.exec(path)?.[1];
+    const routes = ['/v0/cluster/vote', '/v0/cluster/append', '/v0/cluster/snapshot'];
+    if (blobId ? !['GET', 'POST'].includes(request.method) : request.method !== 'POST' || !routes.includes(path)) throw new HttpError(404, 'no such cluster route');
     const ok = verifyDomainAuth(
       header(request.headers, 'signet-domain'),
       this.options.domainKey.publicKey,
@@ -233,6 +287,16 @@ export class Cluster {
     );
     if (!ok || request.headers['signet-domain'] !== this.options.domain) throw new HttpError(401, 'cluster calls are signed with the replicas\' shared key');
     if (!this.callReplays.firstUse(String(request.headers['signet-sig']))) throw new HttpError(401, 'this cluster call was already used');
+    if (blobId) {
+      if (!this.blobs || !BLOB_ID.test(blobId)) throw new HttpError(404, 'no attachments here');
+      if (request.method === 'POST') {
+        this.blobs.put(blobId, request.body);
+        return { ok: true };
+      }
+      const data = this.blobs.get(blobId);
+      if (!data) throw new HttpError(404, 'no such blob');
+      return { raw: data, contentType: 'application/octet-stream' };
+    }
     if (path === '/v0/cluster/vote') {
       const body = json<VoteRequest>(request);
       this.requireMember(body.candidate);

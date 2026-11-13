@@ -8,6 +8,7 @@ import { IssuerServer } from './issuer-server';
 import { TransparencyLogServer } from './log-server';
 import { HttpRegistrar, LocalRegistrar, RegistrarServer } from './registrar';
 import { RelayServer } from './relay-server';
+import type { Limits } from './server';
 import { SignetServer } from './server';
 import { InboundSmtp, OutboundSmtp } from './smtp';
 import { ClusterWitness } from './witness';
@@ -34,6 +35,8 @@ import { ClusterWitness } from './witness';
  * SIGNET_DKIM            JSON {"selector","privateKey"} to DKIM-sign outbound plain email
  * SIGNET_ISSUER          JSON {"url","key":{"name","publicKey"}} of the Privacy Pass issuer (anonymous requests)
  * SIGNET_OHTTP_RELAY     URL of the Oblivious HTTP relay for sealed and anonymous deliveries
+ * SIGNET_LIMITS          JSON of daily limits to change, e.g. {"requestsPerSenderPerDay":2}. Each home counts its own,
+ *                        so a domain with N homes can accept up to N times a limit; an owner who minds sets it lower
  *
  * Issuers read SIGNET_ISSUER_NAME. Their RSA key is kept in SIGNET_DATA_DIR.
  *
@@ -211,6 +214,7 @@ async function main(): Promise<void> {
     outbound: new OutboundSmtp(domain, { relay: jsonEnv('SIGNET_SMTP_RELAY'), dkim: jsonEnv('SIGNET_DKIM') }),
     issuer: jsonEnv('SIGNET_ISSUER'),
     ohttpRelay: env('SIGNET_OHTTP_RELAY'),
+    limits: jsonEnv<Partial<Limits>>('SIGNET_LIMITS'),
   });
   const url = await server.listen(port, '0.0.0.0');
   console.log(`signet home server for ${domain} at ${url}`);

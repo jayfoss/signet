@@ -1,6 +1,6 @@
 import { createServer } from 'node:net';
 import type { KeyPair, SignetEvent } from '@signet/lib';
-import { Identity, SignetClient, StaticResolver, domainAuthHeaders, generateGatewayKey, generateSigningKey, generateVrfKey } from '@signet/lib';
+import { Identity, SignetClient, StaticResolver, clientAuthHeaders, domainAuthHeaders, generateGatewayKey, generateSigningKey, generateVrfKey } from '@signet/lib';
 import type { ClusterMember } from '../cluster';
 import { ClusterWitness } from '../witness';
 import { TransparencyLogServer } from '../log-server';
@@ -81,6 +81,7 @@ async function world(options: { snapshotEvery?: number } = {}) {
   return {
     homes,
     members,
+    aliceKeys,
     witness,
     beta,
     alphaKey,
@@ -145,6 +146,33 @@ describe('a domain with two homes and a witness', () => {
     const rebuilt = await w.rebuild(id);
     await until(() => rebuilt.store.hasUser('alice') && rebuilt.store.mailbox('alice').length === 5);
     expect(rebuilt.store.mailbox('alice').map((item) => item.id)).toEqual(primary.store.mailbox('alice').map((item) => item.id));
+  });
+
+  it('keeps attachments beside the log instead of in it, and either home serves them', async () => {
+    await until(() => w.standby().store.hasUser('alice'));
+    const primary = w.primary();
+    const standby = w.standby();
+    const bytes = Buffer.alloc(300_000, 7);
+    const headers = { ...clientAuthHeaders('alice@alpha.test', w.aliceKeys.cert.clientId, w.aliceKeys.signing, 'POST', '/v0/blobs', bytes), 'content-type': 'application/octet-stream' };
+    const response = await fetch(`${primary.url}/v0/blobs`, { method: 'POST', headers, body: bytes });
+    expect(response.status).toBe(200);
+    const { url } = (await response.json()) as { url: string };
+    // The only thing the upload put in the log is the request's replay record, nowhere near the file's size.
+    const raft = (primary as unknown as { cluster: { raft: { lastIndex: number; entryAt(index: number): unknown } } }).cluster.raft;
+    expect(JSON.stringify(raft.entryAt(raft.lastIndex)).length).toBeLessThan(5_000);
+    // The standby has its own copy.
+    const fromStandby = await fetch(`${standby.url}${new URL(url).pathname}`);
+    expect(fromStandby.status).toBe(200);
+    expect(Buffer.from(await fromStandby.arrayBuffer()).equals(bytes)).toBe(true);
+  });
+
+  it('refuses an attachment it could not keep on a second home', async () => {
+    await until(() => w.standby().store.hasUser('alice'));
+    const primary = w.primary();
+    await w.standby().close();
+    const bytes = Buffer.from('only here');
+    const headers = { ...clientAuthHeaders('alice@alpha.test', w.aliceKeys.cert.clientId, w.aliceKeys.signing, 'POST', '/v0/blobs', bytes), 'content-type': 'application/octet-stream' };
+    expect((await fetch(`${primary.url}/v0/blobs`, { method: 'POST', headers, body: bytes })).status).toBe(503);
   });
 
   it('answers a cluster call only when it is signed with the domain key by a member', async () => {

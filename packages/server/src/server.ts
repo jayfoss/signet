@@ -320,6 +320,7 @@ export class SignetServer implements LegacyInbox {
       for (const local of this.store.userLocals()) this.setListing(local, replayLog(this.store.user(local)?.log ?? []).unlisted);
       // Deliveries that were waiting for a retry when the server stopped pick up where they left off.
       for (const entry of this.store.outbound()) this.schedule(entry);
+      if (!this.store.epoch()) this.store.setEpoch(randomId('e'));
     }
     this.http = new JsonServer((request) => this.route(request), undefined, () => this.cluster?.responseHeaders() ?? {});
   }
@@ -660,6 +661,8 @@ export class SignetServer implements LegacyInbox {
     if (!this.cluster) return this.routeLocal(request);
     if (request.method === 'GET' && request.url.pathname === '/.well-known/signet.json') return this.policy;
     if (request.url.pathname.startsWith('/v0/cluster/')) return this.cluster.handle(request);
+    // An attachment is public ciphertext behind an unguessable id, and a standby holds a copy, so it can serve it.
+    if (request.method === 'GET' && /^\/v0\/blobs\/[^/]+$/.test(request.url.pathname)) return this.routeLocal(request);
     this.cluster.requirePrimary();
     const result = await this.routeLocal(request);
     await this.cluster.durable();
@@ -689,7 +692,7 @@ export class SignetServer implements LegacyInbox {
       return { ok: true };
     }
     if (method === 'GET' && blob) {
-      const data = this.store.blob(decodeURIComponent(blob[1]));
+      const data = this.cluster ? await this.cluster.getBlob(decodeURIComponent(blob[1])) : this.store.blob(decodeURIComponent(blob[1]));
       if (!data) throw new HttpError(404, 'no such blob');
       return { raw: data, contentType: 'application/octet-stream' };
     }
@@ -720,7 +723,11 @@ export class SignetServer implements LegacyInbox {
     if (method === 'GET' && transparency) return this.logQueryFor(client, transparency[1], url.searchParams);
     if (method === 'POST' && path === '/v0/submit') return this.submit(client, json<Envelope>(request));
     if (method === 'GET' && path === '/v0/mailbox') {
-      return { items: this.store.mailbox(splitAddress(client.principal).local, Number(url.searchParams.get('after') ?? 0)) };
+      // A client that knows an older epoch than this store's reads from the start: its cursor points into a store that is gone.
+      const epoch = this.store.epoch();
+      const known = url.searchParams.get('epoch');
+      const after = known !== null && known !== epoch ? 0 : Number(url.searchParams.get('after') ?? 0);
+      return { items: this.store.mailbox(splitAddress(client.principal).local, after), epoch };
     }
     if (method === 'GET' && path === '/v0/contacts') return this.store.contactsOf(splitAddress(client.principal).local);
     if (method === 'POST' && path === '/v0/contacts') {
@@ -750,7 +757,9 @@ export class SignetServer implements LegacyInbox {
     }
     if (method === 'POST' && path === '/v0/blobs') {
       const id = randomId('blob');
-      this.store.putBlob(id, request.body);
+      // A replica keeps blobs beside its log and copies them to another home, so they never enter the log.
+      if (this.cluster) await this.cluster.putBlob(id, request.body);
+      else this.store.putBlob(id, request.body);
       return { id, url: `${this.http.publicUrl}/v0/blobs/${id}` };
     }
     if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request), request);
@@ -1176,6 +1185,8 @@ export class SignetServer implements LegacyInbox {
 
   /** A new primary rebuilds what it derives from the store and takes over the retry queue. */
   private becamePrimary(): void {
+    // The first primary names the mailbox store; the name is replicated, so every replica keeps it.
+    if (!this.store.epoch()) this.store.setEpoch(randomId('e'));
     this.unlisted.clear();
     for (const local of this.store.userLocals()) this.setListing(local, replayLog(this.store.user(local)?.log ?? []).unlisted);
     this.cancelRetries();

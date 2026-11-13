@@ -1,6 +1,7 @@
 import type { Resolver } from '@signet/lib';
 import { OHTTP_REQUEST_TYPE, OHTTP_RESPONSE_TYPE, homeGateway } from '@signet/lib';
 import type { HttpRequest, HttpResult } from './http';
+import { Mix } from './mix';
 import { HttpError, JsonServer } from './http';
 
 /**
@@ -15,11 +16,15 @@ export class RelayServer {
   /** Count of forwarded requests, for tests and monitoring. Nothing about them is kept. */
   forwarded = 0;
   private readonly server: JsonServer;
+  private readonly mix: Mix;
 
   constructor(
     private readonly resolver: Resolver,
     private readonly fetchImpl: typeof fetch = fetch,
+    /** Hold what is forwarded until the end of a clock-aligned window of this many milliseconds, and forward a window's requests in random order of source (Section 10.6.1). 0 forwards at once. */
+    batchMs = 0,
   ) {
+    this.mix = new Mix(batchMs);
     this.server = new JsonServer((request) => this.route(request), 40 * 1024 * 1024);
   }
 
@@ -31,7 +36,8 @@ export class RelayServer {
     return this.server.listen(port, host, publicUrl);
   }
 
-  close(): Promise<void> {
+  async close(): Promise<void> {
+    await this.mix.flush();
     return this.server.close();
   }
 
@@ -46,9 +52,12 @@ export class RelayServer {
     const home = request.url.searchParams.get('home');
     const ohttp = homeGateway(policy, home ?? policy.server);
     if (!ohttp) throw new HttpError(404, `${domain} has no OHTTP gateway${home ? ` at ${home}` : ''}`);
-    const response = await this.fetchImpl(ohttp.gateway, { method: 'POST', headers: { 'content-type': OHTTP_REQUEST_TYPE }, body: request.body });
-    if (!response.ok) throw new HttpError(502, `gateway answered ${response.status}`);
-    this.forwarded += 1;
-    return { raw: Buffer.from(await response.arrayBuffer()), contentType: OHTTP_RESPONSE_TYPE };
+    // Requests from one home keep their order; the relay forwards the homes' requests of a window in random order.
+    return this.mix.run(request.remoteAddress ?? 'unknown', async () => {
+      const response = await this.fetchImpl(ohttp.gateway, { method: 'POST', headers: { 'content-type': OHTTP_REQUEST_TYPE }, body: request.body });
+      if (!response.ok) throw new HttpError(502, `gateway answered ${response.status}`);
+      this.forwarded += 1;
+      return { raw: Buffer.from(await response.arrayBuffer()), contentType: OHTTP_RESPONSE_TYPE };
+    });
   }
 }

@@ -62,7 +62,7 @@ export class Testbed {
 
   static async start(
     domains: string[],
-    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number } = {},
+    options: { retryDelaysMs?: number[]; openEnrollment?: boolean; limits?: Partial<Limits>; intake?: string[]; dataDirs?: Record<string, string>; witnesses?: number; batchMs?: number } = {},
   ): Promise<Testbed> {
     const bed = new Testbed();
     // Witnesses need the log's address and key, and the log needs theirs, so they join the list once running.
@@ -77,7 +77,7 @@ export class Testbed {
     }
     bed.issuer = new IssuerServer('issuer.signet.test', bed.resolver);
     await bed.issuer.listen();
-    bed.relay = new RelayServer(bed.resolver);
+    bed.relay = new RelayServer(bed.resolver, undefined, options.batchMs);
     await bed.relay.listen();
     const sinkPort = await bed.startSink();
     for (const domain of domains) {
@@ -97,6 +97,7 @@ export class Testbed {
           dataDir: options.dataDirs?.[domain],
           issuer: { url: bed.issuer.url, key: bed.issuer.publicKey },
           ohttpRelay: bed.relay.url,
+          batchMs: options.batchMs,
           fetchImpl: (input, init) => bed.fetchBetweenServers(input, init),
         }),
       );
@@ -138,7 +139,7 @@ export class Testbed {
 
   /** A client that shares its label in threads, so test output reads "via Clerk". */
   client(keys: ClientKeys, snapshot?: Partial<ClientSnapshot>, extra: Partial<SignetClientOptions> = {}): SignetClient {
-    return new SignetClient(keys, this.resolver, { trustedLogs: [this.trustedLog], snapshot, keyPackageTarget: 3, shareLabel: true, ohttpRelay: this.relay.url, ...extra });
+    return new SignetClient(keys, this.resolver, { trustedLogs: [this.trustedLog], snapshot, keyPackageTarget: 3, shareLabel: true, ohttpRelay: this.relay.url, submitDelayMs: 0, ...extra });
   }
 
   /** Make server-to-server delivery into this domain fail with a 503 until `repairDelivery`. */

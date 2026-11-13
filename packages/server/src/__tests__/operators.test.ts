@@ -1,6 +1,7 @@
 import { createServer } from 'node:net';
 import type { SignetEvent } from '@signet/lib';
 import {
+  hashBody,
   Identity,
   SignetClient,
   StaticResolver,
@@ -417,16 +418,17 @@ describe('a domain run by three operators who share nothing', () => {
 
     // The registrar attests outgoing plain email for a request alice's client signed.
     const to = ['carol@example.com'];
-    const header = await w.clients.alice.signetHeader({ to, subject: 'Hello' });
-    expect(verifyAttestation(parseSignetHeader(header) as NonNullable<ReturnType<typeof parseSignetHeader>>, { from: principal, to, subject: 'Hello' }, w.owner.publicKey)).toBe(true);
+    const bodyHash = hashBody('Hello there');
+    const header = await w.clients.alice.signetHeader({ to, subject: 'Hello', bodyHash });
+    expect(verifyAttestation(parseSignetHeader(header) as NonNullable<ReturnType<typeof parseSignetHeader>>, { from: principal, to, subject: 'Hello', bodyHash }, w.owner.publicKey)).toBe(true);
 
     // A home can't use that proof for different mail, can't use it twice, and can't make one up.
     const proofFor = (subject: string, signer = w.aliceKeys.signing) => {
-      const body = JSON.stringify({ to, subject });
+      const body = JSON.stringify({ to, subject, bodyHash });
       const signed = clientAuthHeaders(principal, w.aliceKeys.cert.clientId, signer, 'POST', '/v0/legacy/attest', body);
       return { method: 'POST', path: '/v0/legacy/attest', body, headers: signed };
     };
-    const ask = (subject: string, proof: ReturnType<typeof proofFor>) => w.registrarFor(0).attest({ principal, to, subject, server: w.homeUrls[0], proof });
+    const ask = (subject: string, proof: ReturnType<typeof proofFor>) => w.registrarFor(0).attest({ principal, to, subject, bodyHash, server: w.homeUrls[0], proof });
     await expect(ask('Two', proofFor('One'))).rejects.toThrow('different mail');
     const once = proofFor('Once');
     await ask('Once', once);

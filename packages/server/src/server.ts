@@ -49,11 +49,14 @@ import {
   checkOperators,
   entryHash,
   attestedSignetHeader,
+  hashBody,
   hasScope,
   cardHash,
   generateVrfKey,
   proveIndex,
   requesterHash,
+  verifyDirectoryEntry,
+  verifyRequesterProof,
   verifyCard,
   verifyView,
   viewHash,
@@ -82,6 +85,11 @@ import { Cluster } from './cluster';
 import type { ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
 import { HttpError, JsonServer, header, json } from './http';
+
+const optionalHeader = (headers: Record<string, string | string[] | undefined>, name: string): string | undefined => {
+  const value = headers[name];
+  return typeof value === 'string' ? value : undefined;
+};
 import type { Registrar } from './registrar';
 import type { LegacyInbox, OutboundSmtp } from './smtp';
 import type { PublishedKeyPackage } from './store';
@@ -698,12 +706,13 @@ export class SignetServer implements LegacyInbox {
   }
 
   /** A request to another Signet service, signed with this domain's key over its method, path, query and body. */
-  private signedFetch(method: 'GET' | 'POST', url: string, body = ''): Promise<Response> {
+  private signedFetch(method: 'GET' | 'POST', url: string, body = '', extra?: Record<string, string>): Promise<Response> {
     const { pathname, search } = new URL(url);
     return this.fetchImpl(url, {
       method,
       headers: {
         ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
+        ...extra,
         ...(this.options.domainKey
           ? domainAuthHeaders(this.options.domain, this.options.domainKey, method, `${pathname}${search}`, body)
           : homeAuthHeaders(this.options.domain, this.options.homeKey as KeyPair, method, `${pathname}${search}`, body)),
@@ -777,7 +786,7 @@ export class SignetServer implements LegacyInbox {
       if (this.livePairing(pairing[1]).principal !== client.principal) throw new HttpError(403, 'not your pairing slot');
       return this.postPairing(pairing[1], 'a', json<{ body: string }>(request).body);
     }
-    if (method === 'GET' && path === '/v0/lookup') return this.lookupFor(client, url.searchParams.get('address') ?? '');
+    if (method === 'GET' && path === '/v0/lookup') return this.lookupFor(client, url.searchParams.get('address') ?? '', optionalHeader(request.headers, 'signet-requester'));
     if (method === 'POST' && path === '/v0/claim') return this.claimFor(client, json<{ address: string; clients: string[] }>(request));
     if (method === 'GET' && transparency) return this.logQueryFor(client, transparency[1], url.searchParams);
     if (method === 'POST' && path === '/v0/submit') return this.submit(client, json<Envelope>(request));
@@ -841,8 +850,8 @@ export class SignetServer implements LegacyInbox {
     }
     if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request), request);
     if (method === 'POST' && path === '/v0/legacy/attest') {
-      const { to, subject } = json<{ to: string[]; subject: string }>(request);
-      return { header: await this.attestHeader(client, to, subject, request) };
+      const { to, subject, bodyHash, humansOnly } = json<{ to: string[]; subject: string; bodyHash: string; humansOnly?: boolean }>(request);
+      return { header: await this.attestHeader(client, to, subject, request, bodyHash, humansOnly ? 'humans' : undefined) };
     }
     if (method === 'GET' && path === '/v0/issuer') {
       if (!this.options.issuer) throw new HttpError(501, 'this server has no Privacy Pass issuer');
@@ -958,14 +967,14 @@ export class SignetServer implements LegacyInbox {
    * A signed call to another domain, to the first of its homes that answers. A home that can't be reached, says
    * 421, or fails with a 5xx is skipped; any other answer, including a refusal, is the answer.
    */
-  private async signedFetchHomes(domain: string, method: 'GET' | 'POST', path: string, body = ''): Promise<Response> {
+  private async signedFetchHomes(domain: string, method: 'GET' | 'POST', path: string, body = '', extra?: Record<string, string>): Promise<Response> {
     const policy = await this.options.resolver.policy(domain);
     const bases = policy.operators ? (policy.replicas ?? [policy.server]) : [policy.server];
     let last: Response | undefined;
     let failure: unknown;
     for (const base of bases) {
       try {
-        const response = await this.signedFetch(method, `${base}${path}`, body);
+        const response = await this.signedFetch(method, `${base}${path}`, body, extra);
         if (response.status < 500 && response.status !== 421) return response;
         last = response;
       } catch (error) {
@@ -986,7 +995,11 @@ export class SignetServer implements LegacyInbox {
       : [[`lookup:ip:${request.remoteAddress}`, this.limits.anonymousLookupsPerIpPerDay, 'anonymous lookups'] as const];
     if (who) this.refuseScanningDomain(who.domain);
     for (const [key, max, what] of keys) if (this.store.count(key) >= max) throw new HttpError(429, `too many ${what} today`);
-    const granted = who !== null && this.store.hasViewGrant(local, who.user);
+    // A release only counts for a requester that proves it is who the hash names (Section 4.7).
+    const granted =
+      who !== null &&
+      this.store.hasViewGrant(local, who.user) &&
+      (await this.requesterProven(optionalHeader(request.headers, 'signet-requester'), who.user, `${local}@${this.options.domain}`));
     const entry = this.directory(local, granted ? 'contact' : 'public');
     // A miss costs more than a hit, and a domain whose lookups mostly miss gets cut off: that is what scanning
     // looks like. The server counts real misses even when its answer doesn't say which it was.
@@ -1028,19 +1041,43 @@ export class SignetServer implements LegacyInbox {
     });
   }
 
+  /** How this server names one of its clients to the home of the address it is looking up (Section 4.7). */
   private requesterHash(client: ClientCert): string {
     return requesterHash(client.principal);
   }
 
-  private async lookupFor(client: ClientCert, address: string): Promise<DirectoryEntry> {
+  /**
+   * Whether a lookup that names a requester proves it is that requester (Section 4.7 step 3): the proof is
+   * signed by an active client of the requester's account log, and that log is the one the requester's own
+   * domain vouches for. The answer is remembered for the proof's lifetime.
+   */
+  private async requesterProven(proof: string | undefined, hash: string, target: string): Promise<boolean> {
+    if (!proof) return false;
+    try {
+      const state = verifyRequesterProof(proof, hash, target);
+      const { local, domain } = splitAddress(state.principal);
+      const policy = await this.options.resolver.policy(domain);
+      const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}`);
+      if (!response.ok) return false;
+      const entry = (await response.json()) as DirectoryEntry;
+      if (entry.status !== 'enrolled') return false;
+      const verified = verifyDirectoryEntry(entry, policy);
+      return verified.identityKey === state.identityKey && entry.card.card.logHead === state.head;
+    } catch {
+      return false;
+    }
+  }
+
+  private async lookupFor(client: ClientCert, address: string, proof?: string): Promise<DirectoryEntry> {
     const { local, domain } = splitAddress(address);
+    const target = `${local}@${domain}`;
     if (domain === this.options.domain) {
-      if (`${local}@${domain}` === client.principal) return this.directory(local, 'owner');
+      if (target === client.principal) return this.directory(local, 'owner');
       const colleague = this.options.colleaguesSeeViews ?? true;
       return this.directory(local, colleague || this.store.hasViewGrant(local, this.requesterHash(client)) ? 'contact' : 'public');
     }
     const query = new URLSearchParams({ requester: this.requesterHash(client) });
-    const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}?${query.toString()}`);
+    const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}?${query.toString()}`, '', proof ? { 'signet-requester': proof } : undefined);
     if (!response.ok) throw new HttpError(response.status === 429 ? 429 : 502, `lookup at ${domain} failed: ${response.status} ${await response.text()}`);
     return (await response.json()) as DirectoryEntry;
   }
@@ -1389,18 +1426,19 @@ export class SignetServer implements LegacyInbox {
    * Vouch, with the domain key, that this user is sending plain email with this From, To and Subject.
    * Used for mail this server sends and for mail the client sends itself (Gmail mode).
    */
-  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest): Promise<string> {
+  private async attestHeader(client: ClientCert, to: string[], subject: string, request: HttpRequest, bodyHash: string, audience?: 'humans'): Promise<string> {
     if (!hasScope(client, 'send')) throw new HttpError(403, `${client.label} may not send`);
     const user = this.store.user(splitAddress(client.principal).local);
     if (!user) throw new HttpError(404, 'sender is not enrolled');
     if (!Array.isArray(to) || to.length === 0 || typeof subject !== 'string') throw new HttpError(400, 'to and subject are required');
+    if (typeof bodyHash !== 'string' || !bodyHash.startsWith('sha256:')) throw new HttpError(400, 'bodyHash must be a sha256: hash of the message body');
     // Without the domain key, the registrar attests, shown the client's own signed request.
     if (!this.options.domainKey && this.options.registrar) {
       const names = ['signet-principal', 'signet-client', 'signet-ts', 'signet-nonce', 'signet-sig'];
       const headers = Object.fromEntries(names.map((name) => [name, header(request.headers, name)]));
-      return this.options.registrar.attest({ principal: client.principal, to, subject, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
+      return this.options.registrar.attest({ principal: client.principal, to, subject, bodyHash, audience, server: this.http.publicUrl, proof: { method: request.method, path: request.path, body: request.body.toString('utf8'), headers } });
     }
-    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject });
+    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject, bodyHash, audience });
   }
 
   private async sendLegacy(
@@ -1417,7 +1455,7 @@ export class SignetServer implements LegacyInbox {
       to: mail.to,
       subject: mail.subject,
       text: mail.text,
-      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
+      headers: { Signet: await this.attestHeader(client, mail.to, mail.subject, request, hashBody(mail.text), mail.humansOnly ? 'humans' : undefined), ...(mail.humansOnly ? { [AUDIENCE_HEADER]: 'humans' } : {}) },
       attachments: mail.attachments ?? [],
     });
     return { messageId };

@@ -7,7 +7,7 @@
  *   pnpm demo
  */
 import type { SignetEvent } from '@signet/lib';
-import { Identity, IdentityChangedError, TransparencyError, bindIdentity, formatSignetHeader, utf8 } from '@signet/lib';
+import { Identity, IdentityChangedError, TransparencyError, bindIdentity, formatSignetHeader, hashBody, utf8 } from '@signet/lib';
 import { Testbed } from '../src/testbed';
 
 const step = (title: string) => console.log(`\n== ${title}`);
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     step('Plain email both ways');
     await bed.sendPlainEmail({ from: 'pat@gmail.test', to: 'jerzy@beta.test', subject: 'Quick question', text: 'Free Thursday?' });
     // Genuine: Alice's own server attests this From, To and Subject with alpha.test's domain key.
-    const attested = await alicePhone.signetHeader({ to: ['jerzy@beta.test'], subject: 'From my old client' });
+    const attested = await alicePhone.signetHeader({ to: ['jerzy@beta.test'], subject: 'From my old client', bodyHash: hashBody('Hi') });
     await bed.sendPlainEmail({ from: 'alice@alpha.test', to: 'jerzy@beta.test', subject: 'From my old client', text: 'Hi', headers: { Signet: attested } });
     // Forged: someone else sends "from" Alice, pasting her public fingerprint, and replays her real header on another subject.
     await bed.sendPlainEmail({

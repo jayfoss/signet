@@ -159,8 +159,12 @@ export function splitAddress(address: string): { local: string; domain: string }
   return { local: address.slice(0, at).toLowerCase(), domain: address.slice(at + 1).toLowerCase() };
 }
 
-/** How home servers name a requester to each other, and how owners name contacts they release their view to. */
-export const requesterHash = (address: string): string => sha256(`${splitAddress(address).domain}|${normalizeAddress(address)}`);
+/**
+ * How home servers name a requester to each other, and how owners name contacts they release their view to
+ * (Section 4.7). It is the same at every address, so a server can limit one user's lookups; the proof that a
+ * requester is who the hash names is bound to the address being looked up.
+ */
+export const requesterHash = (requester: string): string => sha256(`${splitAddress(requester).domain}|${normalizeAddress(requester)}`);
 
 export const normalizeAddress = (address: string): string => {
   const { local, domain } = splitAddress(address);

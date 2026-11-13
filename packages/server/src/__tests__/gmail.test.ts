@@ -10,7 +10,7 @@ import { Testbed } from '../testbed';
  * Each access token is one mailbox; sent mail is delivered to the mailbox of each To address.
  */
 async function fakeGmail(accounts: Record<string, string>) {
-  const mailboxes = new Map<string, { id: string; threadId: string; headers: { name: string; value: string }[] }[]>();
+  const mailboxes = new Map<string, { id: string; threadId: string; headers: { name: string; value: string }[]; text: string }[]>();
   const tokenFor = Object.fromEntries(Object.entries(accounts).map(([token, address]) => [address, token]));
   let next = 0;
   const server: Server = createServer((request, response) => {
@@ -30,7 +30,7 @@ async function fakeGmail(accounts: Record<string, string>) {
           const id = `msg${(next += 1)}`;
           for (const to of parsed.to && !Array.isArray(parsed.to) ? parsed.to.value : []) {
             const box = tokenFor[to.address ?? ''];
-            if (box) mailboxes.set(box, [...(mailboxes.get(box) ?? []), { id, threadId: id, headers }]);
+            if (box) mailboxes.set(box, [...(mailboxes.get(box) ?? []), { id, threadId: id, headers, text: parsed.text ?? '' }]);
           }
           return reply({ id, threadId: id });
         }
@@ -41,6 +41,9 @@ async function fakeGmail(accounts: Record<string, string>) {
         }
         const message = own.find((candidate) => url.pathname === `/gmail/v1/users/me/messages/${candidate.id}`);
         if (message) {
+          if (url.searchParams.get('format') === 'full') {
+            return reply({ id: message.id, threadId: message.threadId, payload: { mimeType: 'multipart/alternative', parts: [{ mimeType: 'text/plain', body: { data: Buffer.from(message.text).toString('base64url') } }] } });
+          }
           const wanted = url.searchParams.getAll('metadataHeaders').map((name) => name.toLowerCase());
           return reply({ id: message.id, threadId: message.threadId, payload: { headers: message.headers.filter((h) => wanted.includes(h.name.toLowerCase())) } });
         }

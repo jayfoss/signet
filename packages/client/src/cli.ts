@@ -481,6 +481,7 @@ async function runClientCommand(command: string, rest: string[], opts: Opts, cli
     }
     case 'request': {
       const to = required(rest[0], 'ADDRESS');
+      if (await client.escrowRecipient(to, Boolean(opts['humans-only']))) ctx.out(`note: ${to} has an organisation escrow client, which can read this request`);
       await client.sendRequest(
         to,
         { subject: required(opts.subject, 'subject'), note: opts.note, intent: intentFrom(opts.intent, opts.args) },

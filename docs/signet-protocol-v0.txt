@@ -2263,28 +2263,27 @@ Experimental           Signet Protocol, Version 0          November 2026
    (Section 4.6). requester names the user on whose behalf the lookup is
    made, as a requester hash:
 
-      requesterHash(requester, target) =
-        sha256("signet0 requester|" + requester + "|" + target)
+      requesterHash(address) = sha256("{domain}|{local}@{domain}")
+
 
 
 Foss                    Expires 15 May 2027                    [Page 38]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-   where requester is the requesting user's address and target is the
-   address being looked up, both lowercased, and the hash is computed
-   over the UTF-8 string and written in sha256: form. The target is part
-   of the hash, so one requester has a different hash at each address.
-   Calls without signet-domain are anonymous.
+   where the address is lowercased and the hash is computed over the
+   UTF-8 string and written in sha256: form. The hash is the same at
+   every address, so a server can limit one user's lookups. Calls
+   without signet-domain are anonymous.
 
    A call that asks for contact level MUST also carry the header
-   signet-requester, whose value is b64u(JCS({"address": A, "cert": C,
-   "ts": T, "sig": S})). A is the requester's address. C is a client
-   certificate of A (Section 3.4) that the requesting client holds. T is
-   the time of the call. S is the client's Ed25519 signature, by the
-   certified key, over UTF-8(JCS({"v": "signet0", "requester": H,
-   "target": X, "ts": T})), where H is the requester parameter and X is
-   the target address.
+   signet-requester, whose value is b64u(JSON({"address": A, "log": L,
+   "clientId": C, "ts": T, "sig": S})). A is the requester's address.
+   L is the entries of A's account log (Section 3.5), which contain the
+   certificate of client C. T is the time of the call. S is C's Ed25519
+   signature, by its certified key, over UTF-8(JCS({"v": "signet0",
+   "requester": H, "target": X, "ts": T})), where H is the requester
+   parameter and X is the target address.
 
    The server answers as follows:
 
@@ -2299,11 +2298,12 @@ Experimental           Signet Protocol, Version 0          November 2026
    3.  If the call is authenticated and the owner released the view to
        requester (Section 4.8), and signet-requester is valid, the
        access level is contact. The proof is valid if H equals
-       requesterHash(A, X), T is within five minutes of now, S verifies
-       under C's key, and C verifies against A's account log, which the
-       server fetches by looking up A and verifying the answer as in
-       Section 5.8. The server MAY cache a verified certificate until
-       the log changes. Otherwise the access level is public.
+       requesterHash(A), T is within five minutes of now, L replays
+       to a log for A in which C is an active client, S verifies under
+       C's key, and L is the log A's own domain vouches for: the server
+       looks up A, verifies the binding and card, and requires the
+       binding's identity key to equal L's and the card's logHead to
+       equal L's head. Otherwise the access level is public.
 
    4.  Build the entry (Section 4.5) at that access level. The log is
        never included.
@@ -2328,9 +2328,7 @@ Experimental           Signet Protocol, Version 0          November 2026
       { "add": ["sha256:…"], "remove": ["sha256:…"] }
 
    A client (Section 3.11) adds or removes requester hashes to which its
-   account's contact view is released. Each hash is
-   requesterHash(person, own address), computed by the owner's client
-   for the person it is releasing to. A client SHOULD release its view
+   account's contact view is released. A client SHOULD release its view
    to each person it sends a request to, starts a thread with, or
    accepts, before doing so. The reference client does this in
    sendRequest and startThread.
@@ -2504,14 +2502,13 @@ Experimental           Signet Protocol, Version 0          November 2026
 4.12.  Open Issues
 
    *  *Requester hashes hide little.* requesterHash is an unkeyed hash
-      of two addresses. Anyone who can guess both can compute it. Since
-      the target is in the hash, one requester's hashes at different
-      addresses cannot be linked, but a target that wants to know
-      whether a given person looked it up can test a guess. A contact
-      view is released only on a valid proof (Section 4.7), so a
-      dishonest home server cannot ask for someone else's level. It can
-      still spread one user's lookups over many hashes for public
-      answers; the per-domain limit and the scanning rule bound that.
+      of an address. Anyone who can guess an address can compute it,
+      and it is the same at every target, so a server that sees two
+      lookups can tell they are from one user. A contact view is
+      released only on a valid proof (Section 4.7), so a dishonest home
+      server cannot ask for someone else's level. It can still spread
+      one user's lookups over many hashes for public answers; the
+      per-domain limit and the scanning rule bound that.
 
    *  *Domain key rotation overlap.* Section 6.5 requires a rotation
       proof, so a new domainKey is accepted while clients hold the old

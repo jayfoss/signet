@@ -26,6 +26,10 @@ export interface SignetHeader {
   fingerprint: string;
   /** A Signet address other than the From address, e.g. for someone sending from consumer Gmail. */
   address?: string;
+  /** sha256 of the message body the attestation covers (Section 13.2.2). */
+  bodyHash?: string;
+  /** humans when the message carried Signet-Audience: humans. */
+  audience?: 'humans';
   /** Attestation by the sender's home server, signed with its domain key; see `attestationPayload`. */
   ts?: string;
   nonce?: string;
@@ -37,7 +41,14 @@ export interface AttestedFields {
   from: string;
   to: string[];
   subject: string;
+  /** sha256 of the body: the text/plain part, else the text/html part, with LF line ends and no trailing whitespace. */
+  bodyHash: string;
+  /** humans when the message is marked humans-only. */
+  audience?: 'humans';
 }
+
+/** The hash an attestation covers: the body with line endings changed to LF and trailing whitespace removed. */
+export const hashBody = (text: string): string => sha256(text.replace(/\r\n?/g, '\n').trimEnd());
 
 /**
  * What the domain key signs: the visible From, To and Subject, plus a timestamp, a nonce, the identity
@@ -54,6 +65,8 @@ export function attestationPayload(fields: AttestedFields, header: { fingerprint
     addr: header.address ?? null,
     ts: header.ts,
     nonce: header.nonce,
+    bodyHash: fields.bodyHash,
+    audience: fields.audience ?? null,
   };
 }
 
@@ -70,15 +83,17 @@ export function attestedSignetHeader(
   const ts = now.toISOString();
   const nonce = randomId('n');
   const sig = signJson(domainKey, attestationPayload(fields, { fingerprint, address, ts, nonce }));
-  return `v=signet0; server=${server}; fp=${fingerprint}${address ? `; addr=${address}` : ''}; ts=${ts}; nonce=${nonce}; sig=${sig}`;
+  return `v=signet0; server=${server}; fp=${fingerprint}${address ? `; addr=${address}` : ''}; ts=${ts}; nonce=${nonce}; bh=${fields.bodyHash}${fields.audience ? `; aud=${fields.audience}` : ''}; sig=${sig}`;
 }
 
 /**
  * True when the header's attestation is signed by `domainKey` for exactly this From, To and Subject and
  * is recent. The fingerprint must still be checked against the sender's verified directory entry.
  */
-export function verifyAttestation(header: SignetHeader, fields: AttestedFields, domainKey: string, now = new Date(), maxAgeMs = 7 * 86_400_000): boolean {
-  if (!header.ts || !header.nonce || !header.sig) return false;
+export function verifyAttestation(header: SignetHeader, fields: AttestedFields, domainKey: string, now = new Date(), maxAgeMs = 3_600_000): boolean {
+  if (!header.ts || !header.nonce || !header.sig || !header.bodyHash) return false;
+  // The body and audience the recipient sees must be what the header says, and what the domain signed.
+  if (header.bodyHash !== fields.bodyHash || header.audience !== fields.audience) return false;
   const age = now.getTime() - Date.parse(header.ts);
   if (!(age >= -300_000 && age <= maxAgeMs)) return false;
   const payload = attestationPayload(fields, { fingerprint: header.fingerprint, address: header.address, ts: header.ts, nonce: header.nonce });
@@ -107,9 +122,10 @@ export function parseSignetHeader(value: string | undefined): SignetHeader | nul
   const server = fields.get('server');
   const fingerprint = fields.get('fp');
   if (version !== 'signet0' || !server || !fingerprint) return null;
-  const optional = (['addr', 'ts', 'nonce', 'sig'] as const).flatMap((key) => {
+  const names = { addr: 'address', ts: 'ts', nonce: 'nonce', sig: 'sig', bh: 'bodyHash', aud: 'audience' } as const;
+  const optional = (Object.keys(names) as (keyof typeof names)[]).flatMap((key) => {
     const value = fields.get(key);
-    return value ? [[key === 'addr' ? 'address' : key, value] as const] : [];
+    return value ? [[names[key], value] as const] : [];
   });
   return { version, server, fingerprint, ...Object.fromEntries(optional) };
 }

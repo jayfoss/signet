@@ -22,6 +22,7 @@ import {
   UnlistedAddressError,
 } from './directory';
 import { decodeResponse, encodeRequest } from './bhttp';
+import { signRequesterProof } from './requester';
 import type { ApprovalCard, ApprovalChoice, AudienceMember, DisclosureContext, OrgClaim } from './disclosure';
 import { DisclosureError, audienceHash, verifyOrgClaim } from './disclosure';
 import { b64u, canonicalJson, fromB64u, utf8 } from './encoding';
@@ -34,7 +35,7 @@ import { EnrollmentError, HttpPairingChannel, completeEnrollment, newPairingSecr
 import type { Intent } from './intents';
 import type { GmailMailbox } from './gmail';
 import type { AttestedFields, LegacyAuth, SealedLegacyMail } from './legacy';
-import { AUDIENCE_HEADER, SIGNET_HEADER, hasLegacyCopy, openLegacyMail, parseSignetHeader, verifyAttestation } from './legacy';
+import { AUDIENCE_HEADER, SIGNET_HEADER, hasLegacyCopy, hashBody, isHumansOnly, openLegacyMail, parseSignetHeader, verifyAttestation } from './legacy';
 import type { MessageFields, SignedMessage } from './message';
 import { composeMessage, verifyMessage } from './message';
 import type { Addition, ClaimedKeyPackage, Joiner, Member } from './mls';
@@ -432,6 +433,15 @@ export class SignetClient {
       }
     }
     if (failed.length > 0) throw failed[0];
+  }
+
+  /**
+   * Whether a request to this address will be readable by the recipient's organisation escrow client. A sender
+   * MUST tell the person before sending (Section 4.3); the card says so on the escrow client's key.
+   */
+  async escrowRecipient(address: string, humansOnly = false): Promise<boolean> {
+    const { card } = await this.recipientFor(normalizeAddress(address));
+    return (humansOnly ? card.humanKeys : card.requestKeys).some((key) => key.escrow === true);
   }
 
   /** Mark a client this device approved itself, so `monitor` doesn't ask whether it was you. */
@@ -839,7 +849,7 @@ export class SignetClient {
   }
 
   /** A Signet header for an outgoing plain email, attested by this account's home server with its domain key. */
-  async signetHeader(fields: { to: string[]; subject: string }): Promise<string> {
+  async signetHeader(fields: { to: string[]; subject: string; bodyHash: string; humansOnly?: boolean }): Promise<string> {
     return ((await this.call('POST', '/v0/legacy/attest', fields)) as { header: string }).header;
   }
 
@@ -877,7 +887,7 @@ export class SignetClient {
 
   /** Plain email through the Gmail API (Gmail mode), carrying an attested Signet header. */
   async sendViaGmail(gmail: GmailMailbox, to: string[], fields: { subject: string; text: string; files?: FileInput[]; humansOnly?: boolean }): Promise<{ id: string }> {
-    const header = await this.signetHeader({ to, subject: fields.subject });
+    const header = await this.signetHeader({ to, subject: fields.subject, bodyHash: hashBody(fields.text), humansOnly: fields.humansOnly });
     return gmail.send({ from: this.address, to, subject: fields.subject, text: fields.text, signetHeader: header, humansOnly: fields.humansOnly, files: fields.files });
   }
 
@@ -891,7 +901,10 @@ export class SignetClient {
     const offers: GmailSignetOffer[] = [];
     for (const message of messages) {
       if (!message.signet || (message.humansOnly && !mayReadHumansOnly)) continue;
-      const signet = await this.checkSignetHeader({ from: message.from, to: message.to, subject: message.subject }, message.signet);
+      const signet = await this.checkSignetHeader(
+        { from: message.from, to: message.to, subject: message.subject, bodyHash: hashBody(message.text ?? ''), ...(message.humansOnly ? { audience: 'humans' as const } : {}) },
+        message.signet,
+      );
       if (signet) offers.push({ gmailId: message.id, from: message.from, subject: message.subject, signet, humansOnly: message.humansOnly });
     }
     return { historyId: next, offers };
@@ -1170,10 +1183,14 @@ export class SignetClient {
   }
 
   private async onLegacy(sealed: SealedLegacyMail): Promise<LegacyMail> {
-    const parsed = await simpleParser(await openLegacyMail(this.keys, sealed));
+    const raw = await openLegacyMail(this.keys, sealed);
+    const parsed = await simpleParser(raw);
     const from = parsed.from?.value[0]?.address ?? sealed.envelopeFrom;
     const to = (Array.isArray(parsed.to) ? parsed.to : parsed.to ? [parsed.to] : []).flatMap((group) => group.value.map((entry) => entry.address ?? ''));
-    const signet = await this.checkSignetHeader({ from, to, subject: parsed.subject ?? '' }, parsed.headers.get(SIGNET_HEADER.toLowerCase())?.toString());
+    const signet = await this.checkSignetHeader(
+      { from, to, subject: parsed.subject ?? '', bodyHash: hashBody(parsed.text ?? (typeof parsed.html === 'string' ? parsed.html : '')), ...(isHumansOnly(raw) ? { audience: 'humans' as const } : {}) },
+      parsed.headers.get(SIGNET_HEADER.toLowerCase())?.toString(),
+    );
     const lookalike = lookalikeOf(splitAddress(from).domain, knownDomains(this.state.admission, this.address)) ?? undefined;
     const trusted = sealed.auth.dmarc === 'pass' && isTrusted(this.state.admission, this.address, from) !== null;
     return {
@@ -1411,10 +1428,26 @@ export class SignetClient {
   }
 
   private async directoryEntry(who: string): Promise<DirectoryEntry> {
-    if (!this.direct) return (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(who)}`)) as DirectoryEntry;
+    if (!this.direct) {
+      // A lookup in another domain carries proof that this client is the requester it names, so the target
+      // releases its contact view to the right person only (Section 4.7).
+      const headers = splitAddress(who).domain === splitAddress(this.address).domain ? undefined : { 'signet-requester': await this.requesterProof(who) };
+      return (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(who)}`, undefined, headers)) as DirectoryEntry;
+    }
     const { local, domain } = splitAddress(who);
     const { server } = await this.resolver.policy(domain);
     return (await this.getJson(`${server}/v0/directory/${encodeURIComponent(local)}`)) as DirectoryEntry;
+  }
+
+  private ownLogEntries?: LogEntry[];
+
+  private async requesterProof(target: string): Promise<string> {
+    if (!this.ownLogEntries) {
+      const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
+      if (!own.log) throw new Error('home server did not return this account’s log');
+      this.ownLogEntries = own.log;
+    }
+    return signRequesterProof(this.keys, this.address, this.ownLogEntries, target);
   }
 
   /** Log queries go through the home server, which authenticates to the log as its domain. */
@@ -1554,12 +1587,13 @@ export class SignetClient {
 
   private preferredHome?: string;
 
-  private async request(base: string, method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<unknown> {
+  private async request(base: string, method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
     const binary = body instanceof Uint8Array;
     const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
     const headers = {
       ...clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, payload),
       ...(body === undefined ? {} : { 'content-type': binary ? 'application/octet-stream' : 'application/json' }),
+      ...extra,
     };
     const response = await this.fetchImpl(`${base}${path}`, { method, headers, body: body === undefined ? undefined : payload });
     if (!response.ok) throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
@@ -1615,11 +1649,11 @@ export class SignetClient {
   }
 
   /** A call to the first home that answers. */
-  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async call(method: 'GET' | 'POST', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
     let failure: unknown;
     for (const home of await this.homeBases()) {
       try {
-        const result = await this.request(home, method, path, body);
+        const result = await this.request(home, method, path, body, extra);
         this.preferredHome = home;
         return result;
       } catch (error) {

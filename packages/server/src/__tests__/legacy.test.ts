@@ -1,4 +1,4 @@
-import { Identity, formatSignetHeader } from '@signet/lib';
+import { Identity, formatSignetHeader, hashBody } from '@signet/lib';
 import { Testbed } from '../testbed';
 
 describe('plain email alongside Signet', () => {
@@ -47,17 +47,23 @@ describe('plain email alongside Signet', () => {
 
   it('authenticates a Signet header only when the sender\'s domain attested this exact email', async () => {
     const { jerzyPhone, alicePhone } = await phones();
-    const attested = await alicePhone.signetHeader({ to: ['jerzy@beta.test'], subject: 'Hello' });
+    const attested = await alicePhone.signetHeader({ to: ['jerzy@beta.test'], subject: 'Hello', bodyHash: hashBody('Hi') });
     const copied = formatSignetHeader(bed.server('alpha.test').url, alice.identityKey);
 
     await bed.sendPlainEmail({ from: 'alice@alpha.test', to: 'jerzy@beta.test', subject: 'Hello', text: 'Hi', headers: { Signet: attested } });
     await bed.sendPlainEmail({ from: 'alice@alpha.test', to: 'jerzy@beta.test', subject: 'Wire the deposit', text: 'Hi', headers: { Signet: copied } });
     await bed.sendPlainEmail({ from: 'alice@alpha.test', to: 'jerzy@beta.test', subject: 'New bank details', text: 'Hi', headers: { Signet: attested } });
+    // The same header on the same subject, but another body, is not what the domain attested.
+    await bed.sendPlainEmail({ from: 'alice@alpha.test', to: 'jerzy@beta.test', subject: 'Hello', text: 'Send the money to this account', headers: { Signet: attested } });
+    // The humans-only marking cannot be stripped or added in transit.
+    await bed.sendPlainEmail({ from: 'alice@alpha.test', to: 'jerzy@beta.test', subject: 'Hello', text: 'Hi', headers: { Signet: attested, 'Signet-Audience': 'humans' } });
 
-    const [genuine, fingerprintOnly, replayed] = await jerzyPhone.sync();
+    const [genuine, fingerprintOnly, replayed, otherBody, addedAudience] = await jerzyPhone.sync();
     expect(genuine.kind === 'legacy' && genuine.mail.signet).toEqual({ address: 'alice@alpha.test', onSignet: true, authenticated: true });
     expect(fingerprintOnly.kind === 'legacy' && fingerprintOnly.mail.signet).toEqual({ address: 'alice@alpha.test', onSignet: true, authenticated: false });
     expect(replayed.kind === 'legacy' && replayed.mail.signet).toEqual({ address: 'alice@alpha.test', onSignet: true, authenticated: false });
+    expect(otherBody.kind === 'legacy' && otherBody.mail.signet).toEqual({ address: 'alice@alpha.test', onSignet: true, authenticated: false });
+    expect(addedAudience.kind === 'legacy' && addedAudience.mail.signet).toEqual({ address: 'alice@alpha.test', onSignet: true, authenticated: false });
   });
 
   it('flags plain email from a domain that looks like a contact\'s', async () => {
@@ -94,7 +100,7 @@ describe('plain email alongside Signet', () => {
     expect(result).toEqual({ via: 'smtp' });
     expect(bed.sent).toHaveLength(1);
     expect(bed.sent[0].to).toEqual(['pat@gmail.test']);
-    expect(bed.sent[0].raw.replace(/\r?\n[ \t]+/g, ' ')).toMatch(/Signet: v=signet0; server=\S+; fp=\S+; ts=\S+; nonce=\S+; sig=\S+/);
+    expect(bed.sent[0].raw.replace(/\r?\n[ \t]+/g, ' ')).toMatch(/Signet: v=signet0; server=\S+; fp=\S+; ts=\S+; nonce=\S+; bh=sha256:\S+; sig=\S+/);
     expect(bed.sent[0].raw).toContain('notes.txt');
   });
 

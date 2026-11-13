@@ -165,6 +165,11 @@ describe('humans-only: the sender asks, the recipient decides', () => {
     await escrow.ready();
     const card = (await alicePhone.lookup('jerzy@beta.test'))?.card;
     expect(card?.humanKeys).toHaveLength(2);
+    // The escrow client's keys say so on the card, so a sender can tell the person (Section 4.3).
+    expect(card?.requestKeys.filter((key) => key.escrow)).toHaveLength(1);
+    expect(card?.humanKeys.filter((key) => key.escrow)).toHaveLength(1);
+    expect(await alicePhone.escrowRecipient('jerzy@beta.test')).toBe(true);
+    expect(await alicePhone.escrowRecipient('alice@alpha.test')).toBe(false);
 
     await alicePhone.sendRequest('jerzy@beta.test', { subject: 'Your sign-in code', note: '482 913' }, { humansOnly: true });
     expect(await escrow.sync()).toMatchObject([{ kind: 'request', request: { body: { audience: 'humans' } } }]);

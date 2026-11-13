@@ -33,7 +33,7 @@ function setup() {
     v: 'signet0',
     domain,
     server: homes[0].url,
-    homes: homes.map((home) => home.url),
+    replicas: homes.map((home) => home.url),
     mode: 'enforce',
     maxAge: 3600,
     domainKey: domainKey.publicKey,
@@ -76,7 +76,7 @@ describe('a resolver holding policies to the DNS pin', () => {
     const lying = { ...policy, server: 'https://evil.example', homes: ['https://evil.example'] };
     const { resolver } = resolverFor(lying, new Map([[domain, domainKey.publicKey]]));
     const accepted = await resolver.policy(domain);
-    expect(accepted.homes).toEqual(['https://home.alpha.example', 'https://home.beta.example']);
+    expect(accepted.replicas).toEqual(['https://home.alpha.example', 'https://home.beta.example']);
     expect(accepted.server).toBe('https://home.alpha.example');
   });
 
@@ -101,7 +101,7 @@ describe('a resolver holding policies to the DNS pin', () => {
     await resolver.policy(domain);
     served.policy = { ...policy, operators: signOperators(domainKey, { domain, seq: 4, notAfter: farFuture, homes: homes.slice(0, 1) }) };
     // The refresh fails, so the cached newer policy is kept (Section 6.5).
-    expect((await resolver.policy(domain)).homes).toHaveLength(2);
+    expect((await resolver.policy(domain)).replicas).toHaveLength(2);
   });
 
   it('keeps a pin case-sensitive when reading the DNS record', () => {

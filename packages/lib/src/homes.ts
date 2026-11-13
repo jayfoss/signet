@@ -1,8 +1,8 @@
 import type { DomainPolicy } from './directory';
 
 /** The base URLs of a domain's homes, in the policy's order of preference. A policy without `homes` has one. */
-export function policyHomes(policy: Pick<DomainPolicy, 'server' | 'homes'>): string[] {
-  const homes = policy.homes?.length ? policy.homes : [policy.server];
+export function policyHomes(policy: Pick<DomainPolicy, 'server' | 'replicas'>): string[] {
+  const homes = policy.replicas?.length ? policy.replicas : [policy.server];
   return [...new Set(homes.map(originOf))];
 }
 
@@ -13,7 +13,7 @@ const originOf = (url: string): string => new URL(url).origin;
  * statement has one group per operator (its url, then its replicas). Any other domain is one home, its
  * `homes` being replicas of it (Section 6.8).
  */
-export function homeGroups(policy: Pick<DomainPolicy, 'server' | 'homes' | 'operators'>): string[][] {
+export function homeGroups(policy: Pick<DomainPolicy, 'server' | 'replicas' | 'operators'>): string[][] {
   if (policy.operators) return policy.operators.body.homes.map((home) => [...new Set([home.url, ...(home.replicas ?? [])].map(originOf))]);
   return [policyHomes(policy)];
 }
@@ -29,7 +29,7 @@ export class HomeRegistry {
   private readonly groups = new Map<string, HomeGroup>();
 
   /** Record a policy's homes. A home keeps its last good replica across refreshes while that replica is still listed. */
-  register(policy: Pick<DomainPolicy, 'server' | 'homes' | 'operators'>): void {
+  register(policy: Pick<DomainPolicy, 'server' | 'replicas' | 'operators'>): void {
     for (const homes of homeGroups(policy)) {
       const group: HomeGroup = { homes, preferred: homes[0] };
       for (const origin of homes) {

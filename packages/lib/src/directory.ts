@@ -16,9 +16,9 @@ export interface DomainPolicy {
   v: 'signet0';
   domain: string;
   server: string;
-  /** Every home of a domain that runs several, in order of preference; `server` is the first (Section 6.8). */
-  homes?: string[];
-  /** The domain owner's signed list of independent homes (Section 6.9). When present, `homes` and `server` come from it. */
+  /** Every replica of a home that runs several, in order of preference; `server` is the first (Section 6.8). */
+  replicas?: string[];
+  /** The domain owner's signed list of independent homes (Section 6.9). When present, `replicas` and `server` come from it. */
   operators?: Operators;
   mode: 'enforce' | 'testing';
   maxAge: number;

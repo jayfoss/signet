@@ -358,7 +358,7 @@ export class SignetServer implements LegacyInbox {
       v: 'signet0',
       domain: this.options.domain,
       server,
-      ...(homes && homes.length > 1 ? { homes } : {}),
+      ...(homes && homes.length > 1 ? { replicas: homes } : {}),
       mode: 'enforce',
       maxAge: this.options.maxAge ?? 2_592_000,
       domainKey: this.options.domainKey?.publicKey ?? (this.options.domainPublicKey as string),
@@ -883,7 +883,7 @@ export class SignetServer implements LegacyInbox {
    */
   private async signedFetchHomes(domain: string, method: 'GET' | 'POST', path: string, body = ''): Promise<Response> {
     const policy = await this.options.resolver.policy(domain);
-    const bases = policy.operators ? (policy.homes ?? [policy.server]) : [policy.server];
+    const bases = policy.operators ? (policy.replicas ?? [policy.server]) : [policy.server];
     let last: Response | undefined;
     let failure: unknown;
     for (const base of bases) {

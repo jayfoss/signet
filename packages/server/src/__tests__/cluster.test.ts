@@ -121,9 +121,9 @@ describe('a domain with two homes and a witness', () => {
     expect(refused.status).toBe(421);
     expect(refused.headers.get('signet-primary')).toBe(primaryMember.url);
 
-    const policy = (await (await fetch(`${standby.url}/.well-known/signet.json`)).json()) as { server: string; homes: string[] };
-    expect(policy.homes).toEqual([w.members[0].url, w.members[1].url]);
-    expect(policy.server).toBe(policy.homes[0]);
+    const policy = (await (await fetch(`${standby.url}/.well-known/signet.json`)).json()) as { server: string; replicas: string[] };
+    expect(policy.replicas).toEqual([w.members[0].url, w.members[1].url]);
+    expect(policy.server).toBe(policy.replicas[0]);
 
     const answered = await fetch(`${primary.url}/.well-known/signet.json`);
     expect(answered.status).toBe(200);

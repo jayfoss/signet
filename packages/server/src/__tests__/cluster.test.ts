@@ -200,7 +200,8 @@ describe('a domain with two homes and a witness', () => {
     const { jerzyClient, aliceClient } = w;
     await jerzyClient.sendRequest('alice@alpha.test', { subject: 'First', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
     expect(kinds(await aliceClient.sync())).toEqual(['request']);
-    await until(() => w.standby().store.mailbox('alice').length === 1);
+    // Alice's acknowledgement empties the mailbox on the standby too, since it is replicated state.
+    await until(() => w.standby().store.mailbox('alice').length === 0);
 
     const dead = w.primary();
     const survivor = w.standby();
@@ -209,11 +210,12 @@ describe('a domain with two homes and a witness', () => {
 
     await jerzyClient.sendRequest('alice@alpha.test', { subject: 'Second', intent: { name: 'schedule.propose', args: { durationMin: 45 } } });
     // beta's first attempt may find no primary yet; its retries land the delivery.
-    await until(() => survivor.store.mailbox('alice').length === 2);
+    await until(() => survivor.store.mailbox('alice').length === 1);
+    // The seq goes on from where the first item left it: a deleted item's number is not reused.
+    expect(survivor.store.mailbox('alice').map((item) => item.seq)).toEqual([2]);
     const events = await aliceClient.sync();
     expect(kinds(events)).toEqual(['request']);
     expect(events[0].kind === 'request' && events[0].request.body.subject).toBe('Second');
-    expect(survivor.store.mailbox('alice').map((item) => item.seq)).toEqual([1, 2]);
   });
 
   it('does not acknowledge a change it could not commit, and forgets it', async () => {

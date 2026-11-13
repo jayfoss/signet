@@ -1,4 +1,4 @@
-import { randomInt } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { join } from 'node:path';
 import type {
   ClaimedKeyPackage,
@@ -164,6 +164,10 @@ export interface SignetServerOptions {
   /** Defaults to the address the server listens on. */
   publicUrl?: string;
   maxAge?: number;
+  /** Seconds a mailbox item is kept at most (Section 10.7). Default 30 days; published in the policy when it differs. */
+  mailboxRetentionSeconds?: number;
+  /** Seconds an attachment is kept at most (Section 8.9). Default 30 days; published in the policy when it differs. */
+  blobRetentionSeconds?: number;
   /** Lets anyone enroll an address over HTTP. Demo only: real enrollment goes through the org's admin. */
   openEnrollment?: boolean;
   /** Keep accounts, mailboxes and this server's keys in this folder, so they survive a restart. In memory if unset. */
@@ -244,6 +248,7 @@ class RelayError extends Error {
 const CLIENT_KINDS: MailKind[] = ['request', 'welcome', 'commit', 'message'];
 const SEALABLE_KINDS: MailKind[] = ['welcome', 'commit', 'message'];
 const HOUR = 3_600_000;
+const DEFAULT_RETENTION_MS = 30 * 24 * HOUR;
 /** Sealed deliveries wait this long for their recipient to register the token, at most this many per user. */
 const PARK_TTL_MS = 24 * HOUR;
 const PARK_CAP = 500;
@@ -361,6 +366,8 @@ export class SignetServer implements LegacyInbox {
       ...(homes && homes.length > 1 ? { replicas: homes } : {}),
       mode: 'enforce',
       maxAge: this.options.maxAge ?? 2_592_000,
+      ...(this.mailboxRetentionMs !== DEFAULT_RETENTION_MS ? { mailboxRetention: this.mailboxRetentionMs / 1000 } : {}),
+      ...(this.blobRetentionMs !== DEFAULT_RETENTION_MS ? { blobRetention: this.blobRetentionMs / 1000 } : {}),
       domainKey: this.options.domainKey?.publicKey ?? (this.options.domainPublicKey as string),
       ...(this.options.operators ? { operators: this.options.operators } : {}),
       vrfKey: this.vrfKey.public,
@@ -371,13 +378,45 @@ export class SignetServer implements LegacyInbox {
     };
   }
 
+  private get mailboxRetentionMs(): number {
+    return (this.options.mailboxRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
+  }
+
+  private get blobRetentionMs(): number {
+    return (this.options.blobRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
+  }
+
+  private sweepTimer?: NodeJS.Timeout;
+
   async listen(port = 0, host = '127.0.0.1'): Promise<string> {
     const url = await this.http.listen(port, host, this.options.publicUrl);
     this.cluster?.start();
+    this.sweepTimer = setInterval(() => void this.sweep(), 10 * 60_000);
+    this.sweepTimer.unref();
     return url;
   }
 
+  /**
+   * Delete what has outlived its retention: mailbox items (Section 10.7) and attachments (Section 8.9).
+   * A standby keeps its own attachments by the same rule and leaves the replicated state to the primary.
+   */
+  async sweep(now = Date.now()): Promise<void> {
+    try {
+      const before = new Date(now - this.mailboxRetentionMs).toISOString();
+      for (const local of this.store.userLocals()) this.store.expireMail(local, before);
+      for (const id of this.store.blobsBefore(now - this.blobRetentionMs)) {
+        await this.cluster?.deleteBlob(id);
+        this.store.deleteBlob(id);
+      }
+      await this.cluster?.expireBlobs(now - this.blobRetentionMs);
+      await this.cluster?.durable();
+    } catch {
+      // Not the primary, or it lost the role mid-sweep: the next one does it.
+    }
+  }
+
   async close(): Promise<void> {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.cluster?.close();
     this.cancelRetries();
     await this.http.close();
@@ -619,6 +658,26 @@ export class SignetServer implements LegacyInbox {
     await this.cluster?.durable();
   }
 
+  /**
+   * Record how far a client has read, then delete what every reading client of the account has (Section 10.7).
+   * A client that is revoked or holds no read scope is not waited for.
+   */
+  private acknowledge(client: ClientCert, body: { through?: number; epoch?: string }): { through: number } {
+    const epoch = this.store.epoch();
+    if (typeof body.through !== 'number' || !Number.isInteger(body.through) || body.through < 0) throw new HttpError(400, 'through must be a sequence number');
+    if (body.epoch !== undefined && body.epoch !== epoch) throw new HttpError(409, 'the mailbox store has changed; read it from the start', { 'signet-epoch': epoch ?? '' });
+    const { local } = splitAddress(client.principal);
+    this.store.ackMail(local, client.clientId, body.through);
+    const user = this.store.user(local);
+    if (user) {
+      const readers = activeClients(replayLog(user.log)).filter((cert) => cert.scopes.some((scope) => scope.startsWith('read:')) || cert.kind === 'org-escrow');
+      const acks = this.store.acks(local);
+      const floor = Math.min(...readers.map((cert) => acks[cert.clientId] ?? 0));
+      if (readers.length > 0 && floor > 0) this.store.dropMail(local, floor);
+    }
+    return { through: body.through };
+  }
+
   private limit(key: string, max: number, what: string): void {
     if (this.store.bump(key) > max) throw new HttpError(429, `too many ${what} today`);
   }
@@ -727,12 +786,18 @@ export class SignetServer implements LegacyInbox {
       const epoch = this.store.epoch();
       const known = url.searchParams.get('epoch');
       const after = known !== null && known !== epoch ? 0 : Number(url.searchParams.get('after') ?? 0);
-      return { items: this.store.mailbox(splitAddress(client.principal).local, after), epoch };
+      const { local } = splitAddress(client.principal);
+      this.store.expireMail(local, new Date(Date.now() - this.mailboxRetentionMs).toISOString());
+      return { items: this.store.mailbox(local, after), epoch };
     }
+    if (method === 'POST' && path === '/v0/mailbox/ack') return this.acknowledge(client, json<{ through?: number; epoch?: string }>(request));
     if (method === 'GET' && path === '/v0/contacts') return this.store.contactsOf(splitAddress(client.principal).local);
     if (method === 'POST' && path === '/v0/contacts') {
-      const { contacts = [], trustedDomains = [] } = json<{ contacts?: string[]; trustedDomains?: string[] }>(request);
-      this.store.addContacts(splitAddress(client.principal).local, contacts, trustedDomains);
+      const body = json<{ contacts?: string[]; trustedDomains?: string[]; removeContacts?: string[]; removeTrustedDomains?: string[] }>(request);
+      const { local } = splitAddress(client.principal);
+      this.store.addContacts(local, body.contacts ?? [], body.trustedDomains ?? []);
+      // Removals apply after additions (Section 7.9).
+      this.store.removeContacts(local, body.removeContacts ?? [], body.removeTrustedDomains ?? []);
       return { ok: true };
     }
     if (method === 'POST' && path === '/v0/contacts/grant') {
@@ -756,11 +821,23 @@ export class SignetServer implements LegacyInbox {
       return { ok: true };
     }
     if (method === 'POST' && path === '/v0/blobs') {
-      const id = randomId('blob');
+      // Sixteen random bytes: an id is the only thing that stops someone else fetching the ciphertext (Section 8.9).
+      const id = `blob_${randomBytes(16).toString('base64url')}`;
       // A replica keeps blobs beside its log and copies them to another home, so they never enter the log.
       if (this.cluster) await this.cluster.putBlob(id, request.body);
       else this.store.putBlob(id, request.body);
+      this.store.noteBlob(id, client.principal, Date.now());
       return { id, url: `${this.http.publicUrl}/v0/blobs/${id}` };
+    }
+    const owned = path.match(/^\/v0\/blobs\/([^/]+)$/);
+    if (method === 'DELETE' && owned) {
+      const id = decodeURIComponent(owned[1]);
+      const owner = this.store.blobOwner(id);
+      if (owner === undefined) throw new HttpError(404, 'no such blob');
+      if (owner !== client.principal) throw new HttpError(403, 'not your blob');
+      await this.cluster?.deleteBlob(id);
+      this.store.deleteBlob(id);
+      return { ok: true };
     }
     if (method === 'POST' && path === '/v0/legacy/send') return this.sendLegacy(client, json(request), request);
     if (method === 'POST' && path === '/v0/legacy/attest') {

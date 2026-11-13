@@ -22,6 +22,10 @@ export interface DomainPolicy {
   operators?: Operators;
   mode: 'enforce' | 'testing';
   maxAge: number;
+  /** Seconds a mailbox item is kept at most, when not the default 30 days (Section 10.7). */
+  mailboxRetention?: number;
+  /** Seconds an attachment is kept at most, when not the default 30 days (Section 8.9). */
+  blobRetention?: number;
   domainKey: string;
   /** VRF public key: proves each address's index in the transparency log (RFC 9381). */
   vrfKey: string;

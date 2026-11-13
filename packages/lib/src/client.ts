@@ -408,6 +408,32 @@ export class SignetClient {
     await this.callEach('POST', '/v0/contacts', { trustedDomains: [name] });
   }
 
+  async removeContact(address: string): Promise<void> {
+    const who = normalizeAddress(address);
+    this.state.admission.contacts = this.state.admission.contacts.filter((known) => known !== who);
+    await this.callEach('POST', '/v0/contacts', { removeContacts: [who] });
+  }
+
+  async untrustDomain(domain: string): Promise<void> {
+    const name = domain.toLowerCase();
+    this.state.admission.trustedDomains = this.state.admission.trustedDomains.filter((known) => known !== name);
+    await this.callEach('POST', '/v0/contacts', { removeTrustedDomains: [name] });
+  }
+
+  /** Delete an attachment this client uploaded, at every home that holds it (Section 8.9). Copies already fetched stay fetched. */
+  async deleteAttachment(ref: AttachmentRef): Promise<void> {
+    const failed: unknown[] = [];
+    for (const url of [ref.url, ...(ref.mirrors ?? [])]) {
+      const { origin, pathname } = new URL(url);
+      try {
+        await this.request(origin, 'DELETE', pathname);
+      } catch (error) {
+        failed.push(error);
+      }
+    }
+    if (failed.length > 0) throw failed[0];
+  }
+
   /** Mark a client this device approved itself, so `monitor` doesn't ask whether it was you. */
   acknowledgeClient(clientId: string): void {
     if (!this.state.knownOwnClients.includes(clientId)) this.state.knownOwnClients.push(clientId);
@@ -415,10 +441,9 @@ export class SignetClient {
 
   private async pullContacts(): Promise<void> {
     const shared = (await this.call('GET', '/v0/contacts')) as AdmissionPolicy;
-    this.state.admission = {
-      contacts: unique([...this.state.admission.contacts, ...shared.contacts]),
-      trustedDomains: unique([...this.state.admission.trustedDomains, ...shared.trustedDomains]),
-    };
+    // The stored list is authoritative (Section 7.9): additions were already uploaded, so a removal made by
+    // another client must not be undone by merging our old copy back in.
+    this.state.admission = { contacts: unique(shared.contacts), trustedDomains: unique(shared.trustedDomains) };
   }
 
   /** Hold a grant from this client's owner. The agent presents it only to the counterparty it names. */
@@ -932,6 +957,7 @@ export class SignetClient {
       lastAnswered = mailboxes.map((mailbox) => mailbox.home);
       if (this.released === 0) break;
     }
+    await this.acknowledgeMailboxes();
     events.push(...(await this.retryUnconfirmed()));
     events.push(...(await this.laggingHomes(lastAnswered)));
     await this.topUpKeyPackages();
@@ -1528,7 +1554,7 @@ export class SignetClient {
 
   private preferredHome?: string;
 
-  private async request(base: string, method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async request(base: string, method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<unknown> {
     const binary = body instanceof Uint8Array;
     const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
     const headers = {
@@ -1554,6 +1580,25 @@ export class SignetClient {
     if (results.length === 0) throw failure;
     return results;
   }
+
+  /**
+   * Tell each home how far this client has read, so it can delete what every reading client has (Section 10.7).
+   * It runs after the items were processed. A home that fails is told again at the next sync.
+   */
+  private async acknowledgeMailboxes(): Promise<void> {
+    for (const home of await this.homeBases()) {
+      const through = this.state.cursors[home] ?? 0;
+      if (through === 0 || through <= (this.acked[home] ?? 0)) continue;
+      try {
+        await this.request(home, 'POST', '/v0/mailbox/ack', { through, ...(this.state.epochs[home] ? { epoch: this.state.epochs[home] } : {}) });
+        this.acked[home] = through;
+      } catch {
+        // The next sync tries again.
+      }
+    }
+  }
+
+  private readonly acked: Record<string, number> = {};
 
   /** The mailbox of every home, each from its own cursor. A home that doesn't answer is skipped. */
   private async readMailboxes(): Promise<{ home: string; items: MailItem[] }[]> {

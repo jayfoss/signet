@@ -221,8 +221,11 @@ describe('a domain run by three operators who share nothing', () => {
     await until(() => w.has(w.homes[2], 'alice') === 1);
     expect(kinds(await w.clients.alice.sync())).toEqual(['request']);
     w.deliveryBlocked.clear();
-    await until(() => w.homes.every((server) => w.has(server, 'alice') === 1));
+    // The third home's copy was acknowledged and deleted when alice read it; the others now hold theirs.
+    await until(() => w.has(w.homes[0], 'alice') === 1 && w.has(w.homes[1], 'alice') === 1);
+    expect(w.has(w.homes[2], 'alice')).toBe(0);
     expect(kinds(await w.clients.alice.sync())).toEqual([]);
+    await until(() => w.homes.every((server) => w.has(server, 'alice') === 0));
   });
 
   it('delivers mail between two addresses on the domain to every home, and sends when the first home is down', async () => {

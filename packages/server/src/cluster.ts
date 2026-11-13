@@ -64,6 +64,12 @@ const MUTATORS = new Set([
   'putBlob',
   'spend',
   'addContacts',
+  'removeContacts',
+  'ackMail',
+  'dropMail',
+  'expireMail',
+  'noteBlob',
+  'deleteBlob',
   'updateViewGrants',
   'bump',
   'setClaims',
@@ -237,6 +243,19 @@ export class Cluster {
     if (!sent.some((outcome) => outcome.status === 'fulfilled')) throw new HttpError(503, 'could not keep the attachment on a second replica', { 'retry-after': '1' });
   }
 
+  /** Remove an attachment here and at the other replicas that hold a copy (Section 8.9). */
+  async deleteBlob(id: string): Promise<void> {
+    (this.blobs as BlobStore | undefined)?.delete(id);
+    const others = this.options.members.filter((member) => member.role === 'home' && member.id !== this.options.id);
+    await Promise.allSettled(others.map((member) => this.blobCall(member, 'DELETE', id)));
+  }
+
+  /** Remove this replica's attachments uploaded before an instant (ms), whatever the primary knew of them. */
+  async expireBlobs(before: number): Promise<void> {
+    const store = this.blobs as BlobStore | undefined;
+    for (const { id, at } of store?.list() ?? []) if (at < before) store?.delete(id);
+  }
+
   /** A stored attachment, from this replica or, failing that, from another home, which is then kept here. */
   async getBlob(id: string): Promise<Buffer | undefined> {
     const store = this.blobs as BlobStore;
@@ -256,7 +275,7 @@ export class Cluster {
     return undefined;
   }
 
-  private async blobCall(member: ClusterMember, method: 'GET' | 'POST', id: string, data?: Buffer): Promise<Buffer | undefined> {
+  private async blobCall(member: ClusterMember, method: 'GET' | 'POST' | 'DELETE', id: string, data?: Buffer): Promise<Buffer | undefined> {
     const path = `/v0/cluster/blob/${id}`;
     const response = await (this.options.fetchImpl ?? fetch)(`${member.url}${path}`, {
       method,
@@ -274,7 +293,7 @@ export class Cluster {
     const path = request.url.pathname;
     const blobId = /^\/v0\/cluster\/blob\/([^/]+)$/.exec(path)?.[1];
     const routes = ['/v0/cluster/vote', '/v0/cluster/append', '/v0/cluster/snapshot'];
-    if (blobId ? !['GET', 'POST'].includes(request.method) : request.method !== 'POST' || !routes.includes(path)) throw new HttpError(404, 'no such cluster route');
+    if (blobId ? !['GET', 'POST', 'DELETE'].includes(request.method) : request.method !== 'POST' || !routes.includes(path)) throw new HttpError(404, 'no such cluster route');
     const ok = verifyDomainAuth(
       header(request.headers, 'signet-domain'),
       this.options.domainKey.publicKey,
@@ -291,6 +310,10 @@ export class Cluster {
       if (!this.blobs || !BLOB_ID.test(blobId)) throw new HttpError(404, 'no attachments here');
       if (request.method === 'POST') {
         this.blobs.put(blobId, request.body);
+        return { ok: true };
+      }
+      if (request.method === 'DELETE') {
+        this.blobs.delete(blobId);
         return { ok: true };
       }
       const data = this.blobs.get(blobId);

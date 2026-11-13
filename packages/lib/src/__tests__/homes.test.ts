@@ -1,6 +1,6 @@
 import { HomeRegistry, failoverFetch, parseSignetTxt, policyHomes } from '..';
 
-const policy = { server: 'https://a.example.com', homes: ['https://a.example.com', 'https://b.example.com', 'https://c.example.com'] };
+const policy = { server: 'https://a.example.com', replicas: ['https://a.example.com', 'https://b.example.com', 'https://c.example.com'] };
 
 /** A fetch whose answer per origin is scripted; records the URLs it was asked for. */
 function scripted(answers: Record<string, () => Response | Error>) {

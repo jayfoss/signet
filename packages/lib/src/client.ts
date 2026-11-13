@@ -1263,7 +1263,7 @@ export class SignetClient {
     const path = `/v0/directory/${encodeURIComponent(local)}`;
     // Any home of the domain can answer; try them in the policy's order.
     let failure: unknown;
-    for (const base of policy.operators ? (policy.homes ?? [policy.server]) : [policy.server]) {
+    for (const base of policy.operators ? (policy.replicas ?? [policy.server]) : [policy.server]) {
       try {
         return await this.anonymousAt(base, domain, policy, path);
       } catch (error) {
@@ -1522,7 +1522,7 @@ export class SignetClient {
   /** The homes of this client's own domain, the one that last answered first. One home for any domain without a signed list. */
   private async homeBases(): Promise<string[]> {
     const policy = await this.resolver.policy(splitAddress(this.address).domain);
-    const bases = policy.operators ? (policy.homes ?? [policy.server]) : [policy.server];
+    const bases = policy.operators ? (policy.replicas ?? [policy.server]) : [policy.server];
     return this.preferredHome && bases.includes(this.preferredHome) ? [this.preferredHome, ...bases.filter((base) => base !== this.preferredHome)] : bases;
   }
 

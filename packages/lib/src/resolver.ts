@@ -105,7 +105,7 @@ abstract class CachingResolver implements Resolver {
       const seq = policy.operators.body.seq;
       if (seq < this.seqStore.get(domain)) return false;
       this.seqStore.set(domain, seq);
-      policy.homes = homes.map((home) => home.url);
+      policy.replicas = homes.map((home) => home.url);
       policy.server = homes[0].url;
       // The first home's gateway, from the owner's statement rather than the operator's word.
       if (homes[0].ohttp) policy.ohttp = homes[0].ohttp;

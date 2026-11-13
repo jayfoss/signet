@@ -135,11 +135,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       6.5.  Caching and Downgrade Resistance ........................ 52
       6.6.  Running Alongside Existing Mail ......................... 53
       6.7.  Open Issues ............................................. 53
-      6.8.  Multi-Home Domains ...................................... 53
+      6.8.  Clustered Homes ........................................ 53
          6.8.1.  Overview .......................................... 53
          6.8.2.  Replicas and Roles ................................ 53
          6.8.3.  Policy and Discovery .............................. 54
-         6.8.4.  Choosing a Home ................................... 54
+         6.8.4.  Choosing a Replica ................................. 54
          6.8.5.  Replicated State .................................. 55
          6.8.6.  Election and Replication .......................... 55
          6.8.7.  Failure Behaviour ................................. 56
@@ -2983,11 +2983,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |        |          | in this document are relative   |
    |             |        |          | to it.                          |
    +-------------+--------+----------+---------------------------------+
-   | homes       | array  | no       | Base URLs of the domain's homes |
-   |             |        |          | in order of preference, when it |
-   |             |        |          | runs more than one (Section     |
-   |             |        |          | 6.8). server MUST equal the     |
-   |             |        |          | first.                          |
+   | replicas    | array  | no       | Base URLs of the home's         |
+   |             |        |          | replicas in order of            |
+   |             |        |          | preference, when it runs more   |
+   |             |        |          | than one (Section 6.8). server  |
+   |             |        |          | MUST equal the first.           |
    +-------------+--------+----------+---------------------------------+
    | operators   | object | no       | The domain owner's signed list  |
    |             |        |          | of independent homes (Section   |
@@ -3019,6 +3019,16 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |        |          | Pass issuer whose tokens the    |
    |             |        |          | domain accepts on anonymous     |
    |             |        |          | requests (Section 10.5).        |
+   +-------------+--------+----------+---------------------------------+
+   | rotation    | object | no       | Present when domainKey has      |
+   |             |        |          | changed: from (the previous     |
+   |             |        |          | key) and sig, its signature     |
+   |             |        |          | over the change (Section 6.5).  |
+   +-------------+--------+----------+---------------------------------+
+   | serverSig   | string | no       | The domain key's signature over |
+   |             |        |          | server and replicas. Required   |
+   |             |        |          | when a URL is outside the       |
+   |             |        |          | domain (Section 6.4).           |
    +-------------+--------+----------+---------------------------------+
    | intake      | object | no       | keyId, agreeKey: the domain     |
    |             |        |          | intake's HPKE key, present only |
@@ -3089,6 +3099,26 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A home server MUST serve its policy at GET /.well-known/signet.json.
 
+   Server URLs.  The policy's server, and each entry of replicas, MUST
+   be an https URL with no user information, no query and no fragment.
+   A client checks each as follows:
+
+   1.  If the URL's host equals the domain or ends with . followed by
+       the domain, it is accepted.
+
+   2.  Otherwise the host belongs to a hosting provider. The client
+       accepts it only if the DNS record carries dk (Section 6.9.2),
+       domainKey equals dk, and serverSig is a valid Ed25519 signature
+       by domainKey over UTF-8(JCS({"v": "signet0", "domain": D,
+       "server": S, "replicas": R})), where D, S and R are the policy's
+       domain, server and replicas (the member is omitted if replicas
+       is absent). Any other policy counts as a failure for that host.
+
+   The signature means the policy host cannot move the domain's traffic
+   to a server the domain owner has not named. An attacker who also
+   controls the DNS record can still replace dk, so the signature
+   removes the policy host from the trust path but not the zone.
+
 6.5.  Caching and Downgrade Resistance
 
    A client SHOULD try to refresh a domain's policy on each use. When it
@@ -3109,6 +3139,29 @@ Experimental           Signet Protocol, Version 0          November 2026
    A cached policy with mode equal to testing gives no such protection:
    a failed refresh is reported as a failure. A domain SHOULD use
    testing while it sets Signet up and enforce after.
+
+   Key continuity.  A client that holds a cached policy for the domain
+   that has not expired and has mode equal to enforce MUST compare the
+   domainKey of each refreshed policy with the cached one. If they are
+   equal, the refresh is accepted. If they differ, the client accepts
+   the refresh only if the policy has a rotation object whose from
+   equals the cached domainKey and whose sig is a valid Ed25519
+   signature by that key over UTF-8(JCS({"v": "signet0", "domain": D,
+   "from": F, "to": T})), where F is from and T is the new domainKey. A
+   rotation that fails, or is missing, counts as a failed refresh: the
+   client keeps the cached policy as above and SHOULD report that the
+   domain key changed without proof.
+
+   A client with no cached policy, or one that has expired, trusts the
+   first domainKey it sees, as before. A domain that loses its key
+   therefore cannot rotate with proof; clients accept the new key once
+   their cached policies expire, which is at most maxAge seconds. A
+   domain SHOULD keep rotation in the policy until every cached policy
+   it issued has expired.
+
+   The DNS dk value does not override continuity, because an attacker
+   who can answer DNS can also set dk. It does bind a first-use client
+   to a key the zone owner chose (Section 6.9.2).
 
 6.6.  Running Alongside Existing Mail
 
@@ -3134,52 +3187,62 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 6.7.  Open Issues
 
-   *  *The domain key is not pinned.* A successful refresh replaces the
-      cached policy, including domainKey, vrfKey and log, with no
-      continuity check. An attacker who can obtain a valid certificate
-      for the policy host and answer its DNS can substitute a domain
-      key. Pinned identity keys and the transparency log still catch a
-      substituted identity key (Section 5.8), but the attacker can sign
-      legacy-mail attestations and server-to-server calls. A future
-      version should log domain policies in the transparency log or
-      require continuity between domainKey values.
+   *  *The domain key is pinned only after first use.* Section 6.5 makes
+      a client reject a new domainKey that lacks a signature from the
+      old one while its cached policy lasts. A client with no cached
+      policy, or an expired one, still trusts the first key it sees. An
+      attacker who can obtain a valid certificate for the policy host
+      and answer its DNS at that moment can substitute a domain key and
+      then sign legacy-mail attestations and server-to-server calls
+      for that client. Pinned identity keys and the transparency log
+      still catch a substituted identity key (Section 5.8). Logging
+      domain policies in the transparency log would close this and is
+      not specified.
 
-   *  *server is unconstrained.* The host field must be under the
-      domain, but the policy's server URL may point anywhere. This
-      allows hosted providers, and also means the policy host decides
-      where all traffic goes.
+   *  *Hosting needs dk.* A server or replica URL outside the domain is
+      accepted only with dk and serverSig (Section 6.4). That removes
+      the policy host from the trust path, but an attacker who also
+      controls the DNS record can set dk. A domain whose servers are
+      all under the domain is not affected.
 
-6.8.  Multi-Home Domains
+   *  *No rotation without the old key.* A domain that has lost its
+      domain key cannot prove a change. Clients accept the new key
+      once their cached policies expire, so an outage lasts up to
+      maxAge.
+
+6.8.  Clustered Homes
 
 6.8.1.  Overview
 
-   A domain MAY run several home servers, called homes, that hold the
-   same state. At any moment one of them is the primary and answers
-   requests; the others are standbys that copy the primary's changes
-   and can take over without anyone editing DNS. A domain with one home
-   is a cluster of one and needs nothing in this section.
+   A domain's home server MAY run as a cluster of servers, called
+   replicas, that hold the same state. At any moment one replica is the
+   primary and answers requests; the others are standbys that copy the
+   primary's changes and can take over without anyone editing DNS. A
+   home with one replica is a cluster of one and needs nothing in this
+   section. A cluster is one operator's home. Section 6.9 covers a
+   domain whose homes belong to different operators.
 
    The design has four aims:
 
-   1.  Mail keeps flowing when a home, or the provider that hosts it,
-       fails. Homes are found through _signet and the policy host, not
-       through MX (Section 6.1), so an outage at the domain's mail
-       provider does not touch them.
+   1.  Mail keeps flowing when a replica, or the provider that hosts
+       it, fails. Replicas are found through _signet and the policy
+       host, not through MX (Section 6.1), so an outage at the
+       domain's mail provider does not touch them.
 
    2.  A change the primary has acknowledged is never lost by a
        failover.
 
    3.  There are never two primaries accepting changes.
 
-   4.  Callers need no new configuration: the policy lists the homes
+   4.  Callers need no new configuration: the policy lists the replicas
        and the callers choose among them (Section 6.8.4).
 
-   It does not spread load, allow writes on more than one home at a
+   It does not spread load, allow writes on more than one replica at a
    time, or let one cluster span operators who do not trust each other
    (Section 6.8.9).
 
-   Homes do not order MLS commits. Section 8.11 describes that gap; it
-   is the same with one home or many.
+   Replicas do not order MLS commits. Section 8.11 describes that gap;
+   it is the same with one replica or many.
 
 6.8.2.  Replicas and Roles
 
@@ -3189,7 +3252,7 @@ Experimental           Signet Protocol, Version 0          November 2026
    +=========+=======================================================+
    | Role    | Behaviour                                             |
    +=========+=======================================================+
-   | home    | Keeps the replication log, applies it to a full copy  |
+   | replica | Keeps the replication log, applies it to a full copy  |
    |         | of the home's state, serves the policy, votes, and    |
    |         | can become primary. Listed in the policy.             |
    +---------+-------------------------------------------------------+
@@ -3199,11 +3262,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    +---------+-------------------------------------------------------+
 
    Every replica votes. A majority is more than half of all replicas.
-   The cluster keeps working while a majority can talk to each other,
-   so it survives the loss of floor((N - 1) / 2) of N replicas. Two
-   homes alone survive no failure, since neither is a majority; two
-   homes and a witness survive one. A cluster SHOULD have an odd number
-   of replicas.
+   The cluster keeps working while a majority can talk to each other, so
+   it survives the loss of floor((N - 1) / 2) of N replicas. Two
+   replicas alone survive no failure, since neither is a majority; two
+   replicas and a witness survive one. A cluster SHOULD have an odd
+   number of replicas.
 
    A witness stores the replication log, and the log holds everything
    a home holds: mailbox items, key packages, parked deliveries and
@@ -3214,44 +3277,44 @@ Experimental           Signet Protocol, Version 0          November 2026
    All replicas of a home use the same key and the same VRF, OHTTP
    gateway and intake keys: they are one server in several places, not
    several servers. The operator supplies these keys to each replica.
-   For a domain whose homes are run by one party, that key is the
-   domain key. A domain whose homes belong to different operators uses
-   Section 6.9 instead, and no replica holds the domain key.
+   For a domain with one operator, that key is the domain key. A
+   domain whose homes belong to different operators uses Section 6.9
+   instead, and no replica holds the domain key.
 
 6.8.3.  Policy and Discovery
 
-   The policy (Section 6.2) gains one field, homes: an array of one to
-   seven base URLs, in order of preference, one for each home. Witnesses
-   are never listed. When homes is present, server MUST equal its first
-   element, so that a client that ignores homes still works. When it is
-   absent, the domain has one home, server. All replicas serve the same
-   policy.
+   The policy (Section 6.2) gains one field, replicas: an array of one
+   to seven base URLs, in order of preference, one for each replica that
+   can become primary. Witnesses are never listed. When replicas is
+   present, server MUST equal its first element, so that a client that
+   ignores replicas still works. When it is absent, the home has one
+   replica, server. All replicas serve the same policy.
 
    The host field of the DNS record (Section 6.3) MAY list several
    hostnames separated by commas. Each is checked as Section 6.3 says
    for a single host, and the candidate hosts are the listed ones, in
-   order. Each home serves the policy at /.well-known/signet.json
+   order. Each replica serves the policy at /.well-known/signet.json
    whatever its role and whether or not a primary exists, so discovery
    works during an election and does not depend on one host being up.
 
-6.8.4.  Choosing a Home
+6.8.4.  Choosing a Replica
 
    A caller is a client of the domain, or the server of another domain
-   delivering or querying. To make a request to a domain with several
-   homes, a caller:
+   delivering or querying. To make a request to a home with several
+   replicas, a caller:
 
-   1.  Tries the home that last worked first, then the others in
-       policy order.
+   1.  Tries the replica that last worked first, then the others
+       in policy order.
 
-   2.  Moves to the next home when a request fails to connect, times
+   2.  Moves to the next replica when a request fails to connect, times
        out, or gets a response of 500 or above.
 
-   3.  When a home answers 421, reads its Signet-Primary field. If the
-       value is the base URL of a home in the policy, the caller sends
-       the request there once. It MUST NOT use a URL that is not one
-       of the policy's homes.
+   3.  When a replica answers 421, reads its Signet-Primary field. If
+       the value is the base URL of a replica in the policy, the caller
+       sends the request there once. It MUST NOT use a URL that is not
+       one of the policy's replicas.
 
-   4.  When every home has failed, treats the failure as temporary. A
+   4.  When every replica has failed, treats the failure as temporary. A
        delivery is queued and retried as Section 10.6 says.
 
    A replica that is not the primary answers every request other than
@@ -3262,10 +3325,10 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A request that fails after it was sent, such as a dropped
    connection, may have taken effect. A caller MAY send it again. A
-   receiving home MUST ignore a delivery whose id is already in the
+   receiving replica MUST ignore a delivery whose id is already in the
    recipient's mailbox (Section 6.9.5).
 
-   A caller learns which home is primary from 421 answers. The
+   A caller learns which replica is primary from 421 answers. The
    primary's position changes at election time; the policy does not.
 
 6.8.5.  Replicated State
@@ -3279,22 +3342,22 @@ Experimental           Signet Protocol, Version 0          November 2026
    are not replicated; a failover loses them, and the owner opens a
    new one.
 
-   Attachment ciphertext (Section 8.9) is not part of the log, since
-   a file of tens of megabytes would otherwise sit in every replica's
-   log and every snapshot. The primary keeps each blob beside its
-   log and copies it to the other homes with a signed
-   POST /v0/cluster/blob/{id}, and answers the upload only once at
-   least one other home has acknowledged, if the cluster has one. If
-   none can be reached it answers 503. Any home serves GET
-   /v0/blobs/{id}, and a home that lacks a blob asks the others for it
-   with a signed GET /v0/cluster/blob/{id} and keeps what it gets. A
-   witness holds no blobs. Version 0 does not copy a blob again once
-   the replicas that held it are gone.
+   Attachment ciphertext (Section 8.9) is not part of the log, since a
+   file of tens of megabytes would otherwise sit in every replica's log
+   and every snapshot. The primary keeps each blob beside its log and
+   copies it to the other replicas with a signed POST
+   /v0/cluster/blob/{id}, and answers the upload only once at least one
+   other replica has acknowledged, if the cluster has one. If none can
+   be reached it answers 503. Any replica serves GET /v0/blobs/{id}, and
+   a replica that lacks a blob asks the others for it with a signed GET
+   /v0/cluster/blob/{id} and keeps what it gets. A witness holds no
+   blobs. Version 0 does not copy a blob again once the replicas that
+   held it are gone.
 
    Changes travel as batches of commands. Every replica applies the
    same batches in the same order, so a mailbox item has the same seq
-   on every home, and a client may use the cursor it holds with any
-   home.
+   on every replica, and a client may use the cursor it holds with any
+   replica.
 
    The primary MUST NOT answer a request until every change the
    request made, and every change made before it, is committed
@@ -3308,7 +3371,7 @@ Experimental           Signet Protocol, Version 0          November 2026
    but did not commit, by rebuilding its state from the committed part
    of its log.
 
-   When a home becomes primary it MUST rebuild whatever it derived
+   When a replica becomes primary it MUST rebuild whatever it derived
    from the store (for example which users are unlisted) and schedule
    every delivery in the retry queue. Only the primary retries
    deliveries.
@@ -3334,13 +3397,13 @@ Experimental           Signet Protocol, Version 0          November 2026
        as its own. Witnesses grant votes the same way and never
        stand as candidates.
 
-   4.  A home that hears nothing from a primary for a random time
+   4.  A replica that hears nothing from a primary for a random time
        between T and 2T first asks the others for a pre-vote: would
        they vote for it in the next term? A replica grants one only if
        the candidate's log is at least as up to date as its own, it
        has not heard from a primary for T, and it is not a primary
        itself. A pre-vote changes nothing on the replica that grants
-       it. Only if a majority grants does the home raise its term and
+       it. Only if a majority grants does the replica raise its term and
        start an election, so a replica that is merely cut off does
        not force an election when it returns. T is 1000 milliseconds
        unless configured. The primary sends a heartbeat every T/5.
@@ -3407,7 +3470,7 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------------------------+----------------------------------------+
    | The primary fails        | After T to 2T, a standby with the most |
    |                          | complete log wins an election. Callers |
-   |                          | follow 421 or move to the next home.   |
+   |                          | follow 421 or move to the next replica |
    +--------------------------+----------------------------------------+
    | A partition              | The side with a majority elects a      |
    |                          | primary if it needs one. The old       |
@@ -3450,13 +3513,13 @@ Experimental           Signet Protocol, Version 0          November 2026
       domain key and are accepted only from configured members. The
       cluster routes SHOULD NOT be reachable from the public Internet.
 
-   *  *Homes in the policy are trusted like server.* Section 6.7
-      already notes that server is unconstrained. homes is the same,
-      with more entries.
+   *  *Replicas in the policy are trusted like server.* Section 6.7
+      already notes that server is unconstrained. replicas is the
+      same, with more entries.
 
    *  *Signet-Primary is a hint.* A caller uses it only for URLs
       already in the policy, so a hostile replica can send a caller
-      to a home it already trusts and no further.
+      to a replica it already trusts and no further.
 
 6.8.10.  Open Issues
 
@@ -3472,10 +3535,10 @@ Experimental           Signet Protocol, Version 0          November 2026
       the transparency log would let outsiders check who was primary
       and when. It is not specified.
 
-   *  *Ambiguous retries.* Deliveries repeat after an ambiguous
-      failure. Section 6.8.4 asks homes to drop a repeated delivery id;
-      the effect of a repeat on a sealed delivery whose token has been
-      spent is not described.
+   *  *Ambiguous retries.* Deliveries repeat after an ambiguous failure.
+      Section 6.8.4 asks replicas to drop a repeated delivery id; the
+      effect of a repeat on a sealed delivery whose token has been spent
+      is not described.
 
 6.9.  Multi-Operator Domains
 
@@ -3500,7 +3563,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    | A hostile operator  | Why                                       |
    +=====================+===========================================+
    | cannot read         | Messages, attachments and legacy mail are |
-   | content             | encrypted to client keys.                 |
+   | message content     | encrypted to client keys. One exception:  |
+   |                     | a domain with an intake shares the intake |
+   |                     | key with every home, so each home can     |
+   |                     | open first-contact requests to unlisted   |
+   |                     | addresses (Section 4.11).                 |
    +---------------------+-------------------------------------------+
    | cannot forge a      | Messages and requests are signed by       |
    | message or identity | client and identity keys; account logs    |
@@ -3580,10 +3647,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    domain, seq or notAfter fails the checks above. A policy host that
    fails them counts as failed (Section 6.4).
 
-   Once accepted, a client treats homes as the policy's homes
-   (Section 6.8.3), the first home's url as server and its ohttp as
-   the policy's ohttp. A domain with operators has no unsigned homes
-   or ohttp field.
+   Once accepted, a client treats homes as the servers to choose among
+   (Section 6.8.4), the first home's url as server and its ohttp as the
+   policy's ohttp. A domain with operators has no unsigned homes or
+   ohttp field.
 
 6.9.3.  Home Keys and Server Calls
 
@@ -4882,6 +4949,51 @@ Experimental           Signet Protocol, Version 0          November 2026
    6.  Otherwise registers the new delivery-token hash and reports
        rekeyed with the new epoch, members and participants.
 
+   Concurrent commits.  Two members can commit from the same epoch
+   before either has seen the other's commit. There is no ordering
+   service, so every client applies the same deterministic rule and all
+   converge on one commit:
+
+   1.  Commits are compared only when they start from the same epoch of
+       the same thread. The commit with the numerically smallest
+       SHA-256 hash of its MLSMessage bytes, compared as unsigned
+       big-endian integers, wins. The hash is of the bytes as submitted,
+       so every recipient computes the same value.
+
+   2.  A client keeps the group state of the epoch before the latest
+       commit it applied, and the secrets needed to decrypt that
+       epoch's messages, until it has held the later epoch for 5
+       minutes. It then discards them.
+
+   3.  A client that receives a competing commit during that time,
+       whose hash is smaller than the commit it applied, rolls back to
+       the saved state, applies the winning commit instead, and then
+       decrypts again any message it could not read. A competing commit
+       with a larger hash is ignored.
+
+   4.  The member whose commit lost recomputes the changes it still
+       needs (Section 8.8 steps 1 to 4) against the winning epoch and,
+       if any remain, submits a new commit.
+
+   5.  A client that cannot decrypt a message from an epoch it has
+       already left MUST retain the message for the same 5 minutes
+       before reporting an error, because the winning commit can arrive
+       after the message does.
+
+   A commit that wins still has to pass the checks in steps 2 and 3
+   above. A client that has discarded its saved state and then receives
+   a competing commit for an epoch it has left MUST ignore it. If its
+   group state has diverged in a way it cannot repair, the client MUST
+   report the thread as forked and MUST NOT send further messages in it
+   until it has rejoined by a new welcome.
+
+   A member can choose its commit to have a small hash, for example by
+   varying its key package choices or proposal order, and so win a
+   race. This lets a member decide between two valid commits at the
+   same epoch, but any member can already commit, and every commit is
+   checked against the owners' contact views, so it gains nothing a
+   single commit would not.
+
 8.9.  Attachments
 
    Attachments are encrypted by the sender and uploaded as opaque blobs.
@@ -4959,12 +5071,15 @@ Experimental           Signet Protocol, Version 0          November 2026
 8.11.  Open Issues
 
    *  *Commit ordering.* MLS needs the delivery service to order commits
-      within an epoch. Signet version 0 has no ordering service: if two
-      members commit in the same epoch, members may apply different
-      commits and the group forks. A conforming implementation SHOULD
-      designate a committer per thread (for example the thread creator's
-      home server) or adopt a resolution rule, and members MUST detect
-      and recover from a fork.
+      within an epoch. Signet version 0 has none, so Section 8.8 uses a
+      deterministic tie-break (smallest commit hash wins) with a
+      5-minute rollback window. This converges only if every member
+      receives every commit inside that window. A member that is
+      offline longer than the window can end on a losing commit, and
+      messages sent in the losing epoch are lost to it. A fork that
+      exceeds the window is detected but is not repaired except by a
+      new welcome. An ordering service, or a designated committer per
+      thread, would remove the window and is left to a later version.
 
    *  *Thread ids are visible to servers.* The thread field of the
       payload and the welcome is sent in the clear. Servers can link all

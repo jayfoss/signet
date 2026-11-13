@@ -2007,10 +2007,14 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |                 |          | over card.             |
    +-------------+-----------------+----------+------------------------+
 
-   A RequestKey has keyId and agreeKey. keyId is the SHA-256 hash, in
+   A RequestKey has keyId and agreeKey, and escrow: true when the key
+   belongs to an org-escrow client. A sender MUST show the person,
+   before sending, that a request will be readable by an escrow client.
+   keyId is the SHA-256 hash, in
    sha256: form, of the UTF-8 string signet0 request key  followed by
-   agreeKey. Request keys carry no client id and no kind, so strangers
-   cannot count or tell apart an account's devices and agents.
+   agreeKey. Request keys carry no client id and no kind other than
+   escrow, so strangers cannot count or tell apart an account's devices
+   and agents. They can tell which keys belong to escrow clients.
 
    The card is derived from the replayed log at time now:
 
@@ -2029,7 +2033,8 @@ Foss                    Expires 15 May 2027                    [Page 34]
 Experimental           Signet Protocol, Version 0          November 2026
 
    4.  requestKeys lists the front set, followed by every active
-       org-escrow client not already in it.
+       org-escrow client not already in it. Each escrow client's entry
+       has escrow: true, including one that is also in the front set.
 
    5.  humanKeys lists every active client that reads humans-only mail
        (Section 11.3).
@@ -3243,8 +3248,8 @@ Experimental           Signet Protocol, Version 0          November 2026
    fetches the latest domain-key leaf for the domain (Section 5.3.1)
    with an inclusion proof against a fresh head carrying the
    cosignatures it requires (Sections 5.5.1 and 5.5.2), and requires
-   the leaf's domainKey to equal the policy's. A policy that fails is a failed
-   fetch for that host. The log is the one in the policy, so this
+   the leaf's domainKey to equal the policy's. A policy that fails is a
+   failed fetch for that host. The log is the one in the policy, so this
    catches an attacker who can substitute a policy but not one who also
    controls that log and the witnesses. A domain that loses its key
    therefore cannot rotate with proof; clients accept the new key once
@@ -3625,10 +3630,11 @@ Experimental           Signet Protocol, Version 0          November 2026
       the transparency log would let outsiders check who was primary
       and when. It is not specified.
 
-   *  *Ambiguous retries.* Deliveries repeat after an ambiguous failure.
-      Section 6.8.4 asks replicas to drop a repeated delivery id; the
-      effect of a repeat on a sealed delivery whose token has been spent
-      is not described.
+   *  *Ambiguous retries.* Section 6.8.4 asks replicas to drop a
+      repeated delivery id. A replica that already holds a delivery id
+      MUST answer a repeat with the same success answer, without
+      checking the delivery token again, so a sealed delivery whose
+      token the first attempt spent is not refused on retry.
 
 6.9.  Multi-Operator Domains
 
@@ -5149,6 +5155,13 @@ Experimental           Signet Protocol, Version 0          November 2026
    |         |        |          | sha256: form.                        |
    +---------+--------+----------+--------------------------------------+
 
+   Blob ids MUST be at least 16 random bytes in b64u after blob_. The
+   uploader can remove a blob with DELETE /v0/blobs/{id}
+   (client-authenticated; 404 once it has gone). A server MUST delete a
+   blob 30 days after upload and MAY set a shorter limit, which it
+   publishes in the policy field blobRetention in seconds. In a domain
+   with several homes, the uploader deletes at each home.
+
    A receiver fetches url with GET /v0/blobs/{id} (no authentication),
    checks the ciphertext digest, decrypts, and checks that the plaintext
    length equals size. Any mismatch is an error. If url cannot be
@@ -5183,8 +5196,10 @@ Experimental           Signet Protocol, Version 0          November 2026
       traffic of a thread, not just of an epoch.
 
    *  *Blob URLs are bearer capabilities.* Anyone with the URL can
-      download the ciphertext, and version 0 has no way to revoke one. A
-      server SHOULD expire blobs and SHOULD use unguessable ids.
+      download the ciphertext until the blob is deleted or expires.
+      Section 8.9 lets the uploader delete it and requires expiry, but
+      a copy already downloaded cannot be recalled, and the key is in
+      the message anyway.
 
 9.  Intents and Grants
 
@@ -6385,9 +6400,12 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 11.7.  Open Issues
 
-   *  *The header is unauthenticated.* Signet-Audience is not covered by
-      the Signet attestation (Section 13.2) and is usually outside DKIM
-      signatures, so any hop can add or remove it. Removing it exposes a
+   *  *The header is unauthenticated unless attested.* Signet-Audience
+      is covered by the Signet attestation (Section 13.2), and a
+      recipient MUST treat an attested message whose audience does not
+      match its header as unauthenticated. A message with no
+      attestation, including mail from a domain without Signet, still
+      carries a header any hop can add or remove. Removing it exposes a
       humans-only email to agents; adding it hides an ordinary email
       from them.
 
@@ -6395,10 +6413,10 @@ Experimental           Signet Protocol, Version 0          November 2026
       applied by each client, not by encryption. A client that ignores
       it can read humans-only mail.
 
-   *  *Escrow is not visible on the card.* Request keys are unlabeled,
-      so a stranger sending a first request cannot tell that an escrow
-      client will receive it. Only contacts with the view see the escrow
-      kind. A future version may flag escrow keys on the card.
+   *  *Escrow is labelled, not hidden.* Request keys of escrow clients
+      carry escrow: true (Section 4.3), and a sender MUST tell the
+      person. A sender that ignores the label still sends to the
+      escrow client, because the key is in the list.
 
 12.  Live Sessions and Handoff
 
@@ -6666,12 +6684,14 @@ Experimental           Signet Protocol, Version 0          November 2026
    Signet-Audience: humans (Section 11.6).
 
       POST /v0/legacy/attest        (client-authenticated)
-      { "to": ["dana@example.org"], "subject": "Board pack" }
-      → { "header": "v=signet0; server=…; fp=…; ts=…; nonce=…; sig=…" }
+      { "to": ["dana@example.org"], "subject": "Board pack",
+        "bodyHash": "sha256:…", "humansOnly": false }
+      → { "header": "v=signet0; server=…; fp=…; ts=…; nonce=…;
+          bh=…; aud=…; sig=…" }
 
    This returns a header value for a message the client will send itself
    (Gmail mode). The same 403 and 404 checks apply, and 400 if to is
-   empty or subject is not a string.
+   empty, subject is not a string, or bodyHash is not a hash.
 
 13.2.2.  The Signet Header Field
 
@@ -6728,6 +6748,12 @@ Experimental           Signet Protocol, Version 0          November 2026
    | nonce  | for attestation | n_ followed by 12 random bytes in      |
    |        |                 | b64u.                                  |
    +--------+-----------------+----------------------------------------+
+   | bh     | for attestation | sha256 of the message body, as below.  |
+   +--------+-----------------+----------------------------------------+
+   | aud    | no              | humans if the message carries          |
+   |        |                 | Signet-Audience: humans; absent        |
+   |        |                 | otherwise.                             |
+   +--------+-----------------+----------------------------------------+
    | sig    | for attestation | The domain key's signature over the    |
    |        |                 | attestation payload below.             |
    +--------+-----------------+----------------------------------------+
@@ -6742,13 +6768,18 @@ Experimental           Signet Protocol, Version 0          November 2026
         "fp": "sha256:Tq…",
         "addr": null,
         "ts": "2026-11-11T09:30:00.000Z",
-        "nonce": "n_Wc2m0aL2vTq1xYb0aLcd"
+        "nonce": "n_Wc2m0aL2vTq1xYb0aLcd",
+        "bodyHash": "sha256:…",
+        "audience": null
       }
 
    from is lowercased. to is lowercased and sorted. addr is null when
-   absent. The home server signs only for its own enrolled user's
-   address as from, with the fingerprint of that user's bound identity
-   key.
+   absent. bodyHash is the hash of the body: the text/plain part if the
+   message has one, otherwise the text/html part, decoded to UTF-8,
+   with line endings changed to LF and trailing whitespace removed from
+   the end of the whole body. audience is humans or null. The home
+   server signs only for its own enrolled user's address as from, with
+   the fingerprint of that user's bound identity key.
 
    The header field is outside the protection of SMTP and is usually not
    covered by DKIM, so any hop can add, remove or copy it. The
@@ -6847,9 +6878,12 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    5.  authenticated is true if onSignet is true, F's domain has a
        Signet policy, and the attestation verifies with that domain's
-       key over F, T, S and the header's fp, addr, ts and nonce, with ts
-       no more than 5 minutes in the future and no more than 7 days in
-       the past.
+       key over F, T, S, the body hash the recipient computes (Section
+       13.2.2), the audience the recipient sees in Signet-Audience, and
+       the header's fp, addr, ts and nonce, with ts no more than 5
+       minutes in the future and no more than 1 hour in the past. A
+       header with no bh, or whose bh does not match, is not
+       authenticated.
 
    The attestation MUST come from F's own domain: nobody else can vouch
    for mail from that address.
@@ -6912,10 +6946,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 13.9.  Open Issues
 
-   *  *Header replay.* The attestation covers From, To and Subject and
-      is valid for 7 days. Recipients do not track nonces, so the same
-      header can be replayed on another message with the same From, To
-      and Subject within that time. The body is not covered.
+   *  *Header replay within an hour.* The attestation covers From, To,
+      Subject, the body hash and the audience, and is valid for one
+      hour. A recipient that does not track nonces can still be shown
+      the same message twice in that time, and a sender can reuse a
+      header on a message it sends again unchanged.
 
    *  *Upgrading conversations.* Version 0 detects Signet senders in
       plain email but does not specify how a reply moves the

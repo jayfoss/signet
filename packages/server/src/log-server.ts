@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
-import type { KeyPair, LogLeaf, Resolver } from '@signet/lib';
-import { MerkleLog, ReplayCache, verifyDomainCall } from '@signet/lib';
+import type { Cosignature, KeyPair, LogLeaf, Resolver, TreeHead } from '@signet/lib';
+import { MerkleLog, ReplayCache, domainKeyIndex, verifyDomainCall, verifyRotation } from '@signet/lib';
 import type { HttpRequest } from './http';
 import { HttpError, JsonServer, header, json } from './http';
 
@@ -21,6 +21,9 @@ export class TransparencyLogServer {
     private readonly limits = { queriesPerDomainPerDay: 50_000, queriesPerRequesterPerDay: 1_000, anonymousQueriesPerIpPerDay: 20 },
     /** Append-only file of leaves, one JSON line each. Without it the log lives in memory and a restart forks it. */
     private readonly dataFile?: string,
+    /** Witnesses to ask for cosignatures on each head (Section 5.5.1). */
+    private readonly witnessUrls: string[] = [],
+    private readonly fetchImpl: typeof fetch = fetch,
   ) {
     this.log = new MerkleLog(key);
     if (dataFile && existsSync(dataFile)) {
@@ -50,14 +53,14 @@ export class TransparencyLogServer {
     const key = url.searchParams.get('key') ?? '';
     // Leaves are filed by the domain that wrote them and the address's index within it.
     const domain = url.searchParams.get('domain') ?? '';
-    if (method === 'GET' && url.pathname === '/v0/tree-head') return this.log.treeHead();
+    if (method === 'GET' && url.pathname === '/v0/tree-head') return this.head();
     if (method === 'GET' && url.pathname === '/v0/latest') {
       await this.authorizeQuery(request);
-      return this.log.latest(domain, key);
+      return { ...this.log.latest(domain, key), head: await this.head() };
     }
     if (method === 'GET' && url.pathname === '/v0/history') {
       await this.authorizeQuery(request);
-      return { history: this.log.history(domain, key), head: this.log.treeHead() };
+      return { history: this.log.history(domain, key), head: await this.head() };
     }
     if (method === 'GET' && url.pathname === '/v0/consistency') {
       const first = Number(url.searchParams.get('first'));
@@ -66,6 +69,37 @@ export class TransparencyLogServer {
     }
     if (method === 'POST' && url.pathname === '/v0/append') return this.append(request);
     throw new HttpError(404, 'not found');
+  }
+
+  private cached?: { size: number; root: string; at: number; head: TreeHead };
+
+  /**
+   * The current signed head. With witnesses it is cosigned, and the same head (cosignatures included) is served
+   * until the tree grows or an hour has passed, when the log signs a fresh one (Section 5.5.2). Without them
+   * every answer carries a head signed just now.
+   */
+  private async head(): Promise<TreeHead> {
+    if (this.witnessUrls.length === 0) return this.log.treeHead();
+    const size = this.log.size;
+    const fresh = this.cached && this.cached.size === size && Date.now() - this.cached.at < 3_600_000;
+    if (fresh && this.cached) return this.cached.head;
+    const head = this.log.treeHead();
+    const answers = await Promise.allSettled(
+      this.witnessUrls.map(async (witness) => {
+        const response = await this.fetchImpl(`${witness}/v0/cosign`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ head }),
+          signal: AbortSignal.timeout(2_000),
+        });
+        if (!response.ok) throw new Error(`witness answered ${response.status}`);
+        return (await response.json()) as Cosignature;
+      }),
+    );
+    const cosigs = answers.flatMap((answer) => (answer.status === 'fulfilled' ? [answer.value] : []));
+    const signed = { ...head, cosigs };
+    this.cached = { size, root: head.root, at: Date.now(), head: signed };
+    return signed;
   }
 
   /**
@@ -115,7 +149,20 @@ export class TransparencyLogServer {
     const domain = await this.authenticate(request, 'append');
     const leaf = json<LogLeaf>(request);
     if (leaf.v !== 0 || leaf.domain !== domain) throw new HttpError(403, `${domain} can only log its own addresses`);
+    if (leaf.kind === 'domain-key') this.checkDomainKeyLeaf(leaf, domain);
     return { index: this.record(leaf) };
+  }
+
+  /**
+   * A domain's first domain-key leaf is accepted; a later one that changes the key must carry the old key's
+   * signature over the change (Sections 5.3.1 and 6.5).
+   */
+  private checkDomainKeyLeaf(leaf: LogLeaf, domain: string): void {
+    if (leaf.index !== domainKeyIndex(domain) || typeof leaf.domainKey !== 'string') throw new HttpError(400, 'a domain-key leaf is filed at the domain-key index and names the key');
+    const previous = this.log.latest(domain, leaf.index).leaf;
+    if (previous?.kind === 'domain-key' && previous.domainKey !== leaf.domainKey && !verifyRotation(leaf.rotation, domain, previous.domainKey as string, leaf.domainKey)) {
+      throw new HttpError(403, `${domain} cannot change its logged key without a proof from the old one`);
+    }
   }
 
   /**

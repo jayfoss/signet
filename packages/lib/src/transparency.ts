@@ -15,11 +15,21 @@ export interface LogLeaf {
   v: 0;
   index: string;
   domain: string;
-  kind: 'bound' | 'unbound';
+  kind: 'bound' | 'unbound' | 'domain-key';
   identityKey: string | null;
   cardHash: string | null;
   viewHash: string | null;
+  /** For a `domain-key` leaf: the domain's key (Section 5.3.1). */
+  domainKey?: string;
+  /** For a `domain-key` leaf that changes the key: the old key's proof (Section 6.5). */
+  rotation?: { from: string; sig: string };
   ts: string;
+}
+
+/** A witness's signature that a tree head extends the last one it saw from the log (Section 5.5.1). */
+export interface Cosignature {
+  witness: string;
+  sig: string;
 }
 
 /** A signed tree head: the log's commitment to its first `size` leaves. */
@@ -28,6 +38,8 @@ export interface TreeHead {
   root: string;
   ts: string;
   sig: string;
+  /** Witness cosignatures. Not covered by the log's signature (Section 5.5.1). */
+  cosigs?: Cosignature[];
 }
 
 export interface InclusionProof {
@@ -166,8 +178,23 @@ export function signTreeHead(key: KeyPair, size: number, root: Uint8Array, now =
 }
 
 export function verifyTreeHead(logKey: string, head: TreeHead): boolean {
-  const { sig, ...unsigned } = head;
+  const { sig, cosigs: _cosigs, ...unsigned } = head;
   return verifyJson(logKey, { type: 'tree-head', ...unsigned }, sig);
+}
+
+const cosignBody = (logKey: string, head: TreeHead) => ({ type: 'tree-head-cosign', log: logKey, size: head.size, root: head.root, ts: head.ts });
+
+export function signCosignature(witness: KeyPair, logKey: string, head: TreeHead): Cosignature {
+  return { witness: witness.publicKey, sig: signJson(witness, cosignBody(logKey, head)) };
+}
+
+/** How many distinct trusted witnesses have validly cosigned this head. */
+export function countCosignatures(logKey: string, head: TreeHead, trusted: string[]): number {
+  const signed = new Set<string>();
+  for (const cosig of head.cosigs ?? []) {
+    if (trusted.includes(cosig.witness) && verifyJson(cosig.witness, cosignBody(logKey, head), cosig.sig)) signed.add(cosig.witness);
+  }
+  return signed.size;
 }
 
 /** An in-memory log. The server app wraps it in HTTP; tests use it directly. */

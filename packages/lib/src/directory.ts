@@ -27,6 +27,10 @@ export interface DomainPolicy {
   /** Seconds an attachment is kept at most, when not the default 30 days (Section 8.9). */
   blobRetention?: number;
   domainKey: string;
+  /** Present when `domainKey` has changed: the previous key's signature over the change (Section 6.5). */
+  rotation?: { from: string; sig: string };
+  /** The domain key's signature over `server` and `replicas`, required for a URL outside the domain (Section 6.4). */
+  serverSig?: string;
   /** VRF public key: proves each address's index in the transparency log (RFC 9381). */
   vrfKey: string;
   /** The transparency log this domain writes every directory change to. Clients only accept logs they trust. */

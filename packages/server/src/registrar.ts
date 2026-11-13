@@ -20,6 +20,7 @@ import {
   viewHash,
 } from '@signet/lib';
 import type { HttpRequest, HttpResult } from './http';
+import { DomainKeyLogger } from './domain-key-log';
 import { HttpError, JsonServer, header, json } from './http';
 
 /**
@@ -68,7 +69,11 @@ export class LocalRegistrar implements Registrar {
   private readonly logs = new Map<string, { entries: LogEntry[]; card: string; view: string }>();
   private readonly proofs = new ReplayCache();
 
-  constructor(private readonly options: LocalRegistrarOptions) {}
+  private readonly keyLogger: DomainKeyLogger;
+
+  constructor(private readonly options: LocalRegistrarOptions) {
+    this.keyLogger = new DomainKeyLogger({ domain: options.domain, domainKey: options.domainKey, log: options.log, fetchImpl: options.fetchImpl });
+  }
 
   /** Whether this registrar has bound the address before. */
   knows(principal: string): boolean {
@@ -120,6 +125,7 @@ export class LocalRegistrar implements Registrar {
   }
 
   private async append(principal: string, kind: LogLeaf['kind'], identityKey: string | null, publication: Publication | null): Promise<void> {
+    await this.keyLogger.ensure();
     const leaf: LogLeaf = {
       v: 0,
       index: proveIndex(this.options.vrfKey, principal).index,

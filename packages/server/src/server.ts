@@ -8,6 +8,7 @@ import type {
   GatewayKey,
   IssuerKey,
   KeyPair,
+  KeyRotation,
   LegacyAuth,
   Operators,
   DomainBinding,
@@ -49,6 +50,8 @@ import {
   checkOperators,
   entryHash,
   attestedSignetHeader,
+  signServerUrls,
+  underDomain,
   hashBody,
   hasScope,
   cardHash,
@@ -84,6 +87,7 @@ import {
 import { Cluster } from './cluster';
 import type { ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
+import { DomainKeyLogger } from './domain-key-log';
 import { HttpError, JsonServer, header, json } from './http';
 
 const optionalHeader = (headers: Record<string, string | string[] | undefined>, name: string): string | undefined => {
@@ -172,6 +176,8 @@ export interface SignetServerOptions {
   /** Defaults to the address the server listens on. */
   publicUrl?: string;
   maxAge?: number;
+  /** Proof that `domainKey` replaces an earlier key, for the policy to carry while clients may still hold the old one (Section 6.5). */
+  rotation?: KeyRotation;
   /** Seconds a mailbox item is kept at most (Section 10.7). Default 30 days; published in the policy when it differs. */
   mailboxRetentionSeconds?: number;
   /** Seconds an attachment is kept at most (Section 8.9). Default 30 days; published in the policy when it differs. */
@@ -303,6 +309,7 @@ export class SignetServer implements LegacyInbox {
 
   constructor(private readonly options: SignetServerOptions) {
     this.fetchImpl = options.resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
+    if (options.domainKey) this.keyLogger = new DomainKeyLogger({ domain: options.domain, domainKey: options.domainKey, log: options.log, rotation: options.rotation, fetchImpl: options.fetchImpl });
     if (!options.domainKey) {
       if (!options.homeKey || !options.operators || !options.domainPublicKey) throw new Error('a home without the domain key needs homeKey, operators and domainPublicKey');
       const listed = checkOperators(options.operators, options.domain, options.domainPublicKey).some((home) => home.key === options.homeKey?.publicKey);
@@ -378,6 +385,8 @@ export class SignetServer implements LegacyInbox {
       ...(this.blobRetentionMs !== DEFAULT_RETENTION_MS ? { blobRetention: this.blobRetentionMs / 1000 } : {}),
       domainKey: this.options.domainKey?.publicKey ?? (this.options.domainPublicKey as string),
       ...(this.options.operators ? { operators: this.options.operators } : {}),
+      ...(this.options.rotation ? { rotation: this.options.rotation } : {}),
+      ...this.serverSignature(server, homes),
       vrfKey: this.vrfKey.public,
       log: this.options.log,
       ohttp: { gateway: `${server}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey) },
@@ -385,6 +394,16 @@ export class SignetServer implements LegacyInbox {
       intake: this.intakeKey ? { keyId: requestKeyId(this.intakeKey.publicKey), agreeKey: this.intakeKey.publicKey } : undefined,
     };
   }
+
+  /** `serverSig` for a policy whose server or replicas are outside the domain, which needs the domain key (Section 6.4). */
+  private serverSignature(server: string, homes?: string[]): { serverSig?: string } {
+    const replicas = homes && homes.length > 1 ? homes : undefined;
+    const outside = [server, ...(replicas ?? [])].some((url) => !underDomain(url, this.options.domain));
+    if (!outside || !this.options.domainKey) return {};
+    return { serverSig: signServerUrls(this.options.domainKey, { domain: this.options.domain, server, replicas }) };
+  }
+
+  private readonly keyLogger?: DomainKeyLogger;
 
   private get mailboxRetentionMs(): number {
     return (this.options.mailboxRetentionSeconds ?? DEFAULT_RETENTION_MS / 1000) * 1000;
@@ -691,6 +710,8 @@ export class SignetServer implements LegacyInbox {
   }
 
   private async record(principal: string, kind: LogLeaf['kind'], identityKey: string | null, publication: Publication | null): Promise<void> {
+    // The domain's own key goes into the log before its first change, so a client can check the policy against it (Section 5.3.1).
+    await this.keyLogger?.ensure();
     const leaf: LogLeaf = {
       v: 0,
       index: proveIndex(this.vrfKey, principal).index,

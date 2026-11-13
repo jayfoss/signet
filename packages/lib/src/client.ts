@@ -53,7 +53,8 @@ import type { Resolver } from './resolver';
 import { NotSignetDomainError } from './resolver';
 import { DELIVERY_LABEL, TOKEN_EPOCHS_KEPT, deliveryTokenHash, randomToken } from './sealed';
 import type { InclusionProof, LatestLeaf, LogLeaf, TreeHead, TrustedLog } from './transparency';
-import { TransparencyError, checkLeafDomain, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
+import { TransparencyError, checkLeafDomain, countCosignatures, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
+import { domainKeyIndex } from './policy';
 
 export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce' | 'receipt';
 
@@ -192,6 +193,8 @@ export interface ClientSnapshot {
   /** Ids of this client's own deliveries, so their echoes are skipped. */
   sentIds: string[];
   treeHeads: Record<string, TreeHead>;
+  /** The domain key already checked against the domain's log, by domain (Section 6.5). */
+  domainKeys: Record<string, string>;
   knownOwnClients: string[];
   /** Grants this agent holds from its owner. */
   grants: Grant[];
@@ -231,6 +234,13 @@ export interface LiveSessionRecord {
 
 export interface SignetClientOptions {
   trustedLogs: TrustedLog[];
+  /**
+   * Witnesses whose cosignatures a tree head needs, and how many of them (Section 5.5.1). Set by the client,
+   * never by a domain's policy. Without them a log is trusted on its own signature alone.
+   */
+  witnesses?: { keys: string[]; threshold: number };
+  /** Reject tree heads older than this many milliseconds (Section 5.5.2). Defaults to 24 hours. */
+  maxHeadAgeMs?: number;
   snapshot?: Partial<ClientSnapshot>;
   fetchImpl?: typeof fetch;
   /** How many unused key packages to keep on the home server, besides the last-resort one. */
@@ -291,6 +301,7 @@ const emptySnapshot = (): ClientSnapshot => ({
   tokens: {},
   sentIds: [],
   treeHeads: {},
+  domainKeys: {},
   knownOwnClients: [],
   grants: [],
   views: {},
@@ -873,6 +884,7 @@ export class SignetClient {
       }
       // The attestation must come from the From address's own domain: nobody else can vouch for that mail.
       const fromPolicy = await this.resolver.policy(splitAddress(fields.from).domain).catch(() => null);
+      if (fromPolicy) await this.checkDomainKey(fromPolicy, this.trustedLog(fromPolicy));
       const vouched = fromPolicy !== null && verifyAttestation(header, fields, fromPolicy.domainKey);
       // An unlisted sender can't be looked up, but its domain's attestation still names its key.
       const onSignet = directory ? sha256(directory.identityKey) === header.fingerprint : hidden && vouched;
@@ -1246,6 +1258,7 @@ export class SignetClient {
   private async fetchDirectory(who: string): Promise<Directory | null> {
     const policy = await this.resolver.policy(splitAddress(who).domain);
     const log = this.trustedLog(policy);
+    await this.checkDomainKey(policy, log);
     let entry = await this.directoryEntry(who);
     const pinned = this.state.pins[who];
 
@@ -1397,6 +1410,7 @@ export class SignetClient {
       if (!(error instanceof UnlistedAddressError)) throw error;
       const policy = await this.resolver.policy(splitAddress(error.principal).domain);
       if (!policy.intake) throw error;
+      await this.checkDomainKey(policy, this.trustedLog(policy));
       return { principal: error.principal, card: { requestKeys: [policy.intake], humanKeys: [policy.intake] } };
     }
   }
@@ -1419,6 +1433,19 @@ export class SignetClient {
   private async releaseView(to: string[]): Promise<void> {
     const others = to.filter((address) => normalizeAddress(address) !== this.address);
     if (others.length > 0) await this.callEach('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
+  }
+
+  /**
+   * A domain key this client has not seen is checked against the domain-key leaf in the log the policy names
+   * before the policy is used (Section 6.5). A key the log does not record is refused.
+   */
+  private async checkDomainKey(policy: DomainPolicy, log: TrustedLog): Promise<void> {
+    if (this.state.domainKeys[policy.domain] === policy.domainKey) return;
+    const { leaf } = await this.latestLeaf(log, domainKeyIndex(policy.domain), policy.domain);
+    if (leaf?.kind !== 'domain-key' || leaf.domainKey !== policy.domainKey) {
+      throw new TransparencyError(`${policy.domain}'s domain key is not the one its transparency log records`);
+    }
+    this.state.domainKeys[policy.domain] = policy.domainKey;
   }
 
   private trustedLog(policy: DomainPolicy): TrustedLog {
@@ -1463,6 +1490,11 @@ export class SignetClient {
   /** Every tree head must extend the last one this client saw from that log, or the log has forked. */
   private async checkTreeHead(log: TrustedLog, head: TreeHead): Promise<void> {
     if (!verifyTreeHead(log.key, head)) throw new TransparencyError('tree head is not signed by the log');
+    if (Date.now() - Date.parse(head.ts) > (this.options.maxHeadAgeMs ?? 24 * 3_600_000)) throw new TransparencyError('tree head is too old');
+    const { witnesses } = this.options;
+    if (witnesses && countCosignatures(log.key, head, witnesses.keys) < witnesses.threshold) {
+      throw new TransparencyError(`tree head has fewer than ${witnesses.threshold} witness cosignatures`);
+    }
     const previous = this.state.treeHeads[log.url];
     if (previous && previous.size === head.size && previous.root !== head.root) {
       throw new TransparencyError('log forked: two different trees of the same size');

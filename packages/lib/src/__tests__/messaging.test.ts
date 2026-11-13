@@ -273,3 +273,29 @@ describe('padded plaintext (Section 7.3)', () => {
     expect(() => unpadPlaintext(padded.subarray(0, 1000))).toThrow('not padded');
   });
 });
+
+describe('padded envelopes (Section 10.2)', () => {
+  const { padJson } = jest.requireActual('../pad') as typeof import('../pad');
+
+  it('makes the body a multiple of 1024 bytes, whatever is in it, and leaves the rest as it was', () => {
+    for (const size of [0, 1, 300, 900, 1000, 1015, 1024, 3000]) {
+      const body = padJson({ id: 'i_abc', to: ['bob@example.net'], kind: 'message', payload: { mls: 'x'.repeat(size) } });
+      expect(Buffer.byteLength(body) % 1024).toBe(0);
+      const parsed = JSON.parse(body) as { pad: string; payload: { mls: string }; id: string };
+      expect(parsed.pad).toMatch(/^0*$/);
+      expect(parsed.payload.mls).toHaveLength(size);
+      expect(parsed.id).toBe('i_abc');
+    }
+  });
+
+  it('counts bytes, not characters', () => {
+    const body = padJson({ note: 'é'.repeat(700) });
+    expect(Buffer.byteLength(body) % 1024).toBe(0);
+  });
+
+  it('gives two bodies in one band the same size', () => {
+    const a = padJson({ id: 'i_1', payload: 'short' });
+    const b = padJson({ id: 'i_2', payload: 'a good deal longer than the other one, but not by much' });
+    expect(a.length).toBe(b.length);
+  });
+});

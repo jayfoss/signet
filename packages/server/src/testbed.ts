@@ -138,7 +138,7 @@ export class Testbed {
 
   /** A client that shares its label in threads, so test output reads "via Clerk". */
   client(keys: ClientKeys, snapshot?: Partial<ClientSnapshot>, extra: Partial<SignetClientOptions> = {}): SignetClient {
-    return new SignetClient(keys, this.resolver, { trustedLogs: [this.trustedLog], snapshot, keyPackageTarget: 3, shareLabel: true, ohttpRelay: this.relay.url, ...extra });
+    return new SignetClient(keys, this.resolver, { trustedLogs: [this.trustedLog], snapshot, keyPackageTarget: 3, shareLabel: true, ohttpRelay: this.relay.url, submitDelayMs: 0, ...extra });
   }
 
   /** Make server-to-server delivery into this domain fail with a 503 until `repairDelivery`. */

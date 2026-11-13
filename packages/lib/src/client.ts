@@ -24,6 +24,7 @@ import {
 } from './directory';
 import { decodeResponse, encodeRequest } from './bhttp';
 import { MAX_HTML_BYTES, htmlToText, sanitizeHtml, textDiverges } from './html';
+import { padJson } from './pad';
 import { signRequesterProof } from './requester';
 import type { ApprovalCard, ApprovalChoice, AudienceMember, DisclosureContext, OrgClaim } from './disclosure';
 import { DisclosureError, audienceHash, verifyOrgClaim } from './disclosure';
@@ -264,6 +265,11 @@ export interface SignetClientOptions {
    * never by a domain's policy. Without them a log is trusted on its own signature alone.
    */
   witnesses?: { keys: string[]; threshold: number };
+  /**
+   * The longest a client waits, at random, before it submits a delivery that nobody asked for just now: one that a sync
+   * sends again or makes again after a competing commit (Section 7.3). Defaults to 2000 milliseconds; 0 turns it off.
+   */
+  submitDelayMs?: number;
   /** Reject tree heads older than this many milliseconds (Section 5.5.2). Defaults to 24 hours. */
   maxHeadAgeMs?: number;
   snapshot?: Partial<ClientSnapshot>;
@@ -1158,7 +1164,10 @@ export class SignetClient {
     events.push(...this.expireHeld());
     // A commit of ours that lost to another is recomputed against the winning epoch (Section 8.8 step 4).
     for (const thread of this.state.rekeyAgain.splice(0)) {
-      if (this.state.threads.includes(thread)) await this.rekey(thread).catch(() => undefined);
+      if (this.state.threads.includes(thread)) {
+        await this.backgroundDelay();
+        await this.rekey(thread).catch(() => undefined);
+      }
     }
     events.push(...(await this.retryUnconfirmed()));
     events.push(...(await this.laggingHomes(lastAnswered)));
@@ -1878,7 +1887,8 @@ export class SignetClient {
 
   private async request(base: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
     const binary = body instanceof Uint8Array;
-    const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
+    // A submission is padded so its size says little (Section 10.2).
+    const payload = body === undefined ? '' : binary ? body : path === '/v0/submit' ? padJson(body as Record<string, unknown>) : JSON.stringify(body);
     const headers = {
       ...clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, payload),
       ...(body === undefined ? {} : { 'content-type': binary ? 'application/octet-stream' : 'application/json' }),
@@ -2019,6 +2029,12 @@ export class SignetClient {
   }
 
   /** Send again, through a different home, what no recipient home has proved it got; report what still can't be. */
+  /** Wait a random time before a delivery that is not in answer to anything the user just did (Section 7.3). */
+  private async backgroundDelay(): Promise<void> {
+    const max = this.options.submitDelayMs ?? 2000;
+    if (max > 0) await new Promise((resolve) => setTimeout(resolve, Math.random() * max));
+  }
+
   private async retryUnconfirmed(): Promise<SignetEvent[]> {
     const events: SignetEvent[] = [];
     const grace = this.options.receiptGraceMs ?? 300_000;
@@ -2032,6 +2048,7 @@ export class SignetClient {
       }
       entry.tries += 1;
       entry.at = Date.now();
+      await this.backgroundDelay();
       try {
         const { result, home } = await this.callFrom('POST', '/v0/submit', { ...entry.body, to: entry.to }, entry.via);
         entry.via = home;

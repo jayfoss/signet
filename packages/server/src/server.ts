@@ -55,6 +55,7 @@ import {
   signServerUrls,
   underDomain,
   hashBody,
+  padJson,
   MAX_HTML_BYTES,
   hasScope,
   cardHash,
@@ -1325,7 +1326,8 @@ export class SignetServer implements LegacyInbox {
   private async relayOnce(domain: string, delivery: Delivery, home?: string): Promise<DeliveryResult> {
     const policy = await this.options.resolver.policy(domain);
     const target = home ?? policy.server;
-    const body = JSON.stringify(delivery);
+    // Padded, so the size of a delivery on the wire says little (Section 10.2).
+    const body = padJson(delivery as unknown as Record<string, unknown>);
     if (!delivery.token && !delivery.anonymousToken) return this.answer(domain, await this.signedFetch('POST', `${target}/v0/deliver`, body));
     // Sealed and anonymous deliveries aren't signed by this domain: a token authorizes them. Through an OHTTP
     // relay, the receiving server doesn't even see which server sent them.

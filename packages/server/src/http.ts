@@ -6,6 +6,8 @@ export class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** Extra response headers, such as Signet-Primary on a 421. */
+    readonly headers: Record<string, string> = {},
   ) {
     super(message);
   }
@@ -60,6 +62,8 @@ export class JsonServer {
   constructor(
     private readonly route: (request: HttpRequest) => Promise<HttpResult>,
     private readonly bodyLimit = 40 * 1024 * 1024,
+    /** Headers added to every response, such as Signet-Term. */
+    private readonly responseHeaders: () => Record<string, string> = () => ({}),
   ) {
     this.http = createServer((request, response) => void this.handle(request, response));
   }
@@ -82,6 +86,7 @@ export class JsonServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     let status = 200;
     let result: HttpResult;
+    let extra: Record<string, string> = {};
     try {
       const path = request.url ?? '/';
       result = await this.route({
@@ -94,14 +99,16 @@ export class JsonServer {
       });
     } catch (error) {
       status = error instanceof HttpError ? error.status : 400;
+      extra = error instanceof HttpError ? error.headers : {};
       result = { error: error instanceof Error ? error.message : String(error) };
     }
+    const headers = { ...this.responseHeaders(), ...extra };
     if (isRaw(result)) {
-      response.writeHead(status, { 'content-type': result.contentType });
+      response.writeHead(status, { ...headers, 'content-type': result.contentType });
       response.end(result.raw);
       return;
     }
-    response.writeHead(status, { 'content-type': 'application/json' });
+    response.writeHead(status, { ...headers, 'content-type': 'application/json' });
     response.end(JSON.stringify(result));
   }
 }

@@ -9,6 +9,7 @@ export * from './disclosure';
 export * from './encoding';
 export * from './enrollment';
 export * from './gmail';
+export * from './homes';
 export * from './identity';
 export * from './intents';
 export * from './legacy';

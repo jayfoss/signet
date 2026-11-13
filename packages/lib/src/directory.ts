@@ -14,6 +14,8 @@ export interface DomainPolicy {
   v: 'signet0';
   domain: string;
   server: string;
+  /** Every home of a domain that runs several, in order of preference; `server` is the first (Section 6.8). */
+  homes?: string[];
   mode: 'enforce' | 'testing';
   maxAge: number;
   domainKey: string;

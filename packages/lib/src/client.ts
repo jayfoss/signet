@@ -300,7 +300,7 @@ export class SignetClient {
   ) {
     this.state = { ...emptySnapshot(), ...structuredClone(options.snapshot ?? {}) };
     this.mls = new MlsSession(keys, this.state.mls);
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
     this.ohttpRelay = options.ohttpRelay;
   }
 

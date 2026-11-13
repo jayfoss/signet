@@ -69,6 +69,8 @@ import {
   verifyClientAuth,
   verifyDomainAuth,
 } from '@signet/lib';
+import { Cluster } from './cluster';
+import type { ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
 import { HttpError, JsonServer, header, json } from './http';
 import type { LegacyInbox, OutboundSmtp } from './smtp';
@@ -164,6 +166,14 @@ export interface SignetServerOptions {
   intake?: boolean;
   /** This server's OHTTP gateway key. Generated if not given. */
   gatewayKey?: GatewayKey;
+  /** The domain intake's HPKE key. Generated if not given. */
+  intakeKey?: KeyPair;
+  /**
+   * Run as one home of several (Section 6.8). Every replica must be given the same domain key, VRF key,
+   * gateway key and, with an intake, intake key, since they are one server in several places. Replicas keep
+   * their state in memory and rebuild it from the replication log, so `dataDir` isn't used.
+   */
+  cluster?: Omit<ClusterOptions, 'domain' | 'domainKey'>;
   /** OHTTP relay used for sealed and anonymous deliveries to other domains. Without one they go direct. */
   ohttpRelay?: string;
   /**
@@ -243,23 +253,40 @@ export class SignetServer implements LegacyInbox {
   /** Pairing slots relaying a new client's enrollment to its owner's device, by four-digit slot. */
   private readonly pairings = new Map<string, Pairing>();
   private readonly vrfKey: VrfKey;
+  /** Set when this server is one home of several. */
+  private readonly cluster?: Cluster;
   /** Deliveries that arrived through the OHTTP gateway, for tests and monitoring. */
   receivedViaOhttp = 0;
 
   constructor(private readonly options: SignetServerOptions) {
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
-    this.store = options.dataDir ? new SqliteStore(join(options.dataDir, 'signet.db')) : new MemoryStore();
-    // The server's own keys live with its data, so a restart serves the same policy and VRF indexes.
-    const saved = this.store.serverKeys();
-    this.gatewayKey = saved?.gateway ?? options.gatewayKey ?? generateGatewayKey();
-    this.intakeKey = options.intake ? (saved?.intake ?? generateAgreementKey()) : null;
-    this.vrfKey = saved?.vrf ?? options.vrfKey ?? generateVrfKey();
-    this.store.setServerKeys({ vrf: this.vrfKey, gateway: this.gatewayKey, intake: this.intakeKey });
-    for (const local of this.store.userLocals()) this.setListing(local, replayLog(this.store.user(local)?.log ?? []).unlisted);
-    // Deliveries that were waiting for a retry when the server stopped pick up where they left off.
-    for (const entry of this.store.outbound()) this.schedule(entry);
-    this.http = new JsonServer((request) => this.route(request));
+    if (options.cluster) {
+      if (options.dataDir) throw new Error('a cluster replica keeps its state in the replication log, not in dataDir');
+      if (!options.vrfKey || !options.gatewayKey || (options.intake && !options.intakeKey)) {
+        throw new Error('every replica of a cluster must be given the same vrfKey, gatewayKey and (with an intake) intakeKey');
+      }
+      this.cluster = new Cluster({ ...options.cluster, domain: options.domain, domainKey: options.domainKey, fetchImpl: options.cluster.fetchImpl ?? options.fetchImpl ?? fetch }, () => new MemoryStore());
+      this.store = this.cluster.store;
+      this.gatewayKey = options.gatewayKey;
+      this.intakeKey = options.intake ? (options.intakeKey as KeyPair) : null;
+      this.vrfKey = options.vrfKey;
+      // What this replica derives from its store is rebuilt, and its retries start, only when it becomes the primary.
+      this.cluster.onPrimary(() => this.becamePrimary());
+      this.cluster.onStandby(() => this.cancelRetries());
+    } else {
+      this.store = options.dataDir ? new SqliteStore(join(options.dataDir, 'signet.db')) : new MemoryStore();
+      // The server's own keys live with its data, so a restart serves the same policy and VRF indexes.
+      const saved = this.store.serverKeys();
+      this.gatewayKey = saved?.gateway ?? options.gatewayKey ?? generateGatewayKey();
+      this.intakeKey = options.intake ? (saved?.intake ?? options.intakeKey ?? generateAgreementKey()) : null;
+      this.vrfKey = saved?.vrf ?? options.vrfKey ?? generateVrfKey();
+      this.store.setServerKeys({ vrf: this.vrfKey, gateway: this.gatewayKey, intake: this.intakeKey });
+      for (const local of this.store.userLocals()) this.setListing(local, replayLog(this.store.user(local)?.log ?? []).unlisted);
+      // Deliveries that were waiting for a retry when the server stopped pick up where they left off.
+      for (const entry of this.store.outbound()) this.schedule(entry);
+    }
+    this.http = new JsonServer((request) => this.route(request), undefined, () => this.cluster?.responseHeaders() ?? {});
   }
 
   get domain(): string {
@@ -271,28 +298,33 @@ export class SignetServer implements LegacyInbox {
   }
 
   get policy(): DomainPolicy {
+    const homes = this.cluster?.homes;
+    const server = homes?.[0] ?? this.http.publicUrl;
     return {
       v: 'signet0',
       domain: this.options.domain,
-      server: this.http.publicUrl,
+      server,
+      ...(homes && homes.length > 1 ? { homes } : {}),
       mode: 'enforce',
       maxAge: this.options.maxAge ?? 2_592_000,
       domainKey: this.options.domainKey.publicKey,
       vrfKey: this.vrfKey.public,
       log: this.options.log,
-      ohttp: { gateway: `${this.http.publicUrl}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey) },
+      ohttp: { gateway: `${server}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey) },
       privacyPass: this.options.issuer ? { issuer: this.options.issuer.key.name } : undefined,
       intake: this.intakeKey ? { keyId: requestKeyId(this.intakeKey.publicKey), agreeKey: this.intakeKey.publicKey } : undefined,
     };
   }
 
-  listen(port = 0, host = '127.0.0.1'): Promise<string> {
-    return this.http.listen(port, host, this.options.publicUrl);
+  async listen(port = 0, host = '127.0.0.1'): Promise<string> {
+    const url = await this.http.listen(port, host, this.options.publicUrl);
+    this.cluster?.start();
+    return url;
   }
 
   async close(): Promise<void> {
-    for (const timer of this.timers) clearTimeout(timer);
-    this.timers.clear();
+    this.cluster?.close();
+    this.cancelRetries();
     await this.http.close();
     this.store.close();
   }
@@ -314,6 +346,7 @@ export class SignetServer implements LegacyInbox {
 
   /** Bind an address to the identity key that heads this log, record it in the transparency log, then publish it. */
   async enroll(publication: Publication): Promise<void> {
+    this.cluster?.requirePrimary();
     const state = this.checkPublication(publication);
     const { local, domain } = splitAddress(state.principal);
     if (domain !== this.options.domain) throw new HttpError(400, `${state.principal} is not on ${this.options.domain}`);
@@ -327,6 +360,7 @@ export class SignetServer implements LegacyInbox {
       card: structuredClone(publication.card),
       view: structuredClone(publication.view),
     });
+    await this.cluster?.durable();
   }
 
   /**
@@ -345,9 +379,11 @@ export class SignetServer implements LegacyInbox {
 
   /** Release an address. The unbinding is logged, so correspondents who pinned it are told rather than silently downgraded. */
   async unenroll(local: string): Promise<void> {
+    this.cluster?.requirePrimary();
     if (!this.store.hasUser(local)) throw new HttpError(404, `${local} is not enrolled`);
     await this.record(`${local}@${this.options.domain}`, 'unbound', null, null);
     this.store.deleteUser(local);
+    await this.cluster?.durable();
   }
 
   /**
@@ -355,6 +391,7 @@ export class SignetServer implements LegacyInbox {
    * identity key, or by the recovery key it named) moves the domain binding to the new key.
    */
   async updateLog(local: string, publication: Publication): Promise<void> {
+    this.cluster?.requirePrimary();
     const user = this.store.user(local);
     if (!user) throw new HttpError(404, `${local} is not enrolled`);
     const state = this.checkPublication(publication);
@@ -369,6 +406,12 @@ export class SignetServer implements LegacyInbox {
     user.card = structuredClone(publication.card);
     user.view = structuredClone(publication.view);
     this.store.putUser(local, user);
+    await this.cluster?.durable();
+  }
+
+  /** Whether this server answers requests: always for a single home, and for a cluster replica only while it is the primary. */
+  isPrimary(): boolean {
+    return this.cluster ? this.cluster.isPrimary() : true;
   }
 
   /**
@@ -483,6 +526,7 @@ export class SignetServer implements LegacyInbox {
 
   /** Encrypt inbound plain email to the recipient's reading clients and keep only the ciphertext. */
   async storeLegacy(local: string, raw: Buffer, envelopeFrom: string, auth: LegacyAuth): Promise<void> {
+    this.cluster?.requirePrimary();
     const user = this.store.user(local);
     if (!user) throw new HttpError(404, `${local} is not enrolled`);
     const log = replayLog(user.log);
@@ -493,6 +537,7 @@ export class SignetServer implements LegacyInbox {
     );
     const sealed = await sealLegacyMail(user.binding.principal, raw, readers, envelopeFrom, auth);
     this.store.push(local, { id: randomId('l'), kind: 'legacy', from: envelopeFrom, payload: sealed });
+    await this.cluster?.durable();
   }
 
   private limit(key: string, max: number, what: string): void {
@@ -527,7 +572,21 @@ export class SignetServer implements LegacyInbox {
     });
   }
 
+  /**
+   * In a cluster, only the primary answers, and only after what it changed is committed (Section 6.8.5).
+   * Standbys serve the policy and the replicas' own calls, and send everyone else to the primary.
+   */
   private async route(request: HttpRequest): Promise<HttpResult> {
+    if (!this.cluster) return this.routeLocal(request);
+    if (request.method === 'GET' && request.url.pathname === '/.well-known/signet.json') return this.policy;
+    if (request.url.pathname.startsWith('/v0/cluster/')) return this.cluster.handle(request);
+    this.cluster.requirePrimary();
+    const result = await this.routeLocal(request);
+    await this.cluster.durable();
+    return result;
+  }
+
+  private async routeLocal(request: HttpRequest): Promise<HttpResult> {
     const { method, url } = request;
     const path = url.pathname;
     const directory = path.match(/^\/v0\/directory\/([^/]+)(\/claim)?$/);
@@ -928,7 +987,7 @@ export class SignetServer implements LegacyInbox {
 
   private async answer(domain: string, response: Response): Promise<DeliveryResult> {
     if (!response.ok) {
-      const permanent = response.status >= 400 && response.status < 500 && response.status !== 429;
+      const permanent = response.status >= 400 && response.status < 500 && response.status !== 429 && response.status !== 421;
       throw new RelayError(`delivery to ${domain} failed: ${response.status} ${await response.text()}`, permanent);
     }
     return (await response.json()) as DeliveryResult;
@@ -948,10 +1007,25 @@ export class SignetServer implements LegacyInbox {
     return this.answer(domain, new Response(Buffer.from(response.body), { status: response.status, headers: { 'content-type': 'application/json' } }));
   }
 
+  private cancelRetries(): void {
+    for (const timer of this.timers) clearTimeout(timer);
+    this.timers.clear();
+  }
+
+  /** A new primary rebuilds what it derives from the store and takes over the retry queue. */
+  private becamePrimary(): void {
+    this.unlisted.clear();
+    for (const local of this.store.userLocals()) this.setListing(local, replayLog(this.store.user(local)?.log ?? []).unlisted);
+    this.cancelRetries();
+    for (const entry of this.store.outbound()) this.schedule(entry);
+  }
+
   /** Try a queued delivery when it's due; on failure, save the next attempt or bounce it to the sender. */
   private schedule(entry: Outbound): void {
     const timer = setTimeout(() => {
       this.timers.delete(timer);
+      // A standby keeps the queue but doesn't work it; whoever is primary does.
+      if (this.cluster && !this.cluster.isPrimary()) return;
       const delivery = entry.delivery as Delivery;
       this.relayOnce(entry.domain, delivery).then(
         () => this.store.removeOutbound(entry.id),

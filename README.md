@@ -10,7 +10,7 @@ The specification is [`docs/signet-protocol-v0.txt`](docs/signet-protocol-v0.txt
 | --- | --- |
 | [`packages/lib`](packages/lib) | The protocol: identities and account logs, the directory, transparency proofs, requests, threads, intents and grants, delivery, and the client |
 | [`packages/mls`](packages/mls) | The native core in Rust: MLS (RFC 9420, via OpenMLS), ECVRF (RFC 9381) and SPAKE2 pairing, as a Node addon |
-| [`packages/server`](packages/server) | The home server, transparency log, Privacy Pass issuer and OHTTP relay |
+| [`packages/server`](packages/server) | The home server (one, or several kept in step by Raft), transparency log, Privacy Pass issuer and OHTTP relay |
 | [`packages/client`](packages/client) | The `signet` command-line client |
 
 ## Running it
@@ -26,6 +26,10 @@ pnpm demo
 `pnpm demo` runs two domains, a log, an issuer and a relay in one process and walks through first contact, a thread, and the attacks Signet catches. `pnpm disclosure-demo` shows one agent asking a colleague's agent for information the colleague has to approve.
 
 Tests run per file, for example `pnpm jest packages/server/src/__tests__/server.test.ts`. `pnpm typecheck` checks all three TypeScript packages.
+
+## Several homes
+
+A domain can run more than one home server, so mail keeps flowing when one fails and without anyone moving DNS records (Section 6.8 of the specification). Replicas copy the primary's changes through a Raft log, elect a new primary when it fails, and callers fall over to the next home the policy lists. A cheap witness that only votes lets two homes survive the loss of one. Discovery doesn't use MX, so an outage at the domain's mail provider doesn't touch any of this. See `packages/server/src/__tests__/cluster.test.ts` for a cluster built in code; there is no command-line configuration for it yet.
 
 ## Licence
 

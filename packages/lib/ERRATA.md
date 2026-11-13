@@ -66,3 +66,17 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 | --- | --- | --- | --- | --- |
 | 13.8 | Apply the recipient domain's MTA-STS policy when sending directly; use DANE where available | Sends to the lowest-preference MX with opportunistic TLS only | `packages/server/src/smtp.ts` | medium |
 | 13.4 | Read the message's author correctly | The client takes only the first From address and ignores Sender | `packages/lib/src/client.ts` (`onLegacy`), `packages/lib/src/legacy.ts` | low |
+
+## 6.8 Multi-home domains
+
+| Section | Spec requires | Reference does | Where | Severity |
+| --- | --- | --- | --- | --- |
+| 6.8.6 | (no protocol rule; Section 6.8.10 lists it as open) | The log is never compacted and a restart replays all of it; membership is fixed at start | `packages/server/src/cluster.ts`, `packages/server/src/raft.ts` | medium |
+| 6.8.4 | A home ignores a delivery whose id is already in the recipient's mailbox | Repeated deliveries after an ambiguous failure are stored again | `packages/server/src/server.ts` (`deliverLocal`) | medium |
+| 6.3, 10.4 | Callers find a working home | The OHTTP relay and the policy's `ohttp.gateway` name only the first home, so sealed deliveries through a relay don't fail over | `packages/server/src/relay-server.ts`, `packages/server/src/server.ts` (`policy`) | medium |
+| 6.8.5 | Everything a request changes is committed before it is answered | `SignetServer.setClaims` changes the store without waiting for the commit; a failover just after it can lose the claim | `packages/server/src/server.ts` | low |
+| 6.8.5 | (no protocol rule) | Replicas apply batches with their own clock, so `receivedAt` and the expiry of parked deliveries differ by the replication delay | `packages/server/src/cluster.ts` | low |
+| 6.8.6 | Cluster calls are signed as server requests (Section 4.6) | They are checked for the domain key and a fresh timestamp but not for a repeated nonce; Raft tolerates a replayed call | `packages/server/src/cluster.ts` (`handle`) | low |
+| 6.8.6 | (no protocol rule) | No pre-vote: a replica cut off from the others raises its term and forces an election when it returns | `packages/server/src/raft.ts` | low |
+| 6.8 | A deployment can run a cluster | No command-line or environment configuration for `signet server`; clusters are built in code (`SignetServer` with `cluster`, `ClusterWitness`), and an operator copies the domain, VRF, gateway and intake keys to each replica | `packages/server/src/main.ts` | medium |
+

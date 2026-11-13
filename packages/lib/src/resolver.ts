@@ -1,8 +1,11 @@
 import { resolveTxt } from 'node:dns/promises';
 import type { DomainPolicy } from './directory';
+import { HomeRegistry, failoverFetch } from './homes';
 
 export interface Resolver {
   policy(domain: string): Promise<DomainPolicy>;
+  /** `base`, but falling back across a domain's homes (Section 6.8.4). Resolvers that know no homes leave it out. */
+  failoverFetch?(base?: typeof fetch): typeof fetch;
 }
 
 export class NotSignetDomainError extends Error {
@@ -17,8 +20,15 @@ export class NotSignetDomainError extends Error {
  */
 abstract class CachingResolver implements Resolver {
   private readonly cache = new Map<string, { policy: DomainPolicy; until: number }>();
+  /** The homes of every domain this resolver has seen, so a fetch aimed at one can fall back to the others. */
+  readonly homes = new HomeRegistry();
 
   constructor(protected readonly fetchImpl: typeof fetch = fetch) {}
+
+  /** `base`, but trying a domain's other homes when the one it was aimed at can't answer (Section 6.8.4). */
+  failoverFetch(base: typeof fetch = fetch): typeof fetch {
+    return failoverFetch(this.homes, base);
+  }
 
   /** Where the policy may live, tried in order. */
   protected abstract policyUrls(domain: string): Promise<string[]>;
@@ -28,6 +38,7 @@ abstract class CachingResolver implements Resolver {
     try {
       const policy = await this.fetchPolicy(domain);
       this.cache.set(domain, { policy, until: Date.now() + policy.maxAge * 1000 });
+      this.homes.register(policy);
       return policy;
     } catch (error) {
       if (cached && cached.until > Date.now() && cached.policy.mode === 'enforce') return cached.policy;
@@ -50,7 +61,7 @@ abstract class CachingResolver implements Resolver {
 /**
  * Reads `_signet.<domain>` TXT, e.g. `v=signet0; host=signet.example.com`. The optional `host` says
  * where the policy is served, MTA-STS style, so it needn't live on the apex (often a marketing site).
- * It must be the domain or one of its subdomains, so control stays with whoever runs the zone. Without
+ * It may list several hosts separated by commas (Section 6.8.3). Each must be the domain or one of its subdomains, so control stays with whoever runs the zone. Without
  * it, `signet.<domain>` is tried first, then the apex.
  */
 export function parseSignetTxt(records: string[][], domain: string): { hosts: string[] } | null {
@@ -65,9 +76,10 @@ export function parseSignetTxt(records: string[][], domain: string): { hosts: st
   );
   const host = fields.get('host');
   if (host !== undefined) {
-    const valid = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(host);
-    if (!valid || (host !== domain && !host.endsWith(`.${domain}`))) return null;
-    return { hosts: [host] };
+    const hosts = host.split(',').map((part) => part.trim());
+    const valid = (name: string) => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(name) && (name === domain || name.endsWith(`.${domain}`));
+    if (!hosts.every(valid)) return null;
+    return { hosts: [...new Set(hosts)] };
   }
   return { hosts: [`signet.${domain}`, domain] };
 }
@@ -90,18 +102,21 @@ export class DnsResolver extends CachingResolver {
   }
 }
 
-/** Maps domains straight to server URLs, for local demos and tests where there is no DNS. */
+/**
+ * Maps domains straight to server URLs, for local demos and tests where there is no DNS. A domain may map to
+ * several URLs, which are tried in order like the hosts of a `_signet` record.
+ */
 export class StaticResolver extends CachingResolver {
   constructor(
-    private readonly servers: Map<string, string>,
+    private readonly servers: Map<string, string | string[]>,
     fetchImpl: typeof fetch = fetch,
   ) {
     super(fetchImpl);
   }
 
   protected async policyUrls(domain: string): Promise<string[]> {
-    const server = this.servers.get(domain);
-    if (!server) throw new NotSignetDomainError(domain);
-    return [`${server}/.well-known/signet.json`];
+    const servers = this.servers.get(domain);
+    if (!servers) throw new NotSignetDomainError(domain);
+    return [servers].flat().map((server) => `${server}/.well-known/signet.json`);
   }
 }

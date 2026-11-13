@@ -146,6 +146,39 @@ describe('cover traffic (Section 10.6.2)', () => {
   }, 30_000);
 });
 
+describe('cover traffic through a relay that limits (Section 10.4.2)', () => {
+  it('is not held back by limits that are set for real traffic', async () => {
+    const w = await world({ relayLimits: { perSource: { perSecond: 100, burst: 1000 }, perTarget: { perSecond: 50, burst: 500 }, maxHeld: 5000 } });
+    try {
+      await w.alicePhone.sendRequest('jerzy@beta.test', { subject: 'Hello' });
+      const [incoming] = await w.jerzyPhone.sync();
+      if (incoming?.kind !== 'request') throw new Error('expected a request');
+      const thread = await w.jerzyPhone.accept(incoming.request);
+      await w.alicePhone.sync();
+      const before = w.bed.relay.forwarded;
+      for (const text of ['one', 'two', 'three']) await w.alicePhone.send(thread, { subject: 'Busy', text });
+      await sleep(6 * WINDOW);
+      expect(w.bed.relay.forwarded - before).toBeGreaterThanOrEqual(8);
+      expect(w.bed.relay.refused).toBe(0);
+    } finally {
+      await w.bed.close();
+    }
+  }, 60_000);
+
+  it('turns away a source that sends faster than the limits, while others’ traffic goes on', async () => {
+    // Each window sends one cover delivery; allow a burst of 5 and almost nothing after.
+    const w = await world({ relayLimits: { perSource: { perSecond: 0.1, burst: 5 }, perTarget: { perSecond: 0.1, burst: 5 }, maxHeld: 5000 } });
+    try {
+      await sleep(15 * WINDOW);
+      expect(w.bed.relay.refused).toBeGreaterThan(0);
+      // The home treats a refusal as a failure of one delivery, not a reason to stop.
+      expect(w.bed.relay.forwarded).toBeGreaterThanOrEqual(4);
+    } finally {
+      await w.bed.close();
+    }
+  }, 30_000);
+});
+
 describe('the gateway is not a way to flood it (Section 10.6.2)', () => {
   const signed = (key: ReturnType<typeof generateSigningKey>, domain: string, path = '/v0/cover') => {
     const body = JSON.stringify({ pad: '0'.repeat(100) });

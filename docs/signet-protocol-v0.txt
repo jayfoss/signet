@@ -109,7 +109,7 @@ Table of Contents
       4.9.  Lookups by Own Clients .................................. 39
       4.10.  Limits ................................................. 40
       4.11.  Unlisted Addresses ..................................... 40
-      4.12.  Open Issues ............................................ 42
+      4.12.  Open Issues ............................................ 43
    5.  Key Transparency ............................................. 43
       5.1.  Overview ................................................ 43
       5.2.  VRF Index ............................................... 43
@@ -141,22 +141,22 @@ Experimental           Signet Protocol, Version 0          November 2026
       6.8.  Clustered Homes ........................................ 53
          6.8.1.  Overview .......................................... 53
          6.8.2.  Replicas and Roles ................................ 53
-         6.8.3.  Policy and Discovery .............................. 54
-         6.8.4.  Choosing a Replica ................................. 54
-         6.8.5.  Replicated State .................................. 55
-         6.8.6.  Election and Replication .......................... 55
-         6.8.7.  Failure Behaviour ................................. 56
-         6.8.8.  Replica Recovery .................................. 57
-         6.8.9.  Security Considerations ........................... 57
-         6.8.10.  Open Issues ...................................... 57
-      6.9.  Multi-Operator Domains ................................ 58
-         6.9.1.  Overview .......................................... 58
-         6.9.2.  The Operators Statement ........................... 59
-         6.9.3.  Home Keys and Server Calls ........................ 60
-         6.9.4.  What the Domain Owner Keeps ....................... 60
-         6.9.5.  Delivery to Many Homes ............................ 61
-         6.9.6.  Reading and Registering ........................... 62
-         6.9.7.  Security Considerations and Open Issues ........... 62
+         6.8.3.  Policy and Discovery .............................. 53
+         6.8.4.  Choosing a Replica ................................. 53
+         6.8.5.  Replicated State .................................. 53
+         6.8.6.  Election and Replication .......................... 53
+         6.8.7.  Failure Behaviour ................................. 53
+         6.8.8.  Replica Recovery .................................. 53
+         6.8.9.  Security Considerations ........................... 53
+         6.8.10.  Open Issues ...................................... 53
+      6.9.  Multi-Operator Domains ................................ 53
+         6.9.1.  Overview .......................................... 53
+         6.9.2.  The Operators Statement ........................... 53
+         6.9.3.  Home Keys and Server Calls ........................ 53
+         6.9.4.  What the Domain Owner Keeps ....................... 53
+         6.9.5.  Delivery to Many Homes ............................ 53
+         6.9.6.  Reading and Registering ........................... 53
+         6.9.7.  Security Considerations and Open Issues ........... 53
    7.  Requests and Admission ....................................... 53
       7.1.  Overview ................................................ 53
       7.2.  Request Body ............................................ 54
@@ -203,8 +203,8 @@ Experimental           Signet Protocol, Version 0          November 2026
       10.4.  Oblivious HTTP ......................................... 85
       10.5.  Anonymous Requests ..................................... 87
       10.6.  Relaying and Retries ................................... 88
-      10.7.  Mailbox ................................................ 89
-      10.8.  Open Issues ............................................ 89
+      10.7.  Mailbox ................................................ 90
+      10.8.  Open Issues ............................................ 90
    11.  Humans-only Mail and Escrow ................................. 90
       11.1.  Principle .............................................. 90
       11.2.  Humans-only Requests ................................... 90
@@ -3532,6 +3532,17 @@ Experimental           Signet Protocol, Version 0          November 2026
        it. A replica that restarts loads its snapshot before it
        applies anything else.
 
+   10. A change of membership is a log entry that holds the complete new
+       list of replica identifiers. The primary adds or removes one
+       replica per entry and MUST NOT append another membership entry
+       until the last is committed. A replica uses the newest
+       membership entry in its log, committed or not, to decide who
+       counts in a majority. A replica being added takes part as a
+       non-voting follower until it has caught up to the commit index,
+       and the entry that makes it a voter comes after. A primary that
+       is removed steps down when that entry commits. Replacing a
+       replica under its own identifier is not a membership change.
+
    Replicas call each other at three routes. All are POST, send JSON,
    and are authenticated like calls between servers (Section 4.6)
    with the key the replicas of a home share. The body names the
@@ -3618,9 +3629,10 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 6.8.10.  Open Issues
 
-   *  *Membership changes.* Version 0 has fixed membership.
-      Replacing a replica keeps its identifier. Adding or removing
-      one is not specified.
+   *  *Membership changes are manual.* Section 6.8.6 step 10 changes
+      one replica per entry. Nothing detects a failed replica and
+      replaces it, and the operator must also change the policy
+      (Section 6.8.3) to match.
 
    *  *No follower reads.* Standbys could answer reads with a note of
       how far they have applied. Version 0 sends all client traffic to
@@ -4134,8 +4146,18 @@ Foss                    Expires 15 May 2027                    [Page 55]
 
 Experimental           Signet Protocol, Version 0          November 2026
 
-   For each selected key, the sender seals the serialized signed request
-   with HPKE [RFC9180] in base mode, single-shot, with:
+   Padding.  The plaintext that is sealed is a 4-byte big-endian length
+   of the serialized signed request, the request, and zero bytes, so
+   that the whole is a multiple of 1024 bytes. The receiver reads the
+   length, ignores the padding, and MUST reject a plaintext whose length
+   is larger than the plaintext or whose padding has a non-zero byte.
+   The same rule applies to every other HPKE-sealed payload in this
+   document, including welcomes and sealed deliveries. A sender SHOULD
+   also wait a random time of up to 2 seconds before it submits a
+   delivery that is not in answer to a user's action in progress.
+
+   For each selected key, the sender seals the padded plaintext with
+   HPKE [RFC9180] in base mode, single-shot, with:
 
    *  KEM: DHKEM(X25519, HKDF-SHA256);
 
@@ -5672,7 +5694,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  *Extension arguments.* Arguments of extension intents are not
       validated, and an extension intent with a numeric amountUsd is
-      subject to the same limits as a core one.
+      subject to the same limits as a core one. An extension that
+      carries money in another unit MUST name it in a field currency and
+      MUST NOT use amountUsd for it.
 
    *  *Sub-agents.* There are no delegation chains: an agent cannot pass
       a narrower grant to another agent.
@@ -6230,10 +6254,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 10.8.  Open Issues
 
-   *  *Padding and batching.* MLS messages are padded to 256 bytes, but
-      sealed requests, welcomes and the delivery envelope are not, and
-      nothing is batched or delayed. Timing and size still reveal a lot
-      (Section 15).
+   *  *Padding is coarse and delay is optional.* Sealed payloads are
+      padded to a multiple of 1024 bytes (Section 7.3), the delivery
+      envelope and MLS messages to their own bounds, and senders add a
+      small random delay. Timing and size still reveal a lot, since
+      nothing is batched across senders (Section 15).
 
    *  *Mailbox retention.* Section 10.7 lets a server delete items that
       every active reading client has acknowledged, and requires it to
@@ -6244,11 +6269,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    *  *One relay, one issuer.* Version 0 assumes one relay and one
       issuer operator. Collusion between relay and gateway, or between
-      issuer and origin, removes the corresponding protection.
-
-Foss                    Expires 15 May 2027                    [Page 89]
-
-Experimental           Signet Protocol, Version 0          November 2026
+      issuer and origin, removes the corresponding protection. A client
+      MAY be configured with several relays and SHOULD pick one at
+      random for each delivery.
 
    *  *The relay sees the target domain* in the query string. This is
       inherent to forwarding, and the relay already sees the destination
@@ -6591,6 +6614,12 @@ Experimental           Signet Protocol, Version 0          November 2026
    reports a handoff event, so the owner's devices can show the thread
    as needing them.
 
+   A receiver that holds a handoff for an account MUST NOT show as a
+   message, and MUST report as an error, a message in the thread from
+   an agent or tool client of that account, other than handoff.human.
+   It identifies the sender's kind from the sender's certificate in the
+   owner's contact view (Section 8.6 step 3).
+
    While a thread is handed to an account:
 
    *  that account's agents and tools MUST NOT send in the thread,
@@ -6614,9 +6643,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 12.7.  Open Issues
 
-   *  *Holds are enforced by the owner's own clients.* Receivers do not
-      reject an agent's message in a thread its account handed off. An
-      agent that ignores the hold can still send.
+   *  *Holds depend on the receiver's view of the sender.* A receiver
+      rejects an agent's or tool's message in a thread that the sender's
+      account handed off (Section 12.6), by the kind in the sender's
+      certificate. A receiver that has not yet seen the handoff, because
+      the handoff message was delayed or lost, accepts it.
 
    *  *Exposure of the endpoint.* The offer reveals the host's endpoint
       to every thread member, and the guest connects to it directly, so

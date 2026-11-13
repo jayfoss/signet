@@ -3493,7 +3493,9 @@ Experimental           Signet Protocol, Version 0          November 2026
           "homes": [
             { "url": "https://home.alpha.example",
               "key": "b64u Ed25519 public key",
-              "replicas": ["https://r2.alpha.example"] },
+              "replicas": ["https://r2.alpha.example"],
+              "ohttp": { "gateway": "https://home.alpha.example/v0/ohttp",
+                "keys": "b64u key configuration" } },
             { "url": "https://home.beta.example",
               "key": "b64u Ed25519 public key" } ] },
         "sig": "b64u signature by the domain key over body" }
@@ -3514,7 +3516,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    |          |        | url is the home's base URL and key the home |
    |          |        | key (Section 6.9.3). replicas, if present,  |
    |          |        | lists other base URLs of the same home, for |
-   |          |        | Section 6.8.4.                              |
+   |          |        | Section 6.8.4. ohttp, if present, is the    |
+   |          |        | home's own Oblivious HTTP gateway and key   |
+   |          |        | configuration (Section 10.4).               |
    +----------+--------+---------------------------------------------+
 
    Every home serves the same policy. The domain owner signs the
@@ -3536,8 +3540,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    fails them counts as failed (Section 6.4).
 
    Once accepted, a client treats homes as the policy's homes
-   (Section 6.8.3) and the first home's url as server. A domain with
-   operators has no unsigned homes field.
+   (Section 6.8.3), the first home's url as server and its ohttp as
+   the policy's ohttp. A domain with operators has no unsigned homes
+   or ohttp field.
 
 6.9.3.  Home Keys and Server Calls
 
@@ -3596,9 +3601,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    1.  For each recipient domain, the home delivers to every home in
        that domain's statement, at the same time. It sends each home
-       the same delivery, with the same id, to the home's own URL.
-       Replica failover within a home (Section 6.8.4) still applies;
-       substituting a different home does not.
+       the same delivery, with the same id, to the home's own URL, and
+       sends a sealed or anonymous delivery through that home's own
+       gateway (Section 10.4.3) when it has one. Replica failover
+       within a home (Section 6.8.4) still applies; substituting a
+       different home does not.
 
    2.  A recipient domain counts as delivered once any of its homes
        accepts. An address counts as unknown only if every home that
@@ -3665,11 +3672,6 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  *Claims and legacy attestation.* They need the domain key
       (Section 6.9.4) and are unavailable to a home without a
       registrar.
-
-   *  *Sealed deliveries to later homes.* The policy names one OHTTP
-      gateway, the first home's. A sealed delivery to any other home
-      of the domain goes direct, so that home's operator sees the
-      sending server's address.
 
    *  *Attachments.* A blob lives at the home that received it.
 
@@ -5599,7 +5601,7 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    An OHTTP relay is a separate service:
 
-      POST /v0/relay?domain={domain}        (Content-Type:
+      POST /v0/relay?domain={domain}[&home={url}]   (Content-Type:
         message/ohttp-req)
 
    The relay:
@@ -5609,10 +5611,12 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    2.  resolves domain's policy (Section 6) and refuses with 404 if it
        has no ohttp gateway, so the relay cannot be pointed at arbitrary
-       URLs;
+       URLs. If home is given and the domain has operators (Section
+       6.9), the gateway is that home's own, from the statement; with
+       no home it is the policy's;
 
-   3.  forwards the body to the policy's gateway URL with only the
-       content type;
+   3.  forwards the body to that gateway URL with only the content
+       type;
 
    4.  returns the gateway's body as message/ohttp-res, or 502 if the
        gateway did not answer with success.

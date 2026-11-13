@@ -89,7 +89,6 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 | 6.9.6 | A client repeats a registration with a home that was down | Key packages are topped up at every sync, but delivery tokens, contacts and view grants a down home missed are not repeated | `packages/lib/src/client.ts` | medium |
 | 6.9.6 | A client compares what its homes return and flags one that is missing items | Not done; the spec doesn't define the comparison | `packages/lib/src/client.ts` | medium |
 | 6.9.2 | A client refuses a lower `seq` than any it has held | The highest `seq` is kept in the resolver's memory only, so a restarted client forgets it | `packages/lib/src/resolver.ts` | medium |
-| 6.9.7 | (open issue) | Sealed deliveries to homes after the first go direct, not through OHTTP | `packages/server/src/server.ts` (`relayOnce`) | medium |
 | 6.9.7 | (open issue) | Each home accepts a Privacy Pass token once, so one token can be spent at each home | `packages/server/src/server.ts` (`deliverAnonymous`) | low |
 | 6.9.5 | A client resends through another home when its own can't be reached | Done for any failure of the call. A home that accepts and then drops the message isn't noticed | `packages/lib/src/client.ts` (`call`) | medium |
 | 6.9 | A deployment can run a multi-operator domain | There is no command-line or environment configuration for operator mode; it is built in code, and the owner signs the statement with `signOperators` | `packages/server/src/main.ts` | medium |

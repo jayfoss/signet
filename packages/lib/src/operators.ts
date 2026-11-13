@@ -7,6 +7,8 @@ export interface OperatorHome {
   url: string;
   key: string;
   replicas?: string[];
+  /** This home's Oblivious HTTP gateway and its key configuration, so the owner vouches for the key (Section 6.9.2). */
+  ohttp?: { gateway: string; keys: string };
 }
 
 export interface OperatorsBody {
@@ -44,6 +46,7 @@ export function checkOperators(operators: Operators, domain: string, domainKey: 
     if (typeof home.url !== 'string' || typeof home.key !== 'string') throw new OperatorsError('a home needs a url and a key');
     new URL(home.url);
     for (const replica of home.replicas ?? []) new URL(replica);
+    if (home.ohttp) new URL(home.ohttp.gateway);
   }
   return body.homes;
 }
@@ -55,4 +58,15 @@ export const homeKeys = (policy: Pick<DomainPolicy, 'operators'>): string[] => p
 export function verifiedDomainSigner(policy: Pick<DomainPolicy, 'domainKey' | 'operators'>, home: string | undefined): string | undefined {
   if (home === undefined) return policy.domainKey;
   return homeKeys(policy).includes(home) ? home : undefined;
+}
+
+/**
+ * The OHTTP gateway of the home that `url` belongs to (its url or one of its replicas): its own in a domain with
+ * operators, or the policy's single gateway otherwise.
+ */
+export function homeGateway(policy: Pick<DomainPolicy, 'operators' | 'ohttp'>, url: string): { gateway: string; keys: string } | undefined {
+  if (!policy.operators) return policy.ohttp;
+  const origin = new URL(url).origin;
+  const home = policy.operators.body.homes.find((candidate) => [candidate.url, ...(candidate.replicas ?? [])].some((known) => new URL(known).origin === origin));
+  return home?.ohttp;
 }

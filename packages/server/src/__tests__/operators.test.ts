@@ -1,8 +1,9 @@
 import { createServer } from 'node:net';
 import type { SignetEvent } from '@signet/lib';
-import { Identity, SignetClient, StaticResolver, generateGatewayKey, generateSigningKey, generateVrfKey, homeAuthHeaders, signOperators } from '@signet/lib';
+import { Identity, SignetClient, StaticResolver, encodeKeyConfig, generateGatewayKey, generateSigningKey, generateVrfKey, homeAuthHeaders, signOperators } from '@signet/lib';
 import { TransparencyLogServer } from '../log-server';
 import { LocalRegistrar } from '../registrar';
+import { RelayServer } from '../relay-server';
 import { SignetServer } from '../server';
 
 const DOMAIN = 'multi.test';
@@ -52,7 +53,16 @@ async function world() {
   const ports = await Promise.all(names.map(() => freePort()));
   const homeKeys = names.map(() => generateSigningKey());
   const homeUrls = ports.map((port) => `http://127.0.0.1:${port}`);
-  const operators = signOperators(owner, { domain: DOMAIN, seq: 1, notAfter: '2099-01-01T00:00:00.000Z', homes: homeUrls.map((url, i) => ({ url, key: homeKeys[i].publicKey })) });
+  const gatewayKeys = names.map(() => generateGatewayKey());
+  const relay = new RelayServer(resolver);
+  await relay.listen();
+  // Each home has its own gateway, and the owner's signature vouches for its key.
+  const operators = signOperators(owner, {
+    domain: DOMAIN,
+    seq: 1,
+    notAfter: '2099-01-01T00:00:00.000Z',
+    homes: homeUrls.map((url, i) => ({ url, key: homeKeys[i].publicKey, ohttp: { gateway: `${url}/v0/ohttp`, keys: encodeKeyConfig(gatewayKeys[i]) } })),
+  });
   const registrar = new LocalRegistrar({ domain: DOMAIN, domainKey: owner, log, vrfKey });
   const home = (i: number) =>
     new SignetServer({
@@ -64,7 +74,8 @@ async function world() {
       resolver,
       log,
       vrfKey,
-      gatewayKey: generateGatewayKey(),
+      gatewayKey: gatewayKeys[i],
+      ohttpRelay: relay.url,
       retryDelaysMs: RETRY,
       fetchImpl: gate,
     });
@@ -72,7 +83,7 @@ async function world() {
   await Promise.all(homes.map((server, i) => server.listen(ports[i])));
   urls.set(DOMAIN, homeUrls);
 
-  const beta = new SignetServer({ domain: 'beta.test', domainKey: generateSigningKey(), resolver, log, retryDelaysMs: RETRY, fetchImpl: gate });
+  const beta = new SignetServer({ domain: 'beta.test', domainKey: generateSigningKey(), resolver, log, retryDelaysMs: RETRY, ohttpRelay: relay.url, fetchImpl: gate });
   urls.set('beta.test', await beta.listen());
 
   const alice = Identity.create(`alice@${DOMAIN}`);
@@ -99,6 +110,7 @@ async function world() {
     homeUrls,
     homeKeys,
     beta,
+    relay,
     blocked,
     deliveryBlocked,
     owner,
@@ -109,6 +121,7 @@ async function world() {
     has,
     close: async () => {
       await Promise.all([...homes, beta].map((server) => server.close().catch(() => undefined)));
+      await relay.close();
       await logServer.close();
     },
   };
@@ -168,6 +181,24 @@ describe('a domain run by three operators who share nothing', () => {
     // Submitted through B, because A was down; B delivered to itself and to C.
     await until(() => w.has(w.homes[1], 'bob') === 1 && w.has(w.homes[2], 'bob') === 1);
     expect(kinds(await w.clients.bob.sync())).toEqual(['request']);
+  });
+
+  it('sends a sealed message to each home through that home\'s own gateway', async () => {
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Sealed', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    const [incoming] = await w.clients.alice.sync();
+    if (incoming?.kind !== 'request') throw new Error('expected a request');
+    const thread = await w.clients.alice.accept(incoming.request);
+    await w.clients.jerzy.sync();
+
+    const viaGateway = () => w.homes.map((server) => server.receivedViaOhttp);
+    const before = viaGateway();
+    const forwarded = w.relay.forwarded;
+    await w.clients.jerzy.send(thread, { subject: 'Sealed', text: 'Is anyone home?' });
+    // One copy to each operator, every one through the relay and that operator's own gateway.
+    viaGateway().forEach((count, i) => expect(count).toBeGreaterThan(before[i]));
+    expect(w.relay.forwarded - forwarded).toBeGreaterThanOrEqual(3);
+    const events = await w.clients.alice.sync();
+    expect(events.filter((event) => event.kind === 'message')).toHaveLength(1);
   });
 
   it('refuses what an operator is not allowed to do', async () => {

@@ -73,6 +73,7 @@ import {
   verifyClientAuth,
   verifyDomainCall,
   homeGroups,
+  homeGateway,
 } from '@signet/lib';
 import { Cluster } from './cluster';
 import type { ClusterOptions } from './cluster';
@@ -1104,8 +1105,9 @@ export class SignetServer implements LegacyInbox {
     // Sealed and anonymous deliveries aren't signed by this domain: a token authorizes them. Through an OHTTP
     // relay, the receiving server doesn't even see which server sent them.
     const path = delivery.token ? '/v0/deliver-sealed' : '/v0/deliver-anonymous';
-    // The policy names one OHTTP gateway, the first home's; deliveries to the other homes of a domain go direct.
-    if (this.options.ohttpRelay && policy.ohttp && (!home || new URL(home).origin === new URL(policy.server).origin)) return this.relayOblivious(domain, policy, path, body);
+    // Each home has its own gateway, vouched for by the owner's statement.
+    const gateway = homeGateway(policy, target);
+    if (this.options.ohttpRelay && gateway) return this.relayOblivious(domain, target, gateway.keys, path, body);
     return this.answer(domain, await this.fetchImpl(`${target}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }));
   }
 
@@ -1117,11 +1119,11 @@ export class SignetServer implements LegacyInbox {
     return (await response.json()) as DeliveryResult;
   }
 
-  private async relayOblivious(domain: string, policy: DomainPolicy, path: string, body: string): Promise<DeliveryResult> {
-    const authority = new URL(policy.server).host;
+  private async relayOblivious(domain: string, target: string, keys: string, path: string, body: string): Promise<DeliveryResult> {
+    const authority = new URL(target).host;
     const inner = encodeRequest({ method: 'POST', scheme: 'https', authority, path, headers: [['content-type', 'application/json']], body: Buffer.from(body) });
-    const { message, pending } = await encapsulateRequest((policy.ohttp as { keys: string }).keys, inner);
-    const relayed = await this.fetchImpl(`${this.options.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}`, {
+    const { message, pending } = await encapsulateRequest(keys, inner);
+    const relayed = await this.fetchImpl(`${this.options.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}&home=${encodeURIComponent(target)}`, {
       method: 'POST',
       headers: { 'content-type': OHTTP_REQUEST_TYPE },
       body: message,

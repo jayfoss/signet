@@ -9,6 +9,8 @@ import type {
   IssuerKey,
   KeyPair,
   LegacyAuth,
+  Operators,
+  DomainBinding,
   LogLeaf,
   MailKind,
   LogEntry,
@@ -42,6 +44,8 @@ import {
   verifyToken,
   deliveryTokenHash,
   domainAuthHeaders,
+  homeAuthHeaders,
+  checkOperators,
   entryHash,
   attestedSignetHeader,
   hasScope,
@@ -67,12 +71,14 @@ import {
   signNotEnrolled,
   splitAddress,
   verifyClientAuth,
-  verifyDomainAuth,
+  verifyDomainCall,
+  homeGroups,
 } from '@signet/lib';
 import { Cluster } from './cluster';
 import type { ClusterOptions } from './cluster';
 import type { HttpRequest, HttpResult } from './http';
 import { HttpError, JsonServer, header, json } from './http';
+import type { Registrar } from './registrar';
 import type { LegacyInbox, OutboundSmtp } from './smtp';
 import type { PublishedKeyPackage } from './store';
 import type { Outbound, Store } from './store';
@@ -133,7 +139,19 @@ interface Pairing {
 
 export interface SignetServerOptions {
   domain: string;
-  domainKey: KeyPair;
+  /**
+   * The domain's signing key. A home run by an operator who isn't the domain owner doesn't hold it and is
+   * given `homeKey`, `operators`, `domainPublicKey` and a `registrar` instead (Section 6.9).
+   */
+  domainKey?: KeyPair;
+  /** This home's own key, which signs its server calls and directory answers when it has no domain key. */
+  homeKey?: KeyPair;
+  /** The domain owner's signed statement listing every home, served in the policy. */
+  operators?: Operators;
+  /** The domain's public key, for the policy, when this home doesn't hold the private key. */
+  domainPublicKey?: string;
+  /** Asked to bind addresses and record them in the transparency log. Without one, this server does it with the domain key. */
+  registrar?: Registrar;
   resolver: Resolver;
   /** The transparency log this domain writes every directory change to. */
   log: TrustedLog;
@@ -185,6 +203,8 @@ export interface SignetServerOptions {
 }
 
 interface Envelope {
+  /** Chosen by the client, so the same message sent again through another home is recognised (Section 6.9.5). */
+  id?: string;
   to: string[];
   kind: MailKind;
   payload: unknown;
@@ -260,13 +280,18 @@ export class SignetServer implements LegacyInbox {
 
   constructor(private readonly options: SignetServerOptions) {
     this.fetchImpl = options.resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
+    if (!options.domainKey) {
+      if (!options.homeKey || !options.operators || !options.domainPublicKey) throw new Error('a home without the domain key needs homeKey, operators and domainPublicKey');
+      const listed = checkOperators(options.operators, options.domain, options.domainPublicKey).some((home) => home.key === options.homeKey?.publicKey);
+      if (!listed) throw new Error('homeKey is not in the operators statement');
+    }
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
     if (options.cluster) {
       if (options.dataDir) throw new Error('a cluster replica keeps its state in the replication log, not in dataDir');
       if (!options.vrfKey || !options.gatewayKey || (options.intake && !options.intakeKey)) {
         throw new Error('every replica of a cluster must be given the same vrfKey, gatewayKey and (with an intake) intakeKey');
       }
-      this.cluster = new Cluster({ ...options.cluster, domain: options.domain, domainKey: options.domainKey, fetchImpl: options.cluster.fetchImpl ?? options.fetchImpl ?? fetch }, () => new MemoryStore());
+      this.cluster = new Cluster({ ...options.cluster, domain: options.domain, domainKey: options.homeKey ?? this.domainSigner(), fetchImpl: options.cluster.fetchImpl ?? options.fetchImpl ?? fetch }, () => new MemoryStore());
       this.store = this.cluster.store;
       this.gatewayKey = options.gatewayKey;
       this.intakeKey = options.intake ? (options.intakeKey as KeyPair) : null;
@@ -293,6 +318,24 @@ export class SignetServer implements LegacyInbox {
     return this.options.domain;
   }
 
+  /** The key only the domain owner holds. A home without it asks the registrar or refuses (Section 6.9.4). */
+  private domainSigner(): KeyPair {
+    if (!this.options.domainKey) throw new HttpError(501, 'this home does not hold the domain key');
+    return this.options.domainKey;
+  }
+
+  /** Who signs directory answers: the domain key, or this home's key, which says so in the answer. */
+  private answerSigner(): { key: KeyPair; asHome: boolean } {
+    return this.options.domainKey ? { key: this.options.domainKey, asHome: false } : { key: this.options.homeKey as KeyPair, asHome: true };
+  }
+
+  /** Bind an address to a key and record it, through the registrar if there is one. */
+  private async bindAddress(publication: Publication, principal: string, identityKey: string): Promise<DomainBinding> {
+    if (this.options.registrar) return this.options.registrar.bind(publication);
+    await this.record(principal, 'bound', identityKey, publication);
+    return bindIdentity(this.domainSigner(), principal, identityKey);
+  }
+
   get url(): string {
     return this.http.publicUrl;
   }
@@ -307,7 +350,8 @@ export class SignetServer implements LegacyInbox {
       ...(homes && homes.length > 1 ? { homes } : {}),
       mode: 'enforce',
       maxAge: this.options.maxAge ?? 2_592_000,
-      domainKey: this.options.domainKey.publicKey,
+      domainKey: this.options.domainKey?.publicKey ?? (this.options.domainPublicKey as string),
+      ...(this.options.operators ? { operators: this.options.operators } : {}),
       vrfKey: this.vrfKey.public,
       log: this.options.log,
       ohttp: { gateway: `${server}/v0/ohttp`, keys: encodeKeyConfig(this.gatewayKey) },
@@ -352,10 +396,10 @@ export class SignetServer implements LegacyInbox {
     if (domain !== this.options.domain) throw new HttpError(400, `${state.principal} is not on ${this.options.domain}`);
     // Enrollment creates an account; it never replaces one. Changes come as log updates its own key signs.
     if (this.store.hasUser(local)) throw new HttpError(409, `${state.principal} is already enrolled`);
-    await this.record(state.principal, 'bound', state.identityKey, publication);
+    const binding = await this.bindAddress(publication, state.principal, state.identityKey);
     this.setListing(local, state.unlisted);
     this.store.putUser(local, {
-      binding: bindIdentity(this.options.domainKey, state.principal, state.identityKey),
+      binding,
       log: structuredClone(publication.entries),
       card: structuredClone(publication.card),
       view: structuredClone(publication.view),
@@ -381,7 +425,8 @@ export class SignetServer implements LegacyInbox {
   async unenroll(local: string): Promise<void> {
     this.cluster?.requirePrimary();
     if (!this.store.hasUser(local)) throw new HttpError(404, `${local} is not enrolled`);
-    await this.record(`${local}@${this.options.domain}`, 'unbound', null, null);
+    if (this.options.registrar) await this.options.registrar.unbind(`${local}@${this.options.domain}`);
+    else await this.record(`${local}@${this.options.domain}`, 'unbound', null, null);
     this.store.deleteUser(local);
     await this.cluster?.durable();
   }
@@ -399,9 +444,9 @@ export class SignetServer implements LegacyInbox {
     const extendsStored = log.length >= user.log.length && user.log.every((entry, i) => entryHash(entry) === entryHash(log[i]));
     if (!extendsStored) throw new HttpError(409, 'log must extend the stored log');
     if (cardHash(publication.card) === cardHash(user.card) && viewHash(publication.view) === viewHash(user.view)) return;
-    await this.record(state.principal, 'bound', state.identityKey, publication);
+    const binding = await this.bindAddress(publication, state.principal, state.identityKey);
     this.setListing(local, state.unlisted);
-    if (state.identityKey !== user.binding.identityKey) user.binding = bindIdentity(this.options.domainKey, state.principal, state.identityKey);
+    if (state.identityKey !== user.binding.identityKey) user.binding = binding;
     user.log = structuredClone(log);
     user.card = structuredClone(publication.card);
     user.view = structuredClone(publication.view);
@@ -423,9 +468,9 @@ export class SignetServer implements LegacyInbox {
     const principal = `${local}@${this.options.domain}`;
     const user = this.store.user(local);
     // With an intake, strangers can't tell an unlisted address from a missing one: same answer, no VRF proof.
-    if (this.intakeKey && access === 'public' && (!user || this.unlisted.has(local))) return signUnlisted(this.options.domainKey, principal);
+    if (this.intakeKey && access === 'public' && (!user || this.unlisted.has(local))) { const { key, asHome } = this.answerSigner(); return signUnlisted(key, principal, new Date(), asHome); }
     const vrf = proveIndex(this.vrfKey, principal);
-    if (!user) return signNotEnrolled(this.options.domainKey, principal, vrf);
+    if (!user) { const { key, asHome } = this.answerSigner(); return signNotEnrolled(key, principal, vrf, new Date(), asHome); }
     return {
       status: 'enrolled',
       principal,
@@ -566,7 +611,9 @@ export class SignetServer implements LegacyInbox {
       method,
       headers: {
         ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
-        ...domainAuthHeaders(this.options.domain, this.options.domainKey, method, `${pathname}${search}`, body),
+        ...(this.options.domainKey
+          ? domainAuthHeaders(this.options.domain, this.options.domainKey, method, `${pathname}${search}`, body)
+          : homeAuthHeaders(this.options.domain, this.options.homeKey as KeyPair, method, `${pathname}${search}`, body)),
       },
       body: method === 'POST' ? body : undefined,
     });
@@ -629,7 +676,7 @@ export class SignetServer implements LegacyInbox {
     if (method === 'POST' && path === '/v0/pairing') return this.openPairing(client);
     if (method === 'GET' && path === '/v0/claims') {
       const local = splitAddress(client.principal).local;
-      return { claims: this.store.claims(local).map((claim) => signOrgClaim(this.options.domainKey, client.principal, claim)) };
+      return { claims: this.store.claims(local).map((claim) => signOrgClaim(this.domainSigner(), client.principal, claim)) };
     }
     if (method === 'POST' && pairing && pairing[2] === 'a') {
       if (this.livePairing(pairing[1]).principal !== client.principal) throw new HttpError(403, 'not your pairing slot');
@@ -786,6 +833,28 @@ export class SignetServer implements LegacyInbox {
    * anything else gets a small per-IP budget. Unknown addresses get the same signed not-enrolled answer
    * as real but unenrolled ones, so the directory can't be used to test which addresses exist.
    */
+  /**
+   * A signed call to another domain, to the first of its homes that answers. A home that can't be reached, says
+   * 421, or fails with a 5xx is skipped; any other answer, including a refusal, is the answer.
+   */
+  private async signedFetchHomes(domain: string, method: 'GET' | 'POST', path: string, body = ''): Promise<Response> {
+    const policy = await this.options.resolver.policy(domain);
+    const bases = policy.operators ? (policy.homes ?? [policy.server]) : [policy.server];
+    let last: Response | undefined;
+    let failure: unknown;
+    for (const base of bases) {
+      try {
+        const response = await this.signedFetch(method, `${base}${path}`, body);
+        if (response.status < 500 && response.status !== 421) return response;
+        last = response;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (last) return last;
+    throw failure;
+  }
+
   private async remoteLookup(request: HttpRequest, local: string): Promise<DirectoryEntry> {
     const who = await this.requester(request);
     const keys = who
@@ -849,9 +918,8 @@ export class SignetServer implements LegacyInbox {
       const colleague = this.options.colleaguesSeeViews ?? true;
       return this.directory(local, colleague || this.store.hasViewGrant(local, this.requesterHash(client)) ? 'contact' : 'public');
     }
-    const { server } = await this.options.resolver.policy(domain);
     const query = new URLSearchParams({ requester: this.requesterHash(client) });
-    const response = await this.signedFetch('GET', `${server}/v0/directory/${encodeURIComponent(local)}?${query.toString()}`);
+    const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}?${query.toString()}`);
     if (!response.ok) throw new HttpError(response.status === 429 ? 429 : 502, `lookup at ${domain} failed: ${response.status} ${await response.text()}`);
     return (await response.json()) as DirectoryEntry;
   }
@@ -859,9 +927,8 @@ export class SignetServer implements LegacyInbox {
   private async claimFor(client: ClientCert, { address, clients }: { address: string; clients: string[] }): Promise<{ packages: ClaimedKeyPackage[] }> {
     const { local, domain } = splitAddress(address);
     if (domain === this.options.domain) return { packages: this.claim(local, clients, `${domain}:${this.requesterHash(client)}`) };
-    const { server } = await this.options.resolver.policy(domain);
     const query = new URLSearchParams({ requester: this.requesterHash(client) });
-    const response = await this.signedFetch('POST', `${server}/v0/directory/${encodeURIComponent(local)}/claim?${query.toString()}`, JSON.stringify({ clients }));
+    const response = await this.signedFetchHomes(domain, 'POST', `/v0/directory/${encodeURIComponent(local)}/claim?${query.toString()}`, JSON.stringify({ clients }));
     if (!response.ok) throw new HttpError(response.status === 429 ? 429 : 502, `claim at ${domain} failed: ${response.status} ${await response.text()}`);
     return (await response.json()) as { packages: ClaimedKeyPackage[] };
   }
@@ -910,13 +977,11 @@ export class SignetServer implements LegacyInbox {
   /** A request from another Signet server, signed with the key in that domain's published policy. */
   private async authenticateDomain(request: HttpRequest): Promise<string> {
     const domain = header(request.headers, 'signet-domain');
-    const { domainKey } = await this.options.resolver.policy(domain);
-    const ok = verifyDomainAuth(
-      domain,
-      domainKey,
-      header(request.headers, 'signet-sig'),
-      header(request.headers, 'signet-ts'),
-      header(request.headers, 'signet-nonce'),
+    const policy = await this.options.resolver.policy(domain);
+    const home = request.headers['signet-home'];
+    const ok = verifyDomainCall(
+      policy,
+      { sig: header(request.headers, 'signet-sig'), ts: header(request.headers, 'signet-ts'), nonce: header(request.headers, 'signet-nonce'), home: typeof home === 'string' ? home : undefined },
       request.method,
       request.path,
       request.body,
@@ -932,7 +997,8 @@ export class SignetServer implements LegacyInbox {
     if (!CLIENT_KINDS.includes(envelope.kind)) throw new HttpError(400, `clients can't submit ${envelope.kind}`);
     if (envelope.token && !SEALABLE_KINDS.includes(envelope.kind)) throw new HttpError(400, `${envelope.kind} can't be sealed`);
     if (envelope.anonymousToken && envelope.kind !== 'request') throw new HttpError(400, 'only requests are sent anonymously');
-    const id = randomId('i');
+    if (envelope.id !== undefined && !/^[A-Za-z0-9_-]{8,64}$/.test(envelope.id)) throw new HttpError(400, 'id must be 8 to 64 letters, digits, - or _');
+    const id = envelope.id ?? randomId('i');
     // Sealed and anonymous deliveries leave here without a sender; only this server, which already knows its own user, keeps it for bounces.
     const base = { id, to: envelope.to, kind: envelope.kind, payload: envelope.payload };
     const delivery: Delivery = envelope.token
@@ -946,18 +1012,77 @@ export class SignetServer implements LegacyInbox {
       byDomain.set(domain, [...(byDomain.get(domain) ?? []), address]);
     }
     const results = await Promise.all(
-      [...byDomain].map(([domain, to]) =>
-        domain === this.options.domain
-          ? delivery.anonymousToken
-            ? this.deliverAnonymous({ ...delivery, to })
-            : this.deliverLocal({ ...delivery, to })
-          : this.relay(domain, { ...delivery, to }, client.principal),
-      ),
+      [...byDomain].map(([domain, to]) => this.deliverToDomain(domain, { ...delivery, to }, client.principal)),
     );
     return { id, ...merge(results) };
   }
 
+  /** Where else this domain's own mail has to go: the other homes in its operators statement (Section 6.9.5). */
+  private peerHomes(): string[] {
+    const homes = this.options.operators?.body.homes ?? [];
+    return homes.filter((home) => home.key !== this.options.homeKey?.publicKey).map((home) => new URL(home.url).origin);
+  }
+
+  /** Deliver to a domain: here if it is this one, to its other homes as well when it has several, and by relay if it is another. */
+  private async deliverToDomain(domain: string, delivery: Delivery, sender: string): Promise<DeliveryResult> {
+    if (domain !== this.options.domain) return this.relay(domain, delivery, sender);
+    const local = () => (delivery.anonymousToken ? this.deliverAnonymous(delivery) : this.deliverLocal(delivery));
+    const peers = this.peerHomes();
+    return peers.length === 0 ? local() : this.fanOut(domain, delivery, sender, peers, local);
+  }
+
+  /**
+   * Deliver to every home of a domain at the same time (Section 6.9.5). The domain counts as delivered once
+   * any home accepts; a home that couldn't be reached is retried on its own; the sender hears of a bounce
+   * only when every home refused for good.
+   */
+  private async fanOut(domain: string, delivery: Delivery, sender: string, homes: string[], local?: () => Promise<DeliveryResult>): Promise<DeliveryResult> {
+    const attempts: { home?: string; run: () => Promise<DeliveryResult> }[] = [
+      ...(local ? [{ run: local }] : []),
+      ...homes.map((home) => ({ home, run: () => this.relayOnce(domain, delivery, home) })),
+    ];
+    const settled = await Promise.allSettled(attempts.map((attempt) => attempt.run()));
+    const answers: DeliveryResult[] = [];
+    const retry: { home: string; reason: string }[] = [];
+    let refusal: RelayError | undefined;
+    settled.forEach((outcome, i) => {
+      if (outcome.status === 'fulfilled') answers.push(outcome.value);
+      else if (!attempts[i].home) throw outcome.reason;
+      else if (outcome.reason instanceof RelayError && outcome.reason.permanent) refusal = outcome.reason;
+      else retry.push({ home: attempts[i].home as string, reason: describe(outcome.reason) });
+    });
+    const accepted = answers.length > 0;
+    for (const { home, reason } of retry) this.queueRetry(domain, delivery, sender, reason, home, accepted);
+    if (!accepted) {
+      if (retry.length > 0) return { ...empty(), queued: delivery.to };
+      this.bounce(sender, delivery, (refusal as RelayError | undefined)?.message ?? `delivery to ${domain} failed`);
+      return empty();
+    }
+    // An address is delivered if any home that answered took it; unknown only if every one says so.
+    const result = empty();
+    for (const address of delivery.to) {
+      const took = answers.some((answer) => !answer.unknown.includes(address) && !answer.rejected.includes(address));
+      if (took) continue;
+      if (answers.every((answer) => answer.unknown.includes(address))) result.unknown.push(address);
+      else result.rejected.push(address);
+    }
+    return result;
+  }
+
+  private queueRetry(domain: string, delivery: Delivery, sender: string, reason: string, home: string | undefined, accepted: boolean): void {
+    const delays = this.options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS;
+    const entry: Outbound = { id: randomId('o'), domain, delivery, sender, attempt: 0, dueAt: Date.now() + (delays[0] ?? 0), reason, ...(home ? { home, accepted } : {}) };
+    // Saved before the client hears "queued", so a restart can't lose it.
+    this.store.saveOutbound(entry);
+    this.schedule(entry);
+  }
+
   private async relay(domain: string, delivery: Delivery, sender: string): Promise<DeliveryResult> {
+    const homes = await this.options.resolver.policy(domain).then(
+      (policy) => homeGroups(policy).map((group) => group[0]),
+      () => [],
+    );
+    if (homes.length > 1) return this.fanOut(domain, delivery, sender, homes);
     try {
       return await this.relayOnce(domain, delivery);
     } catch (error) {
@@ -965,24 +1090,23 @@ export class SignetServer implements LegacyInbox {
         this.bounce(sender, delivery, error.message);
         return empty();
       }
-      const delays = this.options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS;
-      const entry: Outbound = { id: randomId('o'), domain, delivery, sender, attempt: 0, dueAt: Date.now() + (delays[0] ?? 0), reason: describe(error) };
-      // Saved before the client hears "queued", so a restart can't lose it.
-      this.store.saveOutbound(entry);
-      this.schedule(entry);
+      this.queueRetry(domain, delivery, sender, describe(error), undefined, false);
       return { ...empty(), queued: delivery.to };
     }
   }
 
-  private async relayOnce(domain: string, delivery: Delivery): Promise<DeliveryResult> {
+  /** One attempt at one home: `home` when the domain has several, else the home its policy names. */
+  private async relayOnce(domain: string, delivery: Delivery, home?: string): Promise<DeliveryResult> {
     const policy = await this.options.resolver.policy(domain);
+    const target = home ?? policy.server;
     const body = JSON.stringify(delivery);
-    if (!delivery.token && !delivery.anonymousToken) return this.answer(domain, await this.signedFetch('POST', `${policy.server}/v0/deliver`, body));
+    if (!delivery.token && !delivery.anonymousToken) return this.answer(domain, await this.signedFetch('POST', `${target}/v0/deliver`, body));
     // Sealed and anonymous deliveries aren't signed by this domain: a token authorizes them. Through an OHTTP
     // relay, the receiving server doesn't even see which server sent them.
     const path = delivery.token ? '/v0/deliver-sealed' : '/v0/deliver-anonymous';
-    if (this.options.ohttpRelay && policy.ohttp) return this.relayOblivious(domain, policy, path, body);
-    return this.answer(domain, await this.fetchImpl(`${policy.server}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }));
+    // The policy names one OHTTP gateway, the first home's; deliveries to the other homes of a domain go direct.
+    if (this.options.ohttpRelay && policy.ohttp && (!home || new URL(home).origin === new URL(policy.server).origin)) return this.relayOblivious(domain, policy, path, body);
+    return this.answer(domain, await this.fetchImpl(`${target}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body }));
   }
 
   private async answer(domain: string, response: Response): Promise<DeliveryResult> {
@@ -1027,18 +1151,25 @@ export class SignetServer implements LegacyInbox {
       // A standby keeps the queue but doesn't work it; whoever is primary does.
       if (this.cluster && !this.cluster.isPrimary()) return;
       const delivery = entry.delivery as Delivery;
-      this.relayOnce(entry.domain, delivery).then(
-        () => this.store.removeOutbound(entry.id),
+      this.relayOnce(entry.domain, delivery, entry.home).then(
+        () => {
+          this.store.removeOutbound(entry.id);
+          // The other homes still being retried for this delivery no longer risk a bounce.
+          if (entry.home) for (const other of this.siblings(entry)) this.store.saveOutbound({ ...other, accepted: true });
+        },
         (error: unknown) => {
           const delays = this.options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS;
           const attempt = entry.attempt + 1;
+          const current = this.store.outbound().find((queued) => queued.id === entry.id) ?? entry;
           if ((error instanceof RelayError && error.permanent) || attempt >= delays.length) {
             const reason = error instanceof RelayError && error.permanent ? error.message : `gave up after ${attempt + 1} attempts: ${describe(error)}`;
-            this.bounce(entry.sender, delivery, reason);
+            const lastHome = this.siblings(entry).length === 0;
             this.store.removeOutbound(entry.id);
+            // With several homes, only the last one to give up, and only if none accepted, is a bounce.
+            if (!entry.home || (!current.accepted && lastHome)) this.bounce(entry.sender, delivery, reason);
             return;
           }
-          const next = { ...entry, attempt, dueAt: Date.now() + delays[attempt], reason: describe(error) };
+          const next = { ...current, attempt, dueAt: Date.now() + delays[attempt], reason: describe(error) };
           this.store.saveOutbound(next);
           this.schedule(next);
         },
@@ -1046,6 +1177,11 @@ export class SignetServer implements LegacyInbox {
     }, Math.max(0, entry.dueAt - Date.now()));
     timer.unref();
     this.timers.add(timer);
+  }
+
+  /** Other queued retries of the same delivery to the same domain, at its other homes. */
+  private siblings(entry: Outbound): Outbound[] {
+    return this.store.outbound().filter((other) => other.id !== entry.id && other.domain === entry.domain && (other.delivery as Delivery).id === (entry.delivery as Delivery).id);
   }
 
   /** Tell the sender, in their own mailbox, that a delivery failed for good. */
@@ -1112,7 +1248,7 @@ export class SignetServer implements LegacyInbox {
     const user = this.store.user(splitAddress(client.principal).local);
     if (!user) throw new HttpError(404, 'sender is not enrolled');
     if (!Array.isArray(to) || to.length === 0 || typeof subject !== 'string') throw new HttpError(400, 'to and subject are required');
-    return attestedSignetHeader(this.options.domainKey, this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject });
+    return attestedSignetHeader(this.domainSigner(), this.http.publicUrl, user.binding.identityKey, { from: client.principal, to, subject });
   }
 
   private async sendLegacy(

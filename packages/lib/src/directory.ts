@@ -5,6 +5,8 @@ import { sha256, signJson, verifyJson } from './crypto';
 import { canonicalJson } from './encoding';
 import type { LogEntry } from './identity';
 import { LogError, replayLog } from './identity';
+import type { Operators } from './operators';
+import { verifiedDomainSigner } from './operators';
 import type { TrustedLog } from './transparency';
 import type { VrfProof } from './vrf';
 import { verifyIndex } from './vrf';
@@ -16,6 +18,8 @@ export interface DomainPolicy {
   server: string;
   /** Every home of a domain that runs several, in order of preference; `server` is the first (Section 6.8). */
   homes?: string[];
+  /** The domain owner's signed list of independent homes (Section 6.9). When present, `homes` and `server` come from it. */
+  operators?: Operators;
   mode: 'enforce' | 'testing';
   maxAge: number;
   domainKey: string;
@@ -57,6 +61,8 @@ export interface NotEnrolledEntry {
   status: 'not-enrolled';
   principal: string;
   ts: string;
+  /** The home key that signed this answer in place of the domain key (Section 6.9.3). */
+  home?: string;
   sig: string;
   vrf: VrfProof;
 }
@@ -69,6 +75,7 @@ export interface UnlistedEntry {
   status: 'unlisted';
   principal: string;
   ts: string;
+  home?: string;
   sig: string;
 }
 
@@ -117,14 +124,16 @@ export function parseContactCard(link: string): ContactCard {
   }
 }
 
-export function signUnlisted(domainKey: KeyPair, principal: string, now = new Date()): UnlistedEntry {
-  const unsigned = { status: 'unlisted' as const, principal, ts: now.toISOString() };
-  return { ...unsigned, sig: signJson(domainKey, unsigned) };
+/** Sign with the domain key, or with a home key (`asHome`), which names itself in the answer. */
+export function signUnlisted(signer: KeyPair, principal: string, now = new Date(), asHome = false): UnlistedEntry {
+  const unsigned = { status: 'unlisted' as const, principal, ts: now.toISOString(), ...(asHome ? { home: signer.publicKey } : {}) };
+  return { ...unsigned, sig: signJson(signer, unsigned) };
 }
 
 export function verifyUnlisted(entry: UnlistedEntry, policy: DomainPolicy): void {
   const { sig, ...unsigned } = entry;
-  if (splitAddress(entry.principal).domain !== policy.domain || !policy.intake || !verifyJson(policy.domainKey, unsigned, sig)) {
+  const signer = verifiedDomainSigner(policy, entry.home);
+  if (splitAddress(entry.principal).domain !== policy.domain || !policy.intake || signer === undefined || !verifyJson(signer, unsigned, sig)) {
     throw new LogError(`unsigned unlisted answer for ${entry.principal}`);
   }
 }
@@ -159,15 +168,16 @@ export function bindIdentity(domainKey: KeyPair, principal: string, identityKey:
   return { ...unsigned, sig: signJson(domainKey, { type: 'binding', ...unsigned }) };
 }
 
-export function signNotEnrolled(domainKey: KeyPair, principal: string, vrf: VrfProof, now = new Date()): NotEnrolledEntry {
-  const unsigned = { status: 'not-enrolled' as const, principal, ts: now.toISOString() };
-  return { ...unsigned, sig: signJson(domainKey, unsigned), vrf };
+export function signNotEnrolled(signer: KeyPair, principal: string, vrf: VrfProof, now = new Date(), asHome = false): NotEnrolledEntry {
+  const unsigned = { status: 'not-enrolled' as const, principal, ts: now.toISOString(), ...(asHome ? { home: signer.publicKey } : {}) };
+  return { ...unsigned, sig: signJson(signer, unsigned), vrf };
 }
 
 /** Check a not-enrolled answer's signature and VRF proof; returns the address's log index. */
 export function verifyNotEnrolled(entry: NotEnrolledEntry, policy: DomainPolicy): string {
   const { sig, vrf, ...unsigned } = entry;
-  if (splitAddress(entry.principal).domain !== policy.domain || !verifyJson(policy.domainKey, unsigned, sig)) {
+  const signer = verifiedDomainSigner(policy, entry.home);
+  if (splitAddress(entry.principal).domain !== policy.domain || signer === undefined || !verifyJson(signer, unsigned, sig)) {
     throw new LogError(`unsigned not-enrolled answer for ${entry.principal}`);
   }
   return verifyIndex(policy.vrfKey, entry.principal, vrf);

@@ -149,6 +149,10 @@ export interface ThreadMeta {
 /** Everything a client carries between runs apart from its signing keys. `mls` holds its MLS key store. */
 export interface ClientSnapshot {
   cursor: number;
+  /** A mailbox cursor for each home of a domain with several (their `seq` values differ), by home URL. */
+  cursors: Record<string, number>;
+  /** Ids of mail already processed, so an item that came from more than one home is handled once (Section 6.9.6). */
+  seen: string[];
   pins: Record<string, string>;
   admission: AdmissionPolicy;
   mls: string;
@@ -235,6 +239,8 @@ interface MlsPayload {
 
 const emptySnapshot = (): ClientSnapshot => ({
   cursor: 0,
+  cursors: {},
+  seen: [],
   pins: {},
   admission: { contacts: [], trustedDomains: [] },
   mls: '',
@@ -257,6 +263,7 @@ const emptySnapshot = (): ClientSnapshot => ({
 });
 
 const SENT_IDS_KEPT = 1000;
+const SEEN_IDS_KEPT = 5000;
 
 const joinerTag = (clientId: string): string => sha256(`signet joiner ${clientId}`);
 const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }): WelcomePayload => ({
@@ -342,13 +349,13 @@ export class SignetClient {
   async addContact(address: string): Promise<void> {
     const who = normalizeAddress(address);
     if (!this.state.admission.contacts.includes(who)) this.state.admission.contacts.push(who);
-    await this.call('POST', '/v0/contacts', { contacts: [who] });
+    await this.callEach('POST', '/v0/contacts', { contacts: [who] });
   }
 
   async trustDomain(domain: string): Promise<void> {
     const name = domain.toLowerCase();
     if (!this.state.admission.trustedDomains.includes(name)) this.state.admission.trustedDomains.push(name);
-    await this.call('POST', '/v0/contacts', { trustedDomains: [name] });
+    await this.callEach('POST', '/v0/contacts', { trustedDomains: [name] });
   }
 
   /** Mark a client this device approved itself, so `monitor` doesn't ask whether it was you. */
@@ -842,14 +849,20 @@ export class SignetClient {
     // Joining a thread registers its token, which can release deliveries the server parked; fetch again for those.
     for (let round = 0; round < 3; round += 1) {
       this.released = 0;
-      const { items } = (await this.call('GET', `/v0/mailbox?after=${this.state.cursor}`)) as { items: MailItem[] };
-      for (const item of items) {
-        this.state.cursor = item.seq;
-        if (this.state.sentIds.includes(item.id)) continue;
-        try {
-          events.push(...(await this.process(item)));
-        } catch (error) {
-          events.push({ kind: 'error', item, error: describe(error) });
+      const seen = new Set(this.state.seen);
+      for (const { home, items } of await this.readMailboxes()) {
+        for (const item of items) {
+          this.state.cursors[home] = item.seq;
+          this.state.cursor = item.seq;
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          this.state.seen = [...this.state.seen, item.id].slice(-SEEN_IDS_KEPT);
+          if (this.state.sentIds.includes(item.id)) continue;
+          try {
+            events.push(...(await this.process(item)));
+          } catch (error) {
+            events.push({ kind: 'error', item, error: describe(error) });
+          }
         }
       }
       if (this.released === 0) break;
@@ -1274,7 +1287,7 @@ export class SignetClient {
   /** Let these people's servers fetch this account's contact view from now on. */
   private async releaseView(to: string[]): Promise<void> {
     const others = to.filter((address) => normalizeAddress(address) !== this.address);
-    if (others.length > 0) await this.call('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
+    if (others.length > 0) await this.callEach('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
   }
 
   private trustedLog(policy: DomainPolicy): TrustedLog {
@@ -1330,10 +1343,13 @@ export class SignetClient {
   private async topUpKeyPackages(): Promise<void> {
     if (!this.keys.cert.scopes.some((scope) => scope === 'read:*')) return;
     const target = this.options.keyPackageTarget ?? 5;
-    const { count, lastResort } = (await this.call('GET', '/v0/keypackages/count')) as { count: number; lastResort: boolean };
-    const packages = Array.from({ length: Math.max(0, target - count) }, () => ({ kpId: randomId('kp'), keyPackage: this.mls.keyPackage(false) }));
-    const fallback = lastResort ? undefined : { kpId: randomId('kp'), keyPackage: this.mls.keyPackage(true) };
-    if (packages.length > 0 || fallback) await this.call('POST', '/v0/keypackages', { packages, lastResort: fallback });
+    // Every home keeps its own pool, so each is topped up.
+    await this.eachHome(async (home) => {
+      const { count, lastResort } = (await this.request(home, 'GET', '/v0/keypackages/count')) as { count: number; lastResort: boolean };
+      const packages = Array.from({ length: Math.max(0, target - count) }, () => ({ kpId: randomId('kp'), keyPackage: this.mls.keyPackage(false) }));
+      const fallback = lastResort ? undefined : { kpId: randomId('kp'), keyPackage: this.mls.keyPackage(true) };
+      if (packages.length > 0 || fallback) await this.request(home, 'POST', '/v0/keypackages', { packages, lastResort: fallback });
+    });
   }
 
   /** One token bound to the recipient's domain, blinded so neither the issuer nor this client's server can link it. */
@@ -1365,8 +1381,7 @@ export class SignetClient {
 
   private async registerTokens(add: string[], remove: string[]): Promise<void> {
     if (add.length === 0 && remove.length === 0) return;
-    const { released = 0 } = (await this.call('POST', '/v0/delivery-tokens', { add, remove })) as { released?: number };
-    this.released += released;
+    for (const result of await this.callEach('POST', '/v0/delivery-tokens', { add, remove })) this.released += (result as { released?: number }).released ?? 0;
   }
 
   private async upload(file: FileInput): Promise<AttachmentRef> {
@@ -1386,7 +1401,8 @@ export class SignetClient {
 
   /** With a token the delivery is sealed; with an anonymous token the request carries no sender. */
   private async submit(to: string[], kind: MailKind, payload: unknown, token?: string, anonymousToken?: string): Promise<void> {
-    const { id } = (await this.call('POST', '/v0/submit', { to, kind, payload, token, anonymousToken })) as { id: string };
+    // The client picks the id, so a send repeated through another home after a lost answer is recognised.
+    const { id } = (await this.call('POST', '/v0/submit', { id: randomId('i'), to, kind, payload, token, anonymousToken })) as { id: string };
     this.state.sentIds = [...this.state.sentIds, id].slice(-SENT_IDS_KEPT);
   }
 
@@ -1407,17 +1423,70 @@ export class SignetClient {
     return { code: pairingCode(slot, newPairingSecret()), channel: new HttpPairingChannel(server, slot, 'a', auth, this.fetchImpl), expires };
   }
 
-  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
-    const { server } = await this.resolver.policy(splitAddress(this.address).domain);
+  /** The homes of this client's own domain, the one that last answered first. One home for any domain without a signed list. */
+  private async homeBases(): Promise<string[]> {
+    const policy = await this.resolver.policy(splitAddress(this.address).domain);
+    const bases = policy.operators ? (policy.homes ?? [policy.server]) : [policy.server];
+    return this.preferredHome && bases.includes(this.preferredHome) ? [this.preferredHome, ...bases.filter((base) => base !== this.preferredHome)] : bases;
+  }
+
+  private preferredHome?: string;
+
+  private async request(base: string, method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
     const binary = body instanceof Uint8Array;
     const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
     const headers = {
       ...clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, payload),
       ...(body === undefined ? {} : { 'content-type': binary ? 'application/octet-stream' : 'application/json' }),
     };
-    const response = await this.fetchImpl(`${server}${path}`, { method, headers, body: body === undefined ? undefined : payload });
+    const response = await this.fetchImpl(`${base}${path}`, { method, headers, body: body === undefined ? undefined : payload });
     if (!response.ok) throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
     return response.json();
+  }
+
+  /** Run `act` at every home, ignoring the ones that fail; throws only if every home did. */
+  private async eachHome<T>(act: (home: string) => Promise<T>): Promise<T[]> {
+    const results: T[] = [];
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        results.push(await act(home));
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (results.length === 0) throw failure;
+    return results;
+  }
+
+  /** The mailbox of every home, each from its own cursor. A home that doesn't answer is skipped. */
+  private async readMailboxes(): Promise<{ home: string; items: MailItem[] }[]> {
+    const bases = await this.homeBases();
+    return this.eachHome(async (home) => {
+      const cursor = this.state.cursors[home] ?? (bases.length === 1 ? this.state.cursor : 0);
+      const { items } = (await this.request(home, 'GET', `/v0/mailbox?after=${cursor}`)) as { items: MailItem[] };
+      return { home, items };
+    });
+  }
+
+  /** A call to the first home that answers. */
+  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        const result = await this.request(home, method, path, body);
+        this.preferredHome = home;
+        return result;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
+  }
+
+  /** A call to every home, for state each of them keeps: tokens, contacts and grants. Throws only if every home failed. */
+  private async callEach(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown[]> {
+    return this.eachHome((home) => this.request(home, method, path, body));
   }
 }
 

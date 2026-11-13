@@ -80,3 +80,18 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 | 6.8.6 | (no protocol rule) | No pre-vote: a replica cut off from the others raises its term and forces an election when it returns | `packages/server/src/raft.ts` | low |
 | 6.8 | A deployment can run a cluster | No command-line or environment configuration for `signet server`; clusters are built in code (`SignetServer` with `cluster`, `ClusterWitness`), and an operator copies the domain, VRF, gateway and intake keys to each replica | `packages/server/src/main.ts` | medium |
 
+## 6.9 Multi-operator domains
+
+| Section | Spec requires | Reference does | Where | Severity |
+| --- | --- | --- | --- | --- |
+| 6.9.4 | A home reaches the owner's registrar over some channel | `LocalRegistrar` runs in the home's own process, so a home that isn't run by the domain owner can't bind addresses; there is no network registrar | `packages/server/src/registrar.ts` | high |
+| 6.9.4 | Claims and legacy attestation go through the registrar | A home without the domain key answers 501 for organisation claims and for legacy-mail attestation | `packages/server/src/server.ts` | medium |
+| 6.9.6 | A client repeats a registration with a home that was down | Key packages are topped up at every sync, but delivery tokens, contacts and view grants a down home missed are not repeated | `packages/lib/src/client.ts` | medium |
+| 6.9.6 | A client compares what its homes return and flags one that is missing items | Not done; the spec doesn't define the comparison | `packages/lib/src/client.ts` | medium |
+| 6.9.2 | A client refuses a lower `seq` than any it has held | The highest `seq` is kept in the resolver's memory only, so a restarted client forgets it | `packages/lib/src/resolver.ts` | medium |
+| 6.9.7 | (open issue) | Sealed deliveries to homes after the first go direct, not through OHTTP | `packages/server/src/server.ts` (`relayOnce`) | medium |
+| 6.9.7 | (open issue) | Each home accepts a Privacy Pass token once, so one token can be spent at each home | `packages/server/src/server.ts` (`deliverAnonymous`) | low |
+| 6.9.5 | A client resends through another home when its own can't be reached | Done for any failure of the call. A home that accepts and then drops the message isn't noticed | `packages/lib/src/client.ts` (`call`) | medium |
+| 6.9 | A deployment can run a multi-operator domain | There is no command-line or environment configuration for operator mode; it is built in code, and the owner signs the statement with `signOperators` | `packages/server/src/main.ts` | medium |
+| 6.9.7 | (open issue) | The VRF key, and the intake key with an intake, are given to every home | `packages/server/src/server.ts` | medium |
+

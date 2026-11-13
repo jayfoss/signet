@@ -29,7 +29,11 @@ Tests run per file, for example `pnpm jest packages/server/src/__tests__/server.
 
 ## Several homes
 
-A domain can run more than one home server, so mail keeps flowing when one fails and without anyone moving DNS records (Section 6.8 of the specification). Replicas copy the primary's changes through a Raft log, elect a new primary when it fails, and callers fall over to the next home the policy lists. A cheap witness that only votes lets two homes survive the loss of one. Discovery doesn't use MX, so an outage at the domain's mail provider doesn't touch any of this. See `packages/server/src/__tests__/cluster.test.ts` for a cluster built in code; there is no command-line configuration for it yet.
+**One operator, several machines.** A home can be a Raft cluster: replicas copy the primary's changes, elect a new primary when it fails, and a cheap witness that only votes lets two replicas survive the loss of one (Section 6.8).
+
+**Several operators.** A domain can also spread across operators who don't trust each other (Section 6.9). Each runs an independent home with its own key and state, and none holds the domain key. The domain owner signs a statement listing the homes and pins the domain key in DNS (`dk=`). A sending home delivers to every home of the recipient at the same time, a client reads from all of its homes and shows each message once, and a home that is down is caught up by retries. Discovery doesn't use MX, so an outage at the domain's mail provider doesn't touch any of this.
+
+The tests `cluster.test.ts` and `operators.test.ts` build both in code; there is no command-line configuration for them yet.
 
 ## Licence
 

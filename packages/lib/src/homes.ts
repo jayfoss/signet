@@ -8,6 +8,16 @@ export function policyHomes(policy: Pick<DomainPolicy, 'server' | 'homes'>): str
 
 const originOf = (url: string): string => new URL(url).origin;
 
+/**
+ * The independent homes of a domain, each as the URLs that reach it. A domain with a signed operators
+ * statement has one group per operator (its url, then its replicas). Any other domain is one home, its
+ * `homes` being replicas of it (Section 6.8).
+ */
+export function homeGroups(policy: Pick<DomainPolicy, 'server' | 'homes' | 'operators'>): string[][] {
+  if (policy.operators) return policy.operators.body.homes.map((home) => [...new Set([home.url, ...(home.replicas ?? [])].map(originOf))]);
+  return [policyHomes(policy)];
+}
+
 interface HomeGroup {
   homes: string[];
   /** The home that last answered, tried first. */
@@ -18,15 +28,16 @@ interface HomeGroup {
 export class HomeRegistry {
   private readonly groups = new Map<string, HomeGroup>();
 
-  /** Record a policy's homes. A domain keeps its last good home across refreshes while that home is still listed. */
-  register(policy: Pick<DomainPolicy, 'server' | 'homes'>): void {
-    const homes = policyHomes(policy);
-    const group: HomeGroup = { homes, preferred: homes[0] };
-    for (const origin of homes) {
-      const old = this.groups.get(origin);
-      if (old && homes.includes(old.preferred)) group.preferred = old.preferred;
+  /** Record a policy's homes. A home keeps its last good replica across refreshes while that replica is still listed. */
+  register(policy: Pick<DomainPolicy, 'server' | 'homes' | 'operators'>): void {
+    for (const homes of homeGroups(policy)) {
+      const group: HomeGroup = { homes, preferred: homes[0] };
+      for (const origin of homes) {
+        const old = this.groups.get(origin);
+        if (old && homes.includes(old.preferred)) group.preferred = old.preferred;
+      }
+      for (const origin of homes) this.groups.set(origin, group);
     }
-    for (const origin of homes) this.groups.set(origin, group);
   }
 
   groupOf(origin: string): HomeGroup | undefined {

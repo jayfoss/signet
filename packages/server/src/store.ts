@@ -31,6 +31,10 @@ export interface Outbound {
   attempt: number;
   dueAt: number;
   reason: string;
+  /** For a domain with several homes: the one this entry retries. Unset means whichever home the policy names. */
+  home?: string;
+  /** Another home of the domain has already accepted this delivery, so giving up here is not a bounce. */
+  accepted?: boolean;
 }
 
 type Parked = Omit<MailItem, 'seq' | 'receivedAt'>;
@@ -53,6 +57,7 @@ export interface Store {
   deleteUser(local: string): void;
   userLocals(): string[];
 
+  /** Add an item to a mailbox. An item whose id is already there is not added again; the one already stored is returned (Section 6.9.5). */
   push(local: string, item: Parked): MailItem;
   mailbox(local: string, after?: number): MailItem[];
 
@@ -155,6 +160,8 @@ export class MemoryStore implements Store {
 
   push(local: string, item: Parked): MailItem {
     const mailbox = this.mailboxes.get(local) ?? [];
+    const existing = mailbox.find((entry) => entry.id === item.id);
+    if (existing) return existing;
     const stored = { ...item, seq: mailbox.length + 1, receivedAt: new Date().toISOString() };
     mailbox.push(stored);
     this.mailboxes.set(local, mailbox);
@@ -386,6 +393,8 @@ export class SqliteStore implements Store {
   }
 
   private pushNow(local: string, item: Parked): MailItem {
+    const existing = this.db.prepare("SELECT item FROM mail WHERE local = ? AND json_extract(item, '$.id') = ?").get(local, item.id) as { item: string } | undefined;
+    if (existing) return JSON.parse(existing.item) as MailItem;
     const { next } = this.db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM mail WHERE local = ?').get(local) as { next: number };
     const stored = { ...item, seq: Number(next), receivedAt: new Date().toISOString() } as MailItem;
     this.db.prepare('INSERT INTO mail (local, seq, item) VALUES (?, ?, ?)').run(local, stored.seq, JSON.stringify(stored));

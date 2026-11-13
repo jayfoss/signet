@@ -146,6 +146,14 @@ Experimental           Signet Protocol, Version 0          November 2026
          6.8.8.  Replica Recovery .................................. 57
          6.8.9.  Security Considerations ........................... 57
          6.8.10.  Open Issues ...................................... 57
+      6.9.  Multi-Operator Domains ................................ 58
+         6.9.1.  Overview .......................................... 58
+         6.9.2.  The Operators Statement ........................... 59
+         6.9.3.  Home Keys and Server Calls ........................ 60
+         6.9.4.  What the Domain Owner Keeps ....................... 60
+         6.9.5.  Delivery to Many Homes ............................ 61
+         6.9.6.  Reading and Registering ........................... 62
+         6.9.7.  Security Considerations and Open Issues ........... 62
    7.  Requests and Admission ....................................... 53
       7.1.  Overview ................................................ 53
       7.2.  Request Body ............................................ 54
@@ -2981,6 +2989,11 @@ Experimental           Signet Protocol, Version 0          November 2026
    |             |        |          | 6.8). server MUST equal the     |
    |             |        |          | first.                          |
    +-------------+--------+----------+---------------------------------+
+   | operators   | object | no       | The domain owner's signed list  |
+   |             |        |          | of independent homes (Section   |
+   |             |        |          | 6.9). Needs dk in the DNS       |
+   |             |        |          | record.                         |
+   +-------------+--------+----------+---------------------------------+
    | mode        | string | yes      | enforce or testing (Section     |
    |             |        |          | 6.5).                           |
    +-------------+--------+----------+---------------------------------+
@@ -3051,6 +3064,10 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    The host restriction keeps control of the policy with whoever runs
    the domain's zone. A host on another domain is refused.
+
+   A record MAY carry dk, the domain's public key, which pins
+   domainKey (Section 6.9.2). The value of dk is not lowercased in
+   step 3.
 
 6.4.  Fetching the Policy
 
@@ -3194,10 +3211,12 @@ Experimental           Signet Protocol, Version 0          November 2026
    replica that voted without keeping the log could let an
    acknowledged change be lost, so there is no vote-only role.
 
-   All replicas of a domain use the same domain key and the same VRF,
-   OHTTP gateway and intake keys: they are one server in several
-   places, not several servers. The operator supplies these keys to
-   each replica.
+   All replicas of a home use the same key and the same VRF, OHTTP
+   gateway and intake keys: they are one server in several places, not
+   several servers. The operator supplies these keys to each replica.
+   For a domain whose homes are run by one party, that key is the
+   domain key. A domain whose homes belong to different operators uses
+   Section 6.9 instead, and no replica holds the domain key.
 
 6.8.3.  Policy and Discovery
 
@@ -3243,8 +3262,8 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A request that fails after it was sent, such as a dropped
    connection, may have taken effect. A caller MAY send it again. A
-   receiving home SHOULD ignore a delivery whose id is already in the
-   recipient's mailbox.
+   receiving home MUST ignore a delivery whose id is already in the
+   recipient's mailbox (Section 6.9.5).
 
    A caller learns which home is primary from 421 answers. The
    primary's position changes at election time; the policy does not.
@@ -3376,12 +3395,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 6.8.9.  Security Considerations
 
-   *  *Replicas share the domain key.* A replica that is compromised
-      can sign as the domain and read the replicated mailbox
-      ciphertext, and keys for the OHTTP gateway and intake. A domain
-      MUST run all replicas itself, or under operators it trusts as it
-      trusts a hosted home. A cluster across operators who do not
-      trust each other is not supported.
+   *  *Replicas share a key.* A replica that is compromised can sign
+      as the home and read the replicated mailbox ciphertext, and keys
+      for the OHTTP gateway and intake. All replicas of one home MUST
+      belong to one operator. Operators who do not trust each other
+      run separate homes (Section 6.9); they do not join a cluster.
 
    *  *Message content is unaffected.* Replicas hold what a home
       holds: ciphertext, and the metadata a home sees. They never hold
@@ -3411,15 +3429,252 @@ Experimental           Signet Protocol, Version 0          November 2026
       how far they have applied. Version 0 sends all client traffic to
       the primary.
 
-   *  *Shared domain key.* A delegated operator key, with the
-      primary's term recorded in the account log or the transparency
-      log, would let outsiders check who was primary and when, and
-      would keep the domain key off the replicas. It is not specified.
+   *  *Who was primary.* Recording each term in the account log or
+      the transparency log would let outsiders check who was primary
+      and when. It is not specified.
 
    *  *Ambiguous retries.* Deliveries repeat after an ambiguous
       failure. Section 6.8.4 asks homes to drop a repeated delivery id;
       the effect of a repeat on a sealed delivery whose token has been
       spent is not described.
+
+6.9.  Multi-Operator Domains
+
+6.9.1.  Overview
+
+   A domain MAY spread across operators who do not trust each other.
+   Each operator runs an independent home with its own key, state and
+   mailboxes. Homes copy nothing between them. Resilience comes from
+   redundancy at the edges: a delivery goes to every home of its
+   recipient, and a client reads from every home of its own domain.
+
+   In this section a home is one operator's service. A home MAY be a
+   cluster of replicas as Section 6.8 describes; the "homes" and
+   "replicas" of that section are then the replicas of this home, all
+   run by one operator and all using that operator's home key.
+
+   The threat model is that every operator is hostile. Content is end
+   to end encrypted and identities are signed by keys the operators do
+   not hold, so a hostile operator's powers are these:
+
+   +=====================+===========================================+
+   | A hostile operator  | Why                                       |
+   +=====================+===========================================+
+   | cannot read         | Messages, attachments and legacy mail are |
+   | content             | encrypted to client keys.                 |
+   +---------------------+-------------------------------------------+
+   | cannot forge a      | Messages and requests are signed by       |
+   | message or identity | client and identity keys; account logs    |
+   |                     | are signed by the identity key.           |
+   +---------------------+-------------------------------------------+
+   | cannot speak for    | It holds no domain key (Section 6.9.4).   |
+   | the domain          | It cannot bind an address to a key, add   |
+   |                     | to the transparency log, or sign an org   |
+   |                     | claim.                                    |
+   +---------------------+-------------------------------------------+
+   | can withhold or     | Other homes still hold the delivery       |
+   | delay mail          | (Section 6.9.5).                          |
+   +---------------------+-------------------------------------------+
+   | can see metadata    | Who writes to whom, when, and thread ids  |
+   | for what it         | (Section 15). Each home sees only what    |
+   | receives            | is delivered to it.                       |
+   +---------------------+-------------------------------------------+
+   | can serve stale or  | Clients compare the homes they read       |
+   | different mailboxes | (Section 6.9.6).                          |
+   +---------------------+-------------------------------------------+
+
+6.9.2.  The Operators Statement
+
+   The domain owner signs a statement naming the homes, and the policy
+   (Section 6.2) carries it in a field operators:
+
+      { "body": { "v": "signet0", "domain": "example.net",
+          "seq": 3, "notAfter": "2027-02-01T00:00:00.000Z",
+          "homes": [
+            { "url": "https://home.alpha.example",
+              "key": "b64u Ed25519 public key",
+              "replicas": ["https://r2.alpha.example"] },
+            { "url": "https://home.beta.example",
+              "key": "b64u Ed25519 public key" } ] },
+        "sig": "b64u signature by the domain key over body" }
+
+   +==========+========+=============================================+
+   | Field    | Type   | Meaning                                     |
+   +==========+========+=============================================+
+   | seq      | number | Increases with every statement. A client    |
+   |          |        | that holds a higher seq for the domain MUST |
+   |          |        | refuse a lower one.                         |
+   +----------+--------+---------------------------------------------+
+   | notAfter | string | When the statement expires. A client MUST   |
+   |          |        | refuse an expired statement. This is how an |
+   |          |        | operator is removed: the owner signs a new  |
+   |          |        | statement without it.                       |
+   +----------+--------+---------------------------------------------+
+   | homes    | array  | One to seven homes, in order of preference. |
+   |          |        | url is the home's base URL and key the home |
+   |          |        | key (Section 6.9.3). replicas, if present,  |
+   |          |        | lists other base URLs of the same home, for |
+   |          |        | Section 6.8.4.                              |
+   +----------+--------+---------------------------------------------+
+
+   Every home serves the same policy. The domain owner signs the
+   statement with the domain key, which operators do not hold, and
+   gives it to each operator to serve.
+
+   A policy that carries operators is only as trustworthy as the domain
+   key it names, and operators serve the policy. The DNS record
+   (Section 6.3) therefore pins that key with a dk field:
+
+      _signet.example.net. IN TXT
+         "v=signet0; host=a.example.net,b.example.net; dk=<b64u key>"
+
+   dk is the domain's Ed25519 public key. Unlike other fields, its
+   value is not lowercased. A client MUST refuse a policy whose
+   domainKey differs from dk, MUST refuse a policy with operators when
+   the record has no dk, and MUST refuse a statement whose signature,
+   domain, seq or notAfter fails the checks above. A policy host that
+   fails them counts as failed (Section 6.4).
+
+   Once accepted, a client treats homes as the policy's homes
+   (Section 6.8.3) and the first home's url as server. A domain with
+   operators has no unsigned homes field.
+
+6.9.3.  Home Keys and Server Calls
+
+   Each home has an Ed25519 home key, shared by that operator's
+   replicas and nobody else. A home signs its server-to-server calls
+   (Section 4.6) with the home key. It adds the header:
+
+   +==============+==================================================+
+   | Header       | Value                                            |
+   +==============+==================================================+
+   | signet-home  | The home key, b64u. It is covered by the         |
+   |              | signature, as the field home of the signed       |
+   |              | object.                                          |
+   +--------------+--------------------------------------------------+
+
+   The receiver resolves the calling domain's policy and accepts the
+   call only if signet-home is the key of a home in the verified
+   statement and the signature verifies under it. A call with no
+   signet-home header is checked against the domain key as before.
+
+   Appending to a transparency log (Section 5.6) is not a home's
+   power: a log accepts appends signed by the domain key only.
+
+   A home also signs the directory answers that say an address is not
+   enrolled or is unlisted (Section 4). Such an answer carries home,
+   the home key, and verifies under it when the key is in the verified
+   statement; an answer without home verifies under the domain key.
+
+6.9.4.  What the Domain Owner Keeps
+
+   The domain key stays with the domain owner. It is used for four
+   things, none of which a home does itself:
+
+   *  Binding an address to an identity key (Section 4.2).
+
+   *  Recording that binding, or its removal, in the transparency log.
+
+   *  Signing organisation claims (Section 9.3.2).
+
+   *  Attesting legacy mail (Section 13.2.2).
+
+   A home that needs one of these asks the owner's registrar. The
+   registrar checks the user-signed publication for itself, as a home
+   does today, and returns the binding or makes the log append. A home
+   never gives the registrar a leaf or a binding to sign. How a home
+   reaches the registrar is not specified.
+
+   Until the registrar covers it, a home in this mode does not offer
+   organisation claims or legacy-mail attestation.
+
+6.9.5.  Delivery to Many Homes
+
+   An endpoint client submits a message once, to its own domain
+   (Section 10.2), and chooses the delivery id itself. It does not send
+   a message to each recipient home. The submitting home does:
+
+   1.  For each recipient domain, the home delivers to every home in
+       that domain's statement, at the same time. It sends each home
+       the same delivery, with the same id, to the home's own URL.
+       Replica failover within a home (Section 6.8.4) still applies;
+       substituting a different home does not.
+
+   2.  A recipient domain counts as delivered once any of its homes
+       accepts. An address counts as unknown only if every home that
+       answered says so.
+
+   3.  A home that cannot be reached, or fails in a way Section 10.6
+       calls temporary, is retried on its own schedule, apart from the
+       others. The delivery is not reported as queued once another
+       home has accepted it.
+
+   4.  The sender is told a delivery failed for good only when every
+       home of the recipient domain refused it permanently.
+
+   5.  A home MUST ignore a delivery whose id is already in the
+       recipient's mailbox. This applies to every home, whatever the
+       domain's setup.
+
+   If the client's submitting home cannot be reached, the client sends
+   the same envelope, with the same id, to another of its own homes.
+   The id makes this safe. A home that drops what it was given cannot
+   be detected this way; see Section 6.9.7.
+
+6.9.6.  Reading and Registering
+
+   A client of a domain with several homes:
+
+   1.  Reads the mailbox of every home of its own domain, keeping a
+       cursor for each, because seq values differ between homes. It
+       processes an item only if it has not processed the item's id,
+       whichever home it came from, and remembers processed ids with
+       the rest of its state. If some homes fail it uses the others; it
+       reports an error only if none answered.
+
+   2.  Registers delivery tokens, key packages, contacts and view
+       grants with every home. A home that was unreachable misses the
+       registration; clients SHOULD repeat it when the home returns.
+
+   3.  Expects every home to know its account. The domain owner
+       enrolls an address at every home.
+
+   A client SHOULD compare what its homes return and treat a home that
+   is missing items the others hold as suspect. Version 0 does not
+   define the comparison.
+
+6.9.7.  Security Considerations and Open Issues
+
+   *  *The VRF and intake keys are shared.* Homes answer lookups for
+      addresses that do not exist (Section 5.2) and open unlisted
+      requests (Section 4.11), so each needs the domain's VRF key and,
+      with an intake, its intake key. An operator that leaks either
+      weakens the enumeration protection of the whole domain. Per-home
+      keys are not specified.
+
+   *  *Withholding is not detected.* A home that quietly drops
+      what it receives, or the submitting home that drops what a
+      client gave it, is covered only because other homes hold the
+      delivery. Delivery receipts and head comparison would let a
+      client notice.
+
+   *  *Registrar transport.* The wire form of Section 6.9.4 is not
+      specified, nor is how a domain with no always-on registrar
+      binds new addresses.
+
+   *  *Claims and legacy attestation.* They need the domain key
+      (Section 6.9.4) and are unavailable to a home without a
+      registrar.
+
+   *  *Sealed deliveries to later homes.* The policy names one OHTTP
+      gateway, the first home's. A sealed delivery to any other home
+      of the domain goes direct, so that home's operator sees the
+      sending server's address.
+
+   *  *Attachments.* A blob lives at the home that received it.
+
+   *  *Metadata.* Each extra operator is another party that sees
+      traffic metadata for what it receives.
 
 7.  Requests and Admission
 
@@ -5486,7 +5741,7 @@ Experimental           Signet Protocol, Version 0          November 2026
    domain authentication, or a sealed or anonymous delivery to the
    matching route, through OHTTP when configured (Section 10.4.3).
 
-   A response of 400 to 499, other than 429, is permanent. Any other
+   A response of 400 to 499, other than 421 and 429, is permanent. Any other
    failure, including a network error, an OHTTP relay failure and 429,
    is temporary.
 
@@ -6719,8 +6974,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    *  Media types message/ohttp-req, message/ohttp-res and
       application/ohttp-keys [RFC9458].
 
-   *  The HTTP header fields Signet-Primary and Signet-Term (Sections
-      6.8.4 and 6.8.6) are used without registration.
+   *  The HTTP header fields Signet-Primary, Signet-Term and
+      Signet-Home (Sections 6.8.4, 6.8.6 and 6.9.3) are used without
+      registration.
 
    The HPKE info strings (signet0 request <address>, signet0 legacy
    <address>), the AES-GCM additional data signet0 attachment, and the

@@ -83,6 +83,5 @@ Each entry is removed in the commit that fixes it. Severity: **high** means a de
 | 6.9.4 | The owner signs claims before the old ones expire | Nothing reminds the owner or renews claims; an unrenewed claim just stops being served | `packages/server/src/server.ts` | low |
 | 6.9.7 | (open issue) | The VRF key, and the intake key with an intake, are given to every home | `packages/server/src/server.ts` | medium |
 | 6.9.7 | (open issue) | Each home accepts a Privacy Pass token once, so one token can be spent at each home | `packages/server/src/server.ts` (`deliverAnonymous`) | low |
-| 6.9.7 | (open issue) | A blob lives at the home that received it; if that home is down its attachments can't be fetched | `packages/server/src/server.ts` | medium |
-| 6.9.7 | (open issue) | A sender can't tell that its own submitting home accepted a message and then dropped it | `packages/lib/src/client.ts` (`call`) | medium |
+| 6.9.5 | A receipt for a delivery held for a token or queued behind a retry reaches the sender | A queued retry's receipts are delivered as a mailbox item through the home that queued it; if that home is the one withholding, the sender hears nothing and falls back to resending | `packages/server/src/server.ts` (`schedule`) | low |
 

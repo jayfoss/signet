@@ -3701,8 +3701,60 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    If the client's submitting home cannot be reached, the client sends
    the same envelope, with the same id, to another of its own homes.
-   The id makes this safe. A home that drops what it was given cannot
-   be detected this way; see Section 6.9.7.
+   The id makes this safe.
+
+   The submitting home is not trusted to say that it delivered. Every
+   home that stores a delivery for a recipient signs a receipt, and the
+   submitting home passes the receipts back to the client:
+
+      { "body": { "v": 0, "id": "i_…", "domain": "example.net",
+          "to": ["bob@example.net"], "held": [],
+          "ts": "2026-11-13T09:30:00.000Z",
+          "home": "b64u home key" },
+        "sig": "b64u signature over body" }
+
+   +========+========+================================================+
+   | Field  | Type   | Meaning                                        |
+   +========+========+================================================+
+   | id     | string | The delivery id.                               |
+   +--------+--------+------------------------------------------------+
+   | domain | string | The recipient domain.                          |
+   +--------+--------+------------------------------------------------+
+   | to     | array  | Addresses whose mailbox now holds the          |
+   |        |        | delivery.                                      |
+   +--------+--------+------------------------------------------------+
+   | held   | array  | Addresses for which the home is holding it,    |
+   |        |        | such as a sealed delivery waiting for its      |
+   |        |        | token (Section 10.3.3).                        |
+   +--------+--------+------------------------------------------------+
+   | home   | string | Present when a home key signed in place of the |
+   |        |        | domain key (Section 6.9.3).                    |
+   +--------+--------+------------------------------------------------+
+
+   A receiving home returns its receipt in the delivery response, in a
+   field receipts, and includes no address it delivered through an
+   intake (Section 4.11), so an unlisted address answers as an unknown
+   one does. A delivery that was queued and lands on a retry is proved
+   to the sender in a mailbox item of kind receipt, with the payload
+   { "id": "i_…", "receipts": [ … ] }, which the sender's home stores
+   as it stores a bounce.
+
+   A client counts an address as confirmed when the server answered
+   that it is unknown or refused it, or when a receipt that verifies
+   under the recipient domain's key, or under the key of one of its
+   listed homes, names it in to or held for that delivery id. A
+   receipt from one of the client's own domain's homes, where that
+   home is the one the client submitted through, does not count: that
+   home is the one that might have dropped the message.
+
+   A client keeps a send until every address is confirmed. If one is
+   not confirmed within a grace period, which the reference client sets
+   to five minutes, the client sends the same envelope again, with the
+   same id and only the addresses still unconfirmed, through a home
+   other than the one it used last. After three such resends it
+   reports that the delivery is unconfirmed to its user and stops. A
+   recipient home that already holds the id ignores the repeat and
+   signs a receipt for it.
 
 6.9.6.  Reading and Registering
 
@@ -3743,18 +3795,19 @@ Experimental           Signet Protocol, Version 0          November 2026
       weakens the enumeration protection of the whole domain. Per-home
       keys are not specified.
 
-   *  *Withholding by the sending home.* A recipient's client can
-      notice a home that holds less than the others (Section 6.9.6).
-      A sender cannot notice that its own submitting home dropped a
-      message: it is covered only because the client resends through
-      another home when a call fails. Delivery receipts would let the
-      sender notice.
+   *  *Receipts show delivery, not reading.* A receipt says a home
+      stored the delivery. It says nothing about whether the
+      recipient's client has fetched it. A recipient domain whose
+      homes all drop mail can still sign receipts; the recipient's own
+      comparison of its homes (Section 6.9.6) is what catches that.
+
+   *  *No receipt, no proof of drop.* A send without a receipt is
+      reported as unconfirmed, not as dropped: the recipient's homes
+      may simply have been unreachable for all four attempts.
 
    *  *The registrar is always on.* A home needs it to bind or
       attest. While it is down, enrollment and attested mail wait;
       mail that is already flowing does not.
-
-   *  *Attachments.* A blob lives at the home that received it.
 
    *  *Metadata.* Each extra operator is another party that sees
       traffic metadata for what it receives.
@@ -4814,7 +4867,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    2.  The sender uploads the ciphertext to its own home server with
        POST /v0/blobs (client-authenticated, body: raw bytes), which
        returns { "id": "blob_…", "url":
-       "https://signet.example.com/v0/blobs/blob_…" }.
+       "https://signet.example.com/v0/blobs/blob_…" }. A sender whose
+       domain has several homes (Section 6.9) uploads it to every home
+       it can reach.
 
    3.  The sender puts an attachment reference in the message:
 
@@ -4845,6 +4900,10 @@ Experimental           Signet Protocol, Version 0          November 2026
    +--------+--------+----------+--------------------------------------+
    | url    | string | yes      | Where the ciphertext can be fetched. |
    +--------+--------+----------+--------------------------------------+
+   | copies | array  | no       | Other URLs of the same ciphertext,   |
+   |        |        |          | one for each other home it was       |
+   |        |        |          | uploaded to.                         |
+   +--------+--------+----------+--------------------------------------+
    | key    | string | yes      | The AES-256 key (b64u).              |
    +--------+--------+----------+--------------------------------------+
    | iv     | string | yes      | The nonce (b64u).                    |
@@ -4855,7 +4914,9 @@ Experimental           Signet Protocol, Version 0          November 2026
 
    A receiver fetches url with GET /v0/blobs/{id} (no authentication),
    checks the ciphertext digest, decrypts, and checks that the plaintext
-   length equals size. Any mismatch is an error. The reference
+   length equals size. Any mismatch is an error. If url cannot be
+   fetched, or its ciphertext fails the digest check, the receiver
+   tries each of copies in turn. The reference
    implementation limits a file to 25 MiB.
 
 8.10.  Client State
@@ -5826,9 +5887,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    domain authentication, or a sealed or anonymous delivery to the
    matching route, through OHTTP when configured (Section 10.4.3).
 
-   A response of 400 to 499, other than 421 and 429, is permanent. Any other
-   failure, including a network error, an OHTTP relay failure and 429,
-   is temporary.
+   A response of 400 to 499, other than 421 and 429, is permanent.
+   Any other failure, including a network error, an OHTTP relay
+   failure and 429, is temporary.
 
    On a permanent failure, the home server bounces at once. On a
    temporary failure, it lists the addresses as queued and retries. The
@@ -5861,7 +5922,8 @@ Experimental           Signet Protocol, Version 0          November 2026
    | id         | string  | yes      | The delivery id.                |
    +------------+---------+----------+---------------------------------+
    | kind       | string  | yes      | request, welcome, commit,       |
-   |            |         |          | message, legacy or bounce.      |
+   |            |         |          | message, legacy, bounce or      |
+   |            |         |          | receipt.                        |
    +------------+---------+----------+---------------------------------+
    | from       | string  | yes      | The sender, or empty for sealed |
    |            |         |          | and anonymous deliveries.       |

@@ -46,13 +46,15 @@ import { blindTokenRequest, finalizeToken } from './privacypass';
 import type { Introduction, SealedRequest, SignedRequest } from './request';
 import { createIntroduction, createRequest, myCopy, openRequest } from './request';
 import { homeGateway } from './operators';
+import type { Receipt } from './receipts';
+import { verifyReceipt } from './receipts';
 import type { Resolver } from './resolver';
 import { NotSignetDomainError } from './resolver';
 import { DELIVERY_LABEL, TOKEN_EPOCHS_KEPT, deliveryTokenHash, randomToken } from './sealed';
 import type { InclusionProof, LatestLeaf, LogLeaf, TreeHead, TrustedLog } from './transparency';
 import { TransparencyError, checkLeafDomain, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
 
-export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce';
+export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce' | 'receipt';
 
 /** A mailbox entry. `from` is empty for sealed deliveries: the server never learned who sent them. */
 export interface MailItem {
@@ -142,11 +144,24 @@ export type SignetEvent =
   | { kind: 'directory-alert'; principal: string; alert: string }
   /** A home of this client's domain still lacks an item that others delivered, after the grace period: it may be withholding mail (Section 6.9.6). */
   | { kind: 'home-missing'; home: string; itemId: string }
+  /** No recipient home has proved it received this send, after resending through other homes (Section 6.9.5). */
+  | { kind: 'delivery-unconfirmed'; id: string; to: string[] }
   | { kind: 'error'; item: MailItem; error: string };
 
 export interface ThreadMeta {
   humansOnly: boolean;
   linkedTo?: string;
+}
+
+export interface UnconfirmedSend {
+  id: string;
+  /** The addresses still without a receipt. */
+  to: string[];
+  body: { id: string; to: string[]; kind: MailKind; payload: unknown; token?: string; anonymousToken?: string };
+  /** When it was sent or last sent again, how many times it has been sent again, and the home it went through. */
+  at: number;
+  tries: number;
+  via: string;
 }
 
 /** Everything a client carries between runs apart from its signing keys. `mls` holds its MLS key store. */
@@ -158,6 +173,8 @@ export interface ClientSnapshot {
   seen: string[];
   /** Registrations a home missed because it was down, repeated at the next sync (Section 6.9.6). */
   pending: { home: string; path: string; body: unknown }[];
+  /** Sends no recipient home has yet proved it received, kept to send again (Section 6.9.5). */
+  unconfirmed: UnconfirmedSend[];
   /** Items seen at some homes but not yet all: which homes had each, and when it first showed up. */
   homeWatch: Record<string, { homes: string[]; at: number; alerted?: boolean }>;
   pins: Record<string, string>;
@@ -224,6 +241,10 @@ export interface SignetClientOptions {
    * (`home-missing`). Defaults to ten minutes, longer than a sender's first retry.
    */
   homeGraceMs?: number;
+  /** How long a send may go without a receipt before it is sent again through another home. Defaults to five minutes. */
+  receiptGraceMs?: number;
+  /** How many times to send again before reporting `delivery-unconfirmed`. Defaults to 3. */
+  receiptRetries?: number;
 }
 
 export interface MonitorReport {
@@ -254,6 +275,7 @@ const emptySnapshot = (): ClientSnapshot => ({
   cursors: {},
   seen: [],
   pending: [],
+  unconfirmed: [],
   homeWatch: {},
   pins: {},
   admission: { contacts: [], trustedDomains: [] },
@@ -279,6 +301,7 @@ const emptySnapshot = (): ClientSnapshot => ({
 const SENT_IDS_KEPT = 1000;
 const SEEN_IDS_KEPT = 5000;
 const PENDING_KEPT = 200;
+const UNCONFIRMED_KEPT = 200;
 const WATCH_KEPT = 500;
 const WATCH_MAX_AGE_MS = 24 * 3_600_000;
 
@@ -754,9 +777,18 @@ export class SignetClient {
 
   /** Download and decrypt an attachment from a message this client has read. */
   async fetchAttachment(ref: AttachmentRef): Promise<Buffer> {
-    const response = await this.fetchImpl(ref.url);
-    if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
-    return openAttachment(ref, new Uint8Array(await response.arrayBuffer()));
+    let failure: unknown;
+    for (const url of [ref.url, ...(ref.copies ?? [])]) {
+      try {
+        const response = await this.fetchImpl(url);
+        if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
+        // The digest is checked on every copy, so a copy can't hand over anything but the file.
+        return openAttachment(ref, new Uint8Array(await response.arrayBuffer()));
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   /** Plain email through the home server, for recipients who aren't on Signet. It carries the Signet header. */
@@ -889,6 +921,7 @@ export class SignetClient {
       lastAnswered = mailboxes.map((mailbox) => mailbox.home);
       if (this.released === 0) break;
     }
+    events.push(...(await this.retryUnconfirmed()));
     events.push(...(await this.laggingHomes(lastAnswered)));
     await this.topUpKeyPackages();
     events.push(...this.state.keyChanges.splice(0), ...this.state.directoryAlerts.splice(0));
@@ -1001,6 +1034,13 @@ export class SignetClient {
       case 'bounce': {
         const bounce = item.payload as { id: string; to: string[]; reason: string };
         return [{ kind: 'bounce', ...bounce }];
+      }
+      case 'receipt': {
+        // A retry that landed after the send: the home that queued it passes on the recipient's receipt.
+        const { id, receipts } = item.payload as { id: string; receipts: Receipt[] };
+        const entry = this.state.unconfirmed.find((send) => send.id === id);
+        if (entry) await this.confirm(entry, { receipts });
+        return [];
       }
     }
   }
@@ -1423,8 +1463,10 @@ export class SignetClient {
 
   private async upload(file: FileInput): Promise<AttachmentRef> {
     const { blob, ref } = sealAttachment(file);
-    const { url } = (await this.call('POST', '/v0/blobs', blob)) as { url: string };
-    return { ...ref, url };
+    // The message names where the ciphertext is, so it goes to every home: one operator being down or
+    // withholding must not cost the reader the file.
+    const urls = await this.eachHome(async (home) => ((await this.request(home, 'POST', '/v0/blobs', blob)) as { url: string }).url);
+    return { ...ref, url: urls[0], ...(urls.length > 1 ? { copies: urls.slice(1) } : {}) };
   }
 
   private thread(thread: string): string {
@@ -1439,8 +1481,14 @@ export class SignetClient {
   /** With a token the delivery is sealed; with an anonymous token the request carries no sender. */
   private async submit(to: string[], kind: MailKind, payload: unknown, token?: string, anonymousToken?: string): Promise<void> {
     // The client picks the id, so a send repeated through another home after a lost answer is recognised.
-    const { id } = (await this.call('POST', '/v0/submit', { id: randomId('i'), to, kind, payload, token, anonymousToken })) as { id: string };
+    const body = { id: randomId('i'), to, kind, payload, token, anonymousToken };
+    const { result, home } = await this.callFrom('POST', '/v0/submit', body);
+    const { id } = result as { id: string };
     this.state.sentIds = [...this.state.sentIds, id].slice(-SENT_IDS_KEPT);
+    // Our own home says it delivered. Only the recipients' homes can prove it.
+    const entry: UnconfirmedSend = { id, to: [...to], body, at: Date.now(), tries: 0, via: home };
+    this.state.unconfirmed = [...this.state.unconfirmed, entry].slice(-UNCONFIRMED_KEPT);
+    await this.confirm(entry, result as { unknown?: string[]; rejected?: string[]; receipts?: Receipt[] });
   }
 
   private async getJson(url: string): Promise<unknown> {
@@ -1543,6 +1591,73 @@ export class SignetClient {
       this.state.pending = this.state.pending.slice(-PENDING_KEPT);
     }
     return results;
+  }
+
+  /**
+   * A call to the first home that answers, other than `avoid` unless it is the only one. Says which home answered.
+   */
+  private async callFrom(method: 'GET' | 'POST', path: string, body?: unknown, avoid?: string): Promise<{ result: unknown; home: string }> {
+    const bases = await this.homeBases();
+    const order = avoid ? [...bases.filter((base) => base !== avoid), ...bases.filter((base) => base === avoid)] : bases;
+    let failure: unknown;
+    for (const home of order) {
+      try {
+        const result = await this.request(home, method, path, body);
+        this.preferredHome = home;
+        return { result, home };
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
+  }
+
+  /**
+   * Count what a send has been proved to reach. An address the server said is unknown or refused is settled; so
+   * is one a valid receipt names. A home vouching for a delivery to its own domain through its own mouth doesn't
+   * count: it is the home that might have dropped it.
+   */
+  private async confirm(entry: UnconfirmedSend, result: { unknown?: string[]; rejected?: string[]; receipts?: Receipt[] }): Promise<void> {
+    const settled = new Set([...(result.unknown ?? []), ...(result.rejected ?? [])].map(normalizeAddress));
+    const ownDomain = splitAddress(this.address).domain;
+    for (const receipt of result.receipts ?? []) {
+      try {
+        const policy = await this.resolver.policy(receipt.body.domain);
+        if (!verifyReceipt(receipt, policy, entry.id)) continue;
+        const viaKey = policy.operators?.body.homes.find((home) => new URL(home.url).origin === new URL(entry.via).origin)?.key;
+        if (receipt.body.domain === ownDomain && receipt.body.home !== undefined && receipt.body.home === viaKey) continue;
+        for (const address of [...receipt.body.to, ...receipt.body.held]) settled.add(normalizeAddress(address));
+      } catch {
+        // A receipt we can't check is no receipt.
+      }
+    }
+    entry.to = entry.to.filter((address) => !settled.has(normalizeAddress(address)));
+    if (entry.to.length === 0) this.state.unconfirmed = this.state.unconfirmed.filter((send) => send !== entry && send.id !== entry.id);
+  }
+
+  /** Send again, through a different home, what no recipient home has proved it got; report what still can't be. */
+  private async retryUnconfirmed(): Promise<SignetEvent[]> {
+    const events: SignetEvent[] = [];
+    const grace = this.options.receiptGraceMs ?? 300_000;
+    const retries = this.options.receiptRetries ?? 3;
+    for (const entry of [...this.state.unconfirmed]) {
+      if (Date.now() - entry.at < grace) continue;
+      if (entry.tries >= retries) {
+        events.push({ kind: 'delivery-unconfirmed', id: entry.id, to: entry.to });
+        this.state.unconfirmed = this.state.unconfirmed.filter((send) => send.id !== entry.id);
+        continue;
+      }
+      entry.tries += 1;
+      entry.at = Date.now();
+      try {
+        const { result, home } = await this.callFrom('POST', '/v0/submit', { ...entry.body, to: entry.to }, entry.via);
+        entry.via = home;
+        await this.confirm(entry, result as { unknown?: string[]; rejected?: string[]; receipts?: Receipt[] });
+      } catch {
+        // No home answered; try again at the next sync.
+      }
+    }
+    return events;
   }
 
   /** Repeat registrations that a home missed, oldest first, and keep the ones that still can't be delivered. */

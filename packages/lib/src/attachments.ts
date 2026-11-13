@@ -12,6 +12,8 @@ export interface AttachmentRef {
   type: string;
   size: number;
   url: string;
+  /** The same ciphertext at the sender's other homes, when it has several (Section 6.9.5). */
+  copies?: string[];
   key: string;
   iv: string;
   digest: string;

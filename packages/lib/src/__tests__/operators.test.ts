@@ -11,7 +11,9 @@ import {
   proveIndex,
   signNotEnrolled,
   signOperators,
+  signReceipt,
   verifyDomainCall,
+  verifyReceipt,
   verifyNotEnrolled,
 } from '..';
 
@@ -143,5 +145,26 @@ describe('directory answers signed by a home', () => {
     expect(verifyNotEnrolled(entry, answerPolicy)).toBe(vrf.index);
     const forged = signNotEnrolled(generateSigningKey(), 'ghost@example.net', vrf, new Date(), true);
     expect(() => verifyNotEnrolled(forged, answerPolicy)).toThrow('unsigned not-enrolled');
+  });
+});
+
+describe('delivery receipts', () => {
+  const fields = { id: 'i_abcdef01', domain, to: ['bob@example.net'], held: [] as string[] };
+
+  it('verify when the domain or one of its listed homes signed them for that delivery', () => {
+    const { policy, alpha, domainKey } = setup();
+    expect(verifyReceipt(signReceipt(alpha, fields, new Date(), true), policy, fields.id)).toBe(true);
+    expect(verifyReceipt(signReceipt(domainKey, fields), policy, fields.id)).toBe(true);
+  });
+
+  it('are refused for another delivery or domain, from an unlisted key, or with the signer changed', () => {
+    const { policy, alpha } = setup();
+    const receipt = signReceipt(alpha, fields, new Date(), true);
+    expect(verifyReceipt(receipt, policy, 'i_other0001')).toBe(false);
+    expect(verifyReceipt(receipt, { ...policy, domain: 'other.net' }, fields.id)).toBe(false);
+    expect(verifyReceipt(signReceipt(generateSigningKey(), fields, new Date(), true), policy, fields.id)).toBe(false);
+    // Claiming to be the domain with a key that isn't its own.
+    expect(verifyReceipt(signReceipt(generateSigningKey(), fields), policy, fields.id)).toBe(false);
+    expect(verifyReceipt({ ...receipt, body: { ...receipt.body, to: ['mallory@example.net'] } }, policy, fields.id)).toBe(false);
   });
 });

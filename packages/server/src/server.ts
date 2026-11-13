@@ -11,6 +11,7 @@ import type {
   LegacyAuth,
   Operators,
   DomainBinding,
+  Receipt,
   LogLeaf,
   MailKind,
   LogEntry,
@@ -75,6 +76,7 @@ import {
   verifyDomainCall,
   homeGroups,
   homeGateway,
+  signReceipt,
 } from '@signet/lib';
 import { Cluster } from './cluster';
 import type { ClusterOptions } from './cluster';
@@ -226,6 +228,8 @@ interface DeliveryResult {
   unknown: string[];
   rejected: string[];
   queued: string[];
+  /** Signed by the recipient's home: proof the delivery reached it (Section 6.9.5). */
+  receipts?: Receipt[];
 }
 
 class RelayError extends Error {
@@ -246,11 +250,15 @@ const PARK_CAP = 500;
 const DEFAULT_RETRY_DELAYS = [60_000, 5 * 60_000, 30 * 60_000, 2 * HOUR, 6 * HOUR, 24 * HOUR, 24 * HOUR, 24 * HOUR, 24 * HOUR];
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const empty = (): DeliveryResult => ({ unknown: [], rejected: [], queued: [] });
-const merge = (results: DeliveryResult[]): DeliveryResult => ({
-  unknown: results.flatMap((r) => r.unknown),
-  rejected: results.flatMap((r) => r.rejected),
-  queued: results.flatMap((r) => r.queued),
-});
+const merge = (results: DeliveryResult[]): DeliveryResult => {
+  const receipts = results.flatMap((r) => r.receipts ?? []);
+  return {
+    unknown: results.flatMap((r) => r.unknown),
+    rejected: results.flatMap((r) => r.rejected),
+    queued: results.flatMap((r) => r.queued),
+    ...(receipts.length > 0 ? { receipts } : {}),
+  };
+};
 
 /**
  * One domain's Signet home server. It serves the policy and directory, hands out key packages,
@@ -819,6 +827,7 @@ export class SignetServer implements LegacyInbox {
     }
     if (!this.store.spend(nonce)) throw new HttpError(403, 'token has already been spent');
     const result = empty();
+    const delivered: string[] = [];
     for (const address of to) {
       const { local, domain } = splitAddress(address);
       if (domain === this.options.domain && this.forIntake(kind, payload)) {
@@ -834,8 +843,9 @@ export class SignetServer implements LegacyInbox {
         continue;
       }
       this.store.push(local, { id, kind, from: '', sealed: true, payload });
+      delivered.push(address);
     }
-    return result;
+    return this.withReceipt(result, id, delivered, []);
   }
 
   /** A directory read with no requester behind it: the public answer, on a small per-source budget. */
@@ -1085,6 +1095,8 @@ export class SignetServer implements LegacyInbox {
     }
     // An address is delivered if any home that answered took it; unknown only if every one says so.
     const result = empty();
+    const receipts = answers.flatMap((answer) => answer.receipts ?? []);
+    if (receipts.length > 0) result.receipts = receipts;
     for (const address of delivery.to) {
       const took = answers.some((answer) => !answer.unknown.includes(address) && !answer.rejected.includes(address));
       if (took) continue;
@@ -1178,10 +1190,14 @@ export class SignetServer implements LegacyInbox {
       if (this.cluster && !this.cluster.isPrimary()) return;
       const delivery = entry.delivery as Delivery;
       this.relayOnce(entry.domain, delivery, entry.home).then(
-        () => {
+        (result) => {
           this.store.removeOutbound(entry.id);
           // The other homes still being retried for this delivery no longer risk a bounce.
           if (entry.home) for (const other of this.siblings(entry)) this.store.saveOutbound({ ...other, accepted: true });
+          // A retry that lands later is proved to the sender in its own mailbox, as a bounce is.
+          if (result.receipts?.length) {
+            this.store.push(splitAddress(entry.sender).local, { id: randomId('r'), kind: 'receipt', from: `postmaster@${this.options.domain}`, payload: { id: delivery.id, receipts: result.receipts } });
+          }
         },
         (error: unknown) => {
           const delays = this.options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS;
@@ -1231,6 +1247,8 @@ export class SignetServer implements LegacyInbox {
     if (token && !SEALABLE_KINDS.includes(kind)) throw new HttpError(400, `${kind} can't be sealed`);
     if (!token && !from) throw new HttpError(400, 'a delivery needs a sender or a token');
     const result = empty();
+    const delivered: string[] = [];
+    const held: string[] = [];
     for (const address of to) {
       const { local, domain } = splitAddress(address);
       if (domain === this.options.domain && !token && from && this.forIntake(kind, payload)) {
@@ -1247,8 +1265,11 @@ export class SignetServer implements LegacyInbox {
       if (token) {
         const hash = deliveryTokenHash(token, address);
         const item = { id, kind, from: '', sealed: true, payload };
-        if (this.store.hasToken(local, hash)) this.store.push(local, item);
-        else if (!this.store.park(local, hash, item, PARK_TTL_MS, PARK_CAP)) result.rejected.push(address);
+        if (this.store.hasToken(local, hash)) {
+          this.store.push(local, item);
+          delivered.push(address);
+        } else if (this.store.park(local, hash, item, PARK_TTL_MS, PARK_CAP)) held.push(address);
+        else result.rejected.push(address);
         continue;
       }
       const sender = from as string;
@@ -1261,8 +1282,19 @@ export class SignetServer implements LegacyInbox {
         }
       }
       this.store.push(local, { id, kind, from: sender, payload });
+      delivered.push(address);
     }
-    return result;
+    return this.withReceipt(result, id, delivered, held);
+  }
+
+  /**
+   * Add this home's receipt for what it took. An address delivered through an intake gets none: the answer for
+   * an unlisted address must look the same as for one that doesn't exist.
+   */
+  private withReceipt(result: DeliveryResult, id: string, delivered: string[], held: string[]): DeliveryResult {
+    if (delivered.length === 0 && held.length === 0) return result;
+    const { key, asHome } = this.answerSigner();
+    return { ...result, receipts: [signReceipt(key, { id, domain: this.options.domain, to: delivered, held }, new Date(), asHome)] };
   }
 
   /**

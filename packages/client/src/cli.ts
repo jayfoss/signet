@@ -195,6 +195,8 @@ function describe(event: SignetEvent): string {
       return `bounced ${event.id} to ${event.to.join(', ')}: ${event.reason}`;
     case 'handoff':
       return `handed to you in ${event.thread}: ${event.reason}`;
+    case 'delivery-unconfirmed':
+      return `WARNING no recipient home has confirmed receiving ${event.id} for ${event.to.join(', ')}, even after sending it again through another home`;
     case 'home-missing':
       return `WARNING ${event.home} has not delivered ${event.itemId}, which your other homes have; it may be withholding mail`;
     case 'error':

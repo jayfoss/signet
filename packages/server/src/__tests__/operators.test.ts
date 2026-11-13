@@ -13,6 +13,8 @@ import {
   parseSignetHeader,
   signOperators,
   signOrgClaim,
+  signReceipt,
+  utf8,
   verifyAttestation,
 } from '@signet/lib';
 import { TransparencyLogServer } from '../log-server';
@@ -58,8 +60,16 @@ async function world() {
   const deliveryBlocked = new Set<string>();
   // A dropping home says it accepted a delivery and keeps nothing.
   const dropping = new Set<string>();
+  // A home that takes a client's send, answers "delivered" and sends nothing on, perhaps with a receipt it made up.
+  const submitDropped = new Set<string>();
+  const forgeReceipts = { on: false };
   const gate = ((input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+    if (submitDropped.has(url.origin) && url.pathname === '/v0/submit') {
+      const sent = JSON.parse(String(init?.body)) as { id: string; to: string[] };
+      const receipts = forgeReceipts.on ? [signReceipt(generateSigningKey(), { id: sent.id, domain: sent.to[0].split('@')[1], to: sent.to, held: [] })] : undefined;
+      return Promise.resolve(new Response(JSON.stringify({ id: sent.id, unknown: [], rejected: [], queued: [], ...(receipts ? { receipts } : {}) }), { status: 200 }));
+    }
     const delivery = url.pathname.startsWith('/v0/deliver');
     if (dropping.has(url.origin) && delivery) return Promise.resolve(new Response(JSON.stringify({ unknown: [], rejected: [], queued: [] }), { status: 200 }));
     const down = blocked.has(url.origin) || (deliveryBlocked.has(url.origin) && delivery);
@@ -138,6 +148,8 @@ async function world() {
     relay,
     make,
     dropping,
+    submitDropped,
+    forgeReceipts,
     blocked,
     deliveryBlocked,
     owner,
@@ -239,6 +251,64 @@ describe('a domain run by three operators who share nothing', () => {
     const events = await watching.sync();
     expect(events).toEqual([{ kind: 'home-missing', home: w.homeUrls[1], itemId: expect.any(String) }]);
     expect(await watching.sync()).toEqual([]);
+  });
+
+  it('proves a send reached its recipients, so nothing is left to resend', async () => {
+    await w.clients.alice.sendRequest(`jerzy@beta.test`, { subject: 'Receipts', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    expect(w.has(w.beta, 'jerzy')).toBe(1);
+    expect(w.clients.alice.snapshot().unconfirmed).toEqual([]);
+  });
+
+  it('sends again through another home when its own home takes a send and drops it', async () => {
+    const sender = w.make(w.aliceKeys, { receiptGraceMs: 20, snapshot: w.clients.alice.snapshot() });
+    w.submitDropped.add(w.homeUrls[0]);
+    await sender.sendRequest('jerzy@beta.test', { subject: 'Dropped by my home', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    // The home said "delivered"; nobody the message was for has it, and no receipt came.
+    expect(w.has(w.beta, 'jerzy')).toBe(0);
+    expect(sender.snapshot().unconfirmed).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(await sender.sync()).toEqual([]);
+    // Through another home, the same send reaches jerzy once, and his home proves it.
+    expect(w.has(w.beta, 'jerzy')).toBe(1);
+    expect(sender.snapshot().unconfirmed).toEqual([]);
+  });
+
+  it('is not fooled by a receipt a home makes up, and reports a send nobody confirms', async () => {
+    const sender = w.make(w.aliceKeys, { receiptGraceMs: 20, receiptRetries: 2, snapshot: w.clients.alice.snapshot() });
+    for (const url of w.homeUrls) w.submitDropped.add(url);
+    w.forgeReceipts.on = true;
+    await sender.sendRequest('jerzy@beta.test', { subject: 'Dropped everywhere', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    expect(sender.snapshot().unconfirmed).toHaveLength(1);
+    const events: unknown[] = [];
+    for (let i = 0; i < 5; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      events.push(...(await sender.sync()));
+    }
+    expect(events).toEqual([{ kind: 'delivery-unconfirmed', id: expect.any(String), to: ['jerzy@beta.test'] }]);
+    expect(w.has(w.beta, 'jerzy')).toBe(0);
+    expect(sender.snapshot().unconfirmed).toEqual([]);
+  });
+
+  it('keeps an attachment readable when the home it was first uploaded to is down', async () => {
+    await w.clients.jerzy.sendRequest(`alice@${DOMAIN}`, { subject: 'Files', intent: { name: 'schedule.propose', args: { durationMin: 30 } } });
+    const [incoming] = await w.clients.alice.sync();
+    if (incoming?.kind !== 'request') throw new Error('expected a request');
+    const thread = await w.clients.alice.accept(incoming.request);
+    await w.clients.jerzy.sync();
+    // Alice's domain has three homes, so the ciphertext goes to all three.
+    await w.clients.alice.send(thread, { subject: 'Files', text: 'Agenda attached', files: [{ name: 'agenda.txt', type: 'text/plain', data: utf8('1. Cap table\n') }] });
+    const message = (await w.clients.jerzy.sync()).find((event) => event.kind === 'message');
+    if (message?.kind !== 'message') throw new Error('expected a message');
+    const [ref] = message.message.body.attachments;
+    expect(ref.copies).toHaveLength(2);
+    for (const url of [ref.url, ...(ref.copies ?? [])]) expect(new URL(url).origin).toEqual(expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/));
+
+    // The first home goes down: the file still arrives, from a copy.
+    w.blocked.add(new URL(ref.url).origin);
+    expect((await w.clients.jerzy.fetchAttachment(ref)).toString()).toContain('Cap table');
+    // And a copy that isn't the file is refused rather than trusted.
+    const swapped = { ...ref, digest: 'sha256:deadbeef' };
+    await expect(w.clients.jerzy.fetchAttachment(swapped)).rejects.toThrow('digest');
   });
 
   it('sends a sealed message to each home through that home\'s own gateway', async () => {

@@ -1,6 +1,8 @@
 import { randomBytes, randomInt } from 'node:crypto';
 import { join } from 'node:path';
 import type {
+  Ciphertext,
+  Sealed,
   ClaimedKeyPackage,
   ClientCert,
   DirectoryEntry,
@@ -97,7 +99,7 @@ const optionalHeader = (headers: Record<string, string | string[] | undefined>, 
 import type { Registrar } from './registrar';
 import type { LegacyInbox, OutboundSmtp } from './smtp';
 import type { PublishedKeyPackage } from './store';
-import type { Outbound, Store } from './store';
+import type { ContactsDoc, Outbound, Store } from './store';
 import { MemoryStore, SqliteStore } from './store';
 
 /** Daily limits. Lookups and claims are counted per requesting domain and per (hashed) requesting user. */
@@ -263,6 +265,8 @@ const CLIENT_KINDS: MailKind[] = ['request', 'welcome', 'commit', 'message'];
 const SEALABLE_KINDS: MailKind[] = ['welcome', 'commit', 'message'];
 const HOUR = 3_600_000;
 const DEFAULT_RETENTION_MS = 30 * 24 * HOUR;
+/** The most ciphertext (base64url characters) an account's contacts may take: about 1 MiB. */
+const MAX_CONTACTS_B64 = 1_400_000;
 /** Sealed deliveries wait this long for their recipient to register the token, at most this many per user. */
 const PARK_TTL_MS = 24 * HOUR;
 const PARK_CAP = 500;
@@ -702,6 +706,34 @@ export class SignetServer implements LegacyInbox {
   }
 
   /**
+   * Store an account's encrypted contacts (Section 7.9). The home server checks the version and that wraps are for
+   * active clients; it cannot check, and never sees, what is inside.
+   */
+  private putContacts(client: ClientCert, body: { expectedVersion?: number; epoch?: number; data?: Ciphertext; wraps?: Record<string, Sealed> }): { version: number } {
+    const { local } = splitAddress(client.principal);
+    const doc = this.store.contactsDoc(local);
+    const sealed = (value: unknown): value is Sealed => typeof value === 'object' && value !== null && typeof (value as Sealed).enc === 'string' && typeof (value as Sealed).ct === 'string';
+    const cipher = (value: unknown): value is Ciphertext => typeof value === 'object' && value !== null && typeof (value as Ciphertext).iv === 'string' && typeof (value as Ciphertext).ct === 'string';
+    if (!Number.isInteger(body.expectedVersion) || !Number.isInteger(body.epoch)) throw new HttpError(400, 'expectedVersion and epoch are required');
+    if (body.data !== undefined && (!cipher(body.data) || body.data.ct.length > MAX_CONTACTS_B64)) throw new HttpError(400, 'data must be ciphertext of a sensible size');
+    if (body.expectedVersion !== doc.version) throw new HttpError(409, 'the contacts changed; read them again', { 'signet-version': String(doc.version) });
+    const user = this.store.user(local);
+    const active = new Set(user ? activeClients(replayLog(user.log)).map((cert) => cert.clientId) : []);
+    const wraps = body.wraps ?? {};
+    for (const [clientId, wrap] of Object.entries(wraps)) {
+      if (!active.has(clientId) || !sealed(wrap)) throw new HttpError(400, `${clientId} is not an active client with a well-formed wrap`);
+    }
+    let next: ContactsDoc;
+    if (doc.epoch >= 1 && body.epoch === doc.epoch) next = { epoch: doc.epoch, version: doc.version + 1, data: body.data ?? doc.data, wraps: { ...doc.wraps, ...wraps } };
+    else if (body.epoch === doc.epoch + 1) {
+      if (body.data === undefined) throw new HttpError(400, 'a new epoch needs data encrypted under its key');
+      next = { epoch: body.epoch, version: doc.version + 1, data: body.data, wraps };
+    } else throw new HttpError(400, `epoch must be ${doc.epoch}${doc.epoch >= 1 ? ' or ' : ' (none stored) +1 = '}${doc.epoch + 1}`);
+    this.store.putContactsDoc(local, next);
+    return { version: next.version };
+  }
+
+  /**
    * Record how far a client has read, then delete what every reading client of the account has (Section 10.7).
    * A client that is revoked or holds no read scope is not waited for.
    */
@@ -837,15 +869,11 @@ export class SignetServer implements LegacyInbox {
       return { items: this.store.mailbox(local, after), epoch };
     }
     if (method === 'POST' && path === '/v0/mailbox/ack') return this.acknowledge(client, json<{ through?: number; epoch?: string }>(request));
-    if (method === 'GET' && path === '/v0/contacts') return this.store.contactsOf(splitAddress(client.principal).local);
-    if (method === 'POST' && path === '/v0/contacts') {
-      const body = json<{ contacts?: string[]; trustedDomains?: string[]; removeContacts?: string[]; removeTrustedDomains?: string[] }>(request);
-      const { local } = splitAddress(client.principal);
-      this.store.addContacts(local, body.contacts ?? [], body.trustedDomains ?? []);
-      // Removals apply after additions (Section 7.9).
-      this.store.removeContacts(local, body.removeContacts ?? [], body.removeTrustedDomains ?? []);
-      return { ok: true };
+    if (method === 'GET' && path === '/v0/contacts') {
+      const doc = this.store.contactsDoc(splitAddress(client.principal).local);
+      return { epoch: doc.epoch, version: doc.version, data: doc.data, wrap: doc.wraps[client.clientId] ?? null, wrapped: Object.keys(doc.wraps) };
     }
+    if (method === 'PUT' && path === '/v0/contacts') return this.putContacts(client, json(request));
     if (method === 'POST' && path === '/v0/contacts/grant') {
       const { add = [], remove = [] } = json<{ add?: string[]; remove?: string[] }>(request);
       this.store.updateViewGrants(splitAddress(client.principal).local, add, remove);

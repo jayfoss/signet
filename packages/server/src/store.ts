@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { DomainBinding, GatewayKey, KeyPair, LogEntry, MailItem, SignedCard, SignedView, VrfKey } from '@signet/lib';
+import type { Ciphertext, DomainBinding, GatewayKey, KeyPair, LogEntry, MailItem, Sealed, SignedCard, SignedView, VrfKey } from '@signet/lib';
 import { AUTH_SKEW_MS, ReplayCache } from '@signet/lib';
 import { decode, encode } from './codec';
 
@@ -37,6 +37,16 @@ export interface Outbound {
   /** Another home of the domain has already accepted this delivery, so giving up here is not a bounce. */
   accepted?: boolean;
 }
+
+/** What a home keeps of an account's contacts: the ciphertext, and one wrap of its key for each client. */
+export interface ContactsDoc {
+  epoch: number;
+  version: number;
+  data: Ciphertext | null;
+  wraps: Record<string, Sealed>;
+}
+
+export const emptyContacts = (): ContactsDoc => ({ epoch: 0, version: 0, data: null, wraps: {} });
 
 type Parked = Omit<MailItem, 'seq' | 'receivedAt'>;
 
@@ -101,10 +111,9 @@ export interface Store {
   /** Record a Privacy Pass token nonce. False if it was already spent. */
   spend(nonce: string): boolean;
 
-  /** A user's contacts and trusted domains, shared by all their clients. */
-  addContacts(local: string, contacts: string[], trustedDomains: string[]): void;
-  removeContacts(local: string, contacts: string[], trustedDomains: string[]): void;
-  contactsOf(local: string): { contacts: string[]; trustedDomains: string[] };
+  /** A user's contacts and trusted domains, encrypted by their clients; the server never sees them (Section 7.9). */
+  contactsDoc(local: string): ContactsDoc;
+  putContactsDoc(local: string, doc: ContactsDoc): void;
 
   /** Hashed requesters a user has released their contact view to. */
   updateViewGrants(local: string, add: string[], remove: string[]): void;
@@ -164,7 +173,7 @@ export class MemoryStore implements SnapshotStore {
   private readonly counters = new Map<string, number>();
   private readonly spent = new Set<string>();
   private readonly viewGrants = new Map<string, Set<string>>();
-  private readonly contacts = new Map<string, { contacts: Set<string>; trustedDomains: Set<string> }>();
+  private readonly contacts = new Map<string, ContactsDoc>();
   private readonly orgClaims = new Map<string, string[]>();
   private readonly pending = new Map<string, Outbound>();
   private keys?: ServerKeys;
@@ -187,7 +196,7 @@ export class MemoryStore implements SnapshotStore {
       counters: [...this.counters],
       spent: [...this.spent],
       viewGrants: [...this.viewGrants].map(([key, set]) => [key, [...set]]),
-      contacts: [...this.contacts].map(([key, value]) => [key, { contacts: [...value.contacts], trustedDomains: [...value.trustedDomains] }]),
+      contacts: [...this.contacts],
       orgClaims: [...this.orgClaims],
       pending: [...this.pending],
       keys: this.keys ?? null,
@@ -227,9 +236,7 @@ export class MemoryStore implements SnapshotStore {
     this.viewGrants.clear();
     pairs<string[]>('viewGrants').forEach(([key, value]) => this.viewGrants.set(key, new Set(value)));
     this.contacts.clear();
-    pairs<{ contacts: string[]; trustedDomains: string[] }>('contacts').forEach(([key, value]) =>
-      this.contacts.set(key, { contacts: new Set(value.contacts), trustedDomains: new Set(value.trustedDomains) }),
-    );
+    pairs<ContactsDoc>('contacts').forEach(([key, value]) => this.contacts.set(key, value));
     this.orgClaims.clear();
     pairs<string[]>('orgClaims').forEach(([key, value]) => this.orgClaims.set(key, value));
     this.pending.clear();
@@ -378,23 +385,12 @@ export class MemoryStore implements SnapshotStore {
     return true;
   }
 
-  addContacts(local: string, contacts: string[], trustedDomains: string[]): void {
-    const entry = this.contacts.get(local) ?? { contacts: new Set<string>(), trustedDomains: new Set<string>() };
-    contacts.forEach((address) => entry.contacts.add(address.toLowerCase()));
-    trustedDomains.forEach((domain) => entry.trustedDomains.add(domain.toLowerCase()));
-    this.contacts.set(local, entry);
+  contactsDoc(local: string): ContactsDoc {
+    return structuredClone(this.contacts.get(local) ?? emptyContacts());
   }
 
-  removeContacts(local: string, contacts: string[], trustedDomains: string[]): void {
-    const entry = this.contacts.get(local);
-    if (!entry) return;
-    contacts.forEach((address) => entry.contacts.delete(address.toLowerCase()));
-    trustedDomains.forEach((domain) => entry.trustedDomains.delete(domain.toLowerCase()));
-  }
-
-  contactsOf(local: string): { contacts: string[]; trustedDomains: string[] } {
-    const entry = this.contacts.get(local);
-    return { contacts: [...(entry?.contacts ?? [])], trustedDomains: [...(entry?.trustedDomains ?? [])] };
+  putContactsDoc(local: string, doc: ContactsDoc): void {
+    this.contacts.set(local, structuredClone(doc));
   }
 
   updateViewGrants(local: string, add: string[], remove: string[]): void {
@@ -492,7 +488,7 @@ CREATE TABLE IF NOT EXISTS blob_meta (id TEXT PRIMARY KEY, owner TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS mail_seq (local TEXT PRIMARY KEY, next INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mail_acks (local TEXT NOT NULL, client_id TEXT NOT NULL, through INTEGER NOT NULL, PRIMARY KEY (local, client_id));
 CREATE TABLE IF NOT EXISTS spent (nonce TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS contacts (local TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (local, kind, value));
+CREATE TABLE IF NOT EXISTS contacts_doc (local TEXT PRIMARY KEY, doc TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS view_grants (local TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (local, hash));
 CREATE TABLE IF NOT EXISTS counters (bucket TEXT PRIMARY KEY, total INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS seen (scope TEXT NOT NULL, key TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY (scope, key));
@@ -699,25 +695,13 @@ export class SqliteStore implements Store {
     return Number(this.db.prepare('INSERT OR IGNORE INTO spent (nonce) VALUES (?)').run(nonce).changes) === 1;
   }
 
-  addContacts(local: string, contacts: string[], trustedDomains: string[]): void {
-    this.transaction(() => {
-      const insert = this.db.prepare('INSERT OR IGNORE INTO contacts (local, kind, value) VALUES (?, ?, ?)');
-      for (const address of contacts) insert.run(local, 'contact', address.toLowerCase());
-      for (const domain of trustedDomains) insert.run(local, 'domain', domain.toLowerCase());
-    });
+  contactsDoc(local: string): ContactsDoc {
+    const row = this.db.prepare('SELECT doc FROM contacts_doc WHERE local = ?').get(local) as { doc: string } | undefined;
+    return row ? (JSON.parse(row.doc) as ContactsDoc) : emptyContacts();
   }
 
-  removeContacts(local: string, contacts: string[], trustedDomains: string[]): void {
-    this.transaction(() => {
-      const remove = this.db.prepare('DELETE FROM contacts WHERE local = ? AND kind = ? AND value = ?');
-      for (const address of contacts) remove.run(local, 'contact', address.toLowerCase());
-      for (const domain of trustedDomains) remove.run(local, 'domain', domain.toLowerCase());
-    });
-  }
-
-  contactsOf(local: string): { contacts: string[]; trustedDomains: string[] } {
-    const rows = this.db.prepare('SELECT kind, value FROM contacts WHERE local = ?').all(local) as { kind: string; value: string }[];
-    return { contacts: rows.filter((row) => row.kind === 'contact').map((row) => row.value), trustedDomains: rows.filter((row) => row.kind === 'domain').map((row) => row.value) };
+  putContactsDoc(local: string, doc: ContactsDoc): void {
+    this.db.prepare('INSERT INTO contacts_doc (local, doc) VALUES (?, ?) ON CONFLICT (local) DO UPDATE SET doc = excluded.doc').run(local, JSON.stringify(doc));
   }
 
   updateViewGrants(local: string, add: string[], remove: string[]): void {

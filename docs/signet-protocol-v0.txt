@@ -4461,24 +4461,74 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 7.9.  Shared Contacts
 
-   The reference home server stores each account's contacts and trusted
-   domains, so that every client of the account admits the same people
-   and warns about the same lookalikes:
+   Every client of an account admits the same people and warns about
+   the same lookalikes, so the account's contacts and trusted domains
+   are kept on its home server. The home server holds them encrypted
+   and cannot read them.
 
-      GET  /v0/contacts
-      POST /v0/contacts   { "contacts": ["…"], "trustedDomains": ["…"] }
+   The document is the JSON object {"v": 0, "contacts": [...],
+   "trustedDomains": [...]}, with entries lowercased, padded as in
+   Section 7.3 and encrypted with AES-256-GCM under the contacts key:
+   32 random bytes shared by the account's clients. The key has an
+   epoch, a number from 1. The additional data is the UTF-8 string
+   "signet0 contacts|" followed by the principal, "|" and the epoch.
 
-   Both require client authentication (Section 3.11). POST adds the
-   given entries (lowercased). To remove entries, a POST body also
-   MAY carry removeContacts and removeTrustedDomains, arrays of the
-   same form. Within one POST, removals apply after additions. GET
-   returns {contacts, trustedDomains}.
+   A client holds the key by a wrap: the key sealed with HPKE as in
+   Section 7.3 to that client's agreement key, with the info string
+   "signet0 contacts key|" followed by the principal, "|" and the epoch.
+   The home server keeps one wrap for each client.
 
-   The stored list is authoritative. On every sync a client first
-   uploads the entries it added since its last sync, then replaces its
-   own lists with the stored ones. It MUST NOT upload an entry merely
-   because it is in its local list, or a removal made by another client
-   would be undone.
+      GET /v0/contacts
+      → { "epoch": 1, "version": 7, "data": { "iv": "…", "ct": "…" },
+          "wrap": { "enc": "…", "ct": "…" }, "wrapped": ["c_…", …] }
+
+      PUT /v0/contacts
+      { "expectedVersion": 7, "epoch": 1, "data": { "iv": "…",
+        "ct": "…" }, "wraps": { "c_…": { "enc": "…", "ct": "…" } } }
+      → { "version": 8 }
+
+   Both require client authentication (Section 3.11). With nothing
+   stored, GET answers epoch 0, version 0, data null and no wrap.
+   wrap is the calling client's wrap, or null; wrapped lists the
+   clients that have one. The home server keeps a version that starts
+   at 0 and rises by one with each PUT.
+
+   A PUT is refused with 409 unless expectedVersion equals the stored
+   version. If epoch equals the stored epoch, the wraps are added to
+   those stored, and data, if present, replaces the stored data. If
+   epoch is one more than the stored epoch, the wraps replace all those
+   stored, and data is required. Any other epoch is refused with 400.
+   Every key in wraps MUST be an active client of the account (Section
+   3.4.3); otherwise the PUT is refused with 400.
+
+   A client keeps the contacts as follows:
+
+   1.  A client with no key and nothing stored (epoch 0) makes a key,
+       encrypts its own lists, and PUTs epoch 1 with a wrap for every
+       active client of the account.
+
+   2.  A client without the key that finds a wrap for itself opens it.
+       One that finds none keeps its own lists and asks again at its
+       next sync, which is after a client that has the key sees it.
+
+   3.  To change the lists, a client GETs, decrypts, applies the
+       change, encrypts, and PUTs with the version it read. After a 409
+       it starts again. The stored lists are authoritative: at each
+       sync a client replaces its own with them.
+
+   4.  A client that holds the key checks at each sync that every
+       active client has a wrap. For one that has not, it PUTs a wrap
+       at the same epoch. If a wrap exists for a client that is no
+       longer active, it makes a new key, encrypts the lists under it,
+       and PUTs the next epoch with wraps for the active clients only.
+
+   5.  A client MUST remember the highest version and epoch it has
+       seen from each home and MUST refuse an answer with a lower one.
+
+   A domain with several homes (Section 6.9) has a separate document
+   at each. A client PUTs a change to every home and reads from the
+   first that answers, and repeats a PUT that a home missed (Section
+   6.9.6).
 
 7.10.  Errors
 
@@ -4600,15 +4650,24 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 7.12.  Open Issues
 
-   *  *Contacts are visible to the home server.* The shared-contacts
-      routes (Section 7.9) store an account's contacts and trusted
-      domains on its home server in the clear, so that all of its
-      clients admit the same people. The admission decision is still
-      made on the client. Storing the lists encrypted needs a key that
-      every client of the account shares and the home server does not
-      hold. Enrollment (Section 3.4.4) could carry one, but version 0
-      does not specify that. A client that does not want its home
-      server to see its contacts MUST NOT use these routes.
+   *  *The home server still sees that contacts change.* The contacts
+      are encrypted (Section 7.9), but the home server sees the
+      document's size, rounded up to 1024 bytes, when it changes, how
+      many clients hold the key, and who writes it.
+
+   *  *A revoked client keeps the key it held.* Revoking a client makes
+      the next client that syncs rotate the key (Section 7.9 step 4),
+      so the revoked client cannot read what is stored after that. It
+      can still read any copy of an older document it saved, and until
+      a client rotates the key it can read the stored one.
+
+   *  *The home server can roll back.* It can answer with an older
+      document. A client that has seen a newer version refuses it, but
+      a client that has not, such as a new device, cannot tell.
+
+   *  *Concurrent edits repeat.* Two clients that change the lists at
+      once cost the later one a 409 and another round trip. There is
+      no merge.
 
 8.  Threads and Messages
 
@@ -7261,8 +7320,9 @@ Experimental           Signet Protocol, Version 0          November 2026
    |                      | submissions,         | legacy mail.        |
    |                      | recipients, sizes    |                     |
    |                      | and timing; the      |                     |
-   |                      | user's contacts and  |                     |
-   |                      | trusted domains      |                     |
+   |                      | the size and timing  |                     |
+   |                      | of changes to its    |                     |
+   |                      | user's contacts      |                     |
    |                      | (Section 7.9).       |                     |
    +----------------------+----------------------+---------------------+
    | Recipient's home     | Sender address,      | Content.            |
@@ -7375,11 +7435,11 @@ Experimental           Signet Protocol, Version 0          November 2026
 
 15.6.  Contacts and Labels
 
-   Admission is decided on the recipient's clients, but the home server
-   stores contacts and trusted domains in the clear so that all of an
-   account's clients share them (Section 7.9). Client labels never
-   appear in the directory. A label reaches a thread only if a client
-   chooses to share it (Section 8.4).
+   Admission is decided on the recipient's clients. The home server
+   stores contacts and trusted domains encrypted, so that all of an
+   account's clients share them without it reading them (Section 7.9).
+   Client labels never appear in the directory. A label reaches a
+   thread only if a client chooses to share it (Section 8.4).
 
 15.7.  Escrow
 

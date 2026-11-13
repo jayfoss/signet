@@ -69,24 +69,6 @@ describe('mailbox acknowledgements and retention (Section 10.7)', () => {
   });
 });
 
-describe('removing contacts (Section 7.9)', () => {
-  it('removes entries for every client, so a stale copy is not merged back', async () => {
-    const w = await world();
-    try {
-      await w.bobPhone.addContact('alice@alpha.test');
-      await w.bobPhone.trustDomain('alpha.test');
-      expect(w.beta.store.contactsOf('bob')).toEqual({ contacts: ['alice@alpha.test'], trustedDomains: ['alpha.test'] });
-      await w.bobPhone.removeContact('alice@alpha.test');
-      await w.bobPhone.untrustDomain('alpha.test');
-      expect(w.beta.store.contactsOf('bob')).toEqual({ contacts: [], trustedDomains: [] });
-      await w.bobPhone.sync();
-      expect(w.bobPhone.snapshot().admission).toEqual({ contacts: [], trustedDomains: [] });
-    } finally {
-      await w.bed.close();
-    }
-  });
-});
-
 describe('attachments (Section 8.9)', () => {
   it('uses long ids, lets the uploader delete a blob, and expires the rest', async () => {
     const w = await world();

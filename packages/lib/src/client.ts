@@ -6,7 +6,8 @@ import { openAttachment, sealAttachment } from './attachments';
 import { clientAuthHeaders } from './auth';
 import type { Directory, Grant, SignedView, ViewMember } from './cards';
 import { cardHash, cardKeyHistory, verifyView, viewHash, viewMember } from './cards';
-import { randomId, sha256 } from './crypto';
+import type { Ciphertext, Sealed } from './crypto';
+import { decrypt, encrypt, open, padPlaintext, randomId, randomSecret, seal, sha256, unpadPlaintext } from './crypto';
 import type { ContactCard, DirectoryEntry, DomainPolicy, EnrolledEntry } from './directory';
 import {
   HiddenAddressError,
@@ -28,8 +29,8 @@ import { DisclosureError, audienceHash, verifyOrgClaim } from './disclosure';
 import { b64u, canonicalJson, fromB64u, utf8 } from './encoding';
 import { OHTTP_REQUEST_TYPE, decapsulateResponse, encapsulateRequest } from './ohttp';
 import type { KeyPair } from './crypto';
-import type { ClientKeys, ClientKind, LogEntry } from './identity';
-import { keyChangeSince, recoveryProof, replayLog } from './identity';
+import type { ClientCert, ClientKeys, ClientKind, LogEntry } from './identity';
+import { activeClients, keyChangeSince, recoveryProof, replayLog } from './identity';
 import type { PairingChannel, PendingClient } from './enrollment';
 import { EnrollmentError, HttpPairingChannel, completeEnrollment, newPairingSecret, pairAsNewClient, pairingCode, parsePairingCode } from './enrollment';
 import type { Intent } from './intents';
@@ -195,6 +196,12 @@ export interface ClientSnapshot {
   treeHeads: Record<string, TreeHead>;
   /** The domain key already checked against the domain's log, by domain (Section 6.5). */
   domainKeys: Record<string, string>;
+  /** The contacts key each home's document is under (Section 7.9), by home URL. */
+  contactKeys: Record<string, { epoch: number; key: string }>;
+  /** The newest contacts epoch and version each home has answered with, so an older answer is refused. */
+  contactSeen: Record<string, { epoch: number; version: number }>;
+  /** Changes to the contacts that a home has not taken yet, by home URL. */
+  contactOps: Record<string, ContactOp[]>;
   /** The latest commit applied in each thread, with the undo for it, kept briefly in case a competing one arrives (Section 8.8). */
   lastCommit: Record<string, { hash: string; undo: StateUndo; at: number; own: boolean; joined?: boolean }>;
   /** Messages that could not be read yet, kept until the winning commit may arrive (Section 8.8). */
@@ -311,6 +318,9 @@ const emptySnapshot = (): ClientSnapshot => ({
   sentIds: [],
   treeHeads: {},
   domainKeys: {},
+  contactKeys: {},
+  contactSeen: {},
+  contactOps: {},
   lastCommit: {},
   held: [],
   rekeyAgain: [],
@@ -349,6 +359,24 @@ const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: Th
 
 /** Who may be in a thread: readers, and in a humans-only thread only devices and agents their owner opted in. */
 const eligible = (member: ViewMember, humansOnly: boolean): boolean => member.reads && (!humansOnly || member.humansOnly);
+
+/** One change to the shared contacts (Section 7.9). */
+interface ContactOp {
+  op: 'add' | 'remove';
+  kind: 'contact' | 'domain';
+  value: string;
+}
+
+function applyContactOps(lists: AdmissionPolicy, ops: ContactOp[]): AdmissionPolicy {
+  const contacts = new Set(lists.contacts);
+  const domains = new Set(lists.trustedDomains);
+  for (const { op, kind, value } of ops) {
+    const set = kind === 'contact' ? contacts : domains;
+    if (op === 'add') set.add(value);
+    else set.delete(value);
+  }
+  return { contacts: [...contacts], trustedDomains: [...domains] };
+}
 
 /** How long a client keeps the means to take back its latest commit, and messages it cannot read yet (Section 8.8). */
 const FORK_WINDOW_MS = 5 * 60_000;
@@ -423,32 +451,24 @@ export class SignetClient {
   }
 
   /**
-   * Contacts and trusted domains live on the account's home server, so every device and agent of the
-   * account admits the same people and warns about the same lookalikes. They're routing metadata the
-   * server already sees, not content. Each client keeps a copy and syncs it on every `sync`.
+   * Contacts and trusted domains are shared by every client of the account, so each admits the same people and
+   * warns about the same lookalikes. The home server holds them encrypted under a key only the account's clients
+   * have (Section 7.9). A change is kept until every home has taken it.
    */
   async addContact(address: string): Promise<void> {
-    const who = normalizeAddress(address);
-    if (!this.state.admission.contacts.includes(who)) this.state.admission.contacts.push(who);
-    await this.callEach('POST', '/v0/contacts', { contacts: [who] });
+    await this.changeContacts([{ op: 'add', kind: 'contact', value: normalizeAddress(address) }]);
   }
 
   async trustDomain(domain: string): Promise<void> {
-    const name = domain.toLowerCase();
-    if (!this.state.admission.trustedDomains.includes(name)) this.state.admission.trustedDomains.push(name);
-    await this.callEach('POST', '/v0/contacts', { trustedDomains: [name] });
+    await this.changeContacts([{ op: 'add', kind: 'domain', value: domain.toLowerCase() }]);
   }
 
   async removeContact(address: string): Promise<void> {
-    const who = normalizeAddress(address);
-    this.state.admission.contacts = this.state.admission.contacts.filter((known) => known !== who);
-    await this.callEach('POST', '/v0/contacts', { removeContacts: [who] });
+    await this.changeContacts([{ op: 'remove', kind: 'contact', value: normalizeAddress(address) }]);
   }
 
   async untrustDomain(domain: string): Promise<void> {
-    const name = domain.toLowerCase();
-    this.state.admission.trustedDomains = this.state.admission.trustedDomains.filter((known) => known !== name);
-    await this.callEach('POST', '/v0/contacts', { removeTrustedDomains: [name] });
+    await this.changeContacts([{ op: 'remove', kind: 'domain', value: domain.toLowerCase() }]);
   }
 
   /** Delete an attachment this client uploaded, at every home that holds it (Section 8.9). Copies already fetched stay fetched. */
@@ -479,11 +499,125 @@ export class SignetClient {
     if (!this.state.knownOwnClients.includes(clientId)) this.state.knownOwnClients.push(clientId);
   }
 
+  /** Apply a change here, and at every home as soon as each takes it. */
+  private async changeContacts(ops: ContactOp[]): Promise<void> {
+    this.state.admission = applyContactOps(this.state.admission, ops);
+    const homes = await this.homeBases();
+    for (const home of homes) (this.state.contactOps[home] ??= []).push(...ops);
+    let failure: unknown;
+    let taken = 0;
+    for (const home of homes) {
+      try {
+        await this.syncContactsAt(home);
+        taken += 1;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (taken === 0 && failure) throw failure;
+  }
+
+  /** The clients that hold a copy of the contacts key: every active client of this account. */
+  private async activeOwnClients(): Promise<ClientCert[]> {
+    const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
+    if (!own.log) throw new Error('home server did not return this account’s log');
+    return activeClients(replayLog(own.log));
+  }
+
+  private contactsAad = (epoch: number): Uint8Array => utf8(`signet0 contacts|${this.address}|${epoch}`);
+  private contactsInfo = (epoch: number): string => `signet0 contacts key|${this.address}|${epoch}`;
+
+  private sealContacts(lists: AdmissionPolicy, key: Buffer, epoch: number): Ciphertext {
+    return encrypt(key, padPlaintext(utf8(JSON.stringify({ v: 0, contacts: lists.contacts, trustedDomains: lists.trustedDomains }))), this.contactsAad(epoch));
+  }
+
+  private openContacts(data: Ciphertext, key: Buffer, epoch: number): AdmissionPolicy {
+    const body = JSON.parse(unpadPlaintext(decrypt(key, data, this.contactsAad(epoch))).toString('utf8')) as { contacts?: string[]; trustedDomains?: string[] };
+    return { contacts: unique(body.contacts ?? []), trustedDomains: unique(body.trustedDomains ?? []) };
+  }
+
+  private async wrapsFor(clients: ClientCert[], key: Buffer, epoch: number): Promise<Record<string, Sealed>> {
+    return Object.fromEntries(await Promise.all(clients.map(async (cert) => [cert.clientId, await seal(cert.agreeKey, key, this.contactsInfo(epoch))] as const)));
+  }
+
+  /**
+   * Bring one home's contacts document in step (Section 7.9): open the key, apply the changes this home has not
+   * taken, give new clients their wraps, and rotate the key if a revoked client still has one. Returns the lists
+   * the home holds, with changes it has not yet taken applied, or null if this client has no key there yet.
+   */
+  private async syncContactsAt(home: string): Promise<AdmissionPolicy | null> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const answer = (await this.request(home, 'GET', '/v0/contacts')) as { epoch: number; version: number; data: Ciphertext | null; wrap: Sealed | null; wrapped: string[] };
+      const seen = this.state.contactSeen[home];
+      if (seen && (answer.epoch < seen.epoch || (answer.epoch === seen.epoch && answer.version < seen.version))) {
+        throw new Error(`${home} answered with older contacts than it did before`);
+      }
+      this.state.contactSeen[home] = { epoch: answer.epoch, version: answer.version };
+      const pending = this.state.contactOps[home] ?? [];
+      let held: { epoch: number; key: string } | undefined = this.state.contactKeys[home];
+      if (answer.epoch > 0 && held?.epoch !== answer.epoch) {
+        held = undefined;
+        delete this.state.contactKeys[home];
+        if (answer.wrap) {
+          const key = await open(this.keys.agreement, answer.wrap, this.contactsInfo(answer.epoch));
+          held = { epoch: answer.epoch, key: b64u(key) };
+          this.state.contactKeys[home] = held;
+        }
+      }
+      // No key yet: another client has to give this one a wrap.
+      if (answer.epoch > 0 && !held) return null;
+      const active = await this.activeOwnClients();
+      const activeIds = new Set(active.map((cert) => cert.clientId));
+      let key = held ? fromB64u(held.key) : randomSecret();
+      let epoch = answer.epoch;
+      const stored = answer.data && held ? this.openContacts(answer.data, key, answer.epoch) : answer.epoch === 0 ? this.state.admission : { contacts: [], trustedDomains: [] };
+      const lists = applyContactOps(stored, pending);
+      const missing = active.filter((cert) => !answer.wrapped.includes(cert.clientId));
+      const revoked = answer.wrapped.some((id) => !activeIds.has(id));
+      let body: { expectedVersion: number; epoch: number; data?: Ciphertext; wraps: Record<string, Sealed> } | undefined;
+      if (answer.epoch === 0 || revoked) {
+        // A first key, or a new one because a client that is no longer active still holds the old.
+        epoch = answer.epoch + 1;
+        key = randomSecret();
+        body = { expectedVersion: answer.version, epoch, data: this.sealContacts(lists, key, epoch), wraps: await this.wrapsFor(active, key, epoch) };
+      } else if (pending.length > 0 || missing.length > 0) {
+        body = {
+          expectedVersion: answer.version,
+          epoch,
+          ...(pending.length > 0 ? { data: this.sealContacts(lists, key, epoch) } : {}),
+          wraps: await this.wrapsFor(missing, key, epoch),
+        };
+      }
+      if (body) {
+        try {
+          const { version } = (await this.request(home, 'PUT', '/v0/contacts', body)) as { version: number };
+          this.state.contactSeen[home] = { epoch, version };
+          this.state.contactKeys[home] = { epoch, key: b64u(key) };
+          delete this.state.contactOps[home];
+        } catch (error) {
+          if (error instanceof Error && error.message.includes(' 409 ')) continue;
+          throw error;
+        }
+      }
+      return lists;
+    }
+    throw new Error(`${home} kept changing the contacts; try again`);
+  }
+
+  /** At each sync: bring every home's contacts in step, then take the lists from the first that answers (Section 7.9). */
   private async pullContacts(): Promise<void> {
-    const shared = (await this.call('GET', '/v0/contacts')) as AdmissionPolicy;
-    // The stored list is authoritative (Section 7.9): additions were already uploaded, so a removal made by
-    // another client must not be undone by merging our old copy back in.
-    this.state.admission = { contacts: unique(shared.contacts), trustedDomains: unique(shared.trustedDomains) };
+    let lists: AdmissionPolicy | null = null;
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        const got = await this.syncContactsAt(home);
+        if (!lists && got) lists = got;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (lists) this.state.admission = lists;
+    else if (failure && (await this.homeBases()).length === 1) throw failure;
   }
 
   /** Hold a grant from this client's owner. The agent presents it only to the counterparty it names. */
@@ -1713,7 +1847,7 @@ export class SignetClient {
 
   private preferredHome?: string;
 
-  private async request(base: string, method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
+  private async request(base: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, extra?: Record<string, string>): Promise<unknown> {
     const binary = body instanceof Uint8Array;
     const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
     const headers = {

@@ -10,7 +10,7 @@ The specification is [`docs/signet-protocol-v0.txt`](docs/signet-protocol-v0.txt
 | --- | --- |
 | [`packages/lib`](packages/lib) | The protocol: identities and account logs, the directory, transparency proofs, requests, threads, intents and grants, delivery, and the client |
 | [`packages/mls`](packages/mls) | The native core in Rust: MLS (RFC 9420, via OpenMLS), ECVRF (RFC 9381) and SPAKE2 pairing, as a Node addon |
-| [`packages/server`](packages/server) | The home server, transparency log, Privacy Pass issuer and OHTTP relay |
+| [`packages/server`](packages/server) | The home server (one, or several kept in step by Raft), transparency log, Privacy Pass issuer and OHTTP relay |
 | [`packages/client`](packages/client) | The `signet` command-line client |
 
 ## Running it
@@ -26,6 +26,14 @@ pnpm demo
 `pnpm demo` runs two domains, a log, an issuer and a relay in one process and walks through first contact, a thread, and the attacks Signet catches. `pnpm disclosure-demo` shows one agent asking a colleague's agent for information the colleague has to approve.
 
 Tests run per file, for example `pnpm jest packages/server/src/__tests__/server.test.ts`. `pnpm typecheck` checks all three TypeScript packages.
+
+## Several homes
+
+**One operator, several machines.** A home can be a Raft cluster: replicas copy the primary's changes, elect a new primary when it fails, and a cheap witness that only votes lets two replicas survive the loss of one (Section 6.8).
+
+**Several operators.** A domain can also spread across operators who don't trust each other (Section 6.9). Each runs an independent home with its own key and state, and none holds the domain key. The domain owner signs a statement listing the homes and pins the domain key in DNS (`dk=`). A sending home delivers to every home of the recipient at the same time, a client reads from all of its homes and shows each message once, and a home that is down is caught up by retries. Recipient homes sign receipts, so a sender's client can tell whether its own home really delivered and send again through another if not. Attachments are uploaded to every home. Discovery doesn't use MX, so an outage at the domain's mail provider doesn't touch any of this.
+
+Both are configured through environment variables; the list is at the top of `packages/server/src/main.ts`. Replicas keep their log in `SIGNET_DATA_DIR` and compact it with snapshots. `SIGNET_ROLE=witness` runs a witness, `registrar` runs the domain owner's registrar, and `sign-operators` signs the statement that lists the homes. `cluster.test.ts` and `operators.test.ts` build both setups in code.
 
 ## Licence
 

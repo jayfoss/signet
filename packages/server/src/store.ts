@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { DomainBinding, GatewayKey, KeyPair, LogEntry, MailItem, SignedCard, SignedView, VrfKey } from '@signet/lib';
 import { AUTH_SKEW_MS, ReplayCache } from '@signet/lib';
+import { decode, encode } from './codec';
 
 export interface UserRecord {
   binding: DomainBinding;
@@ -31,6 +32,10 @@ export interface Outbound {
   attempt: number;
   dueAt: number;
   reason: string;
+  /** For a domain with several homes: the one this entry retries. Unset means whichever home the policy names. */
+  home?: string;
+  /** Another home of the domain has already accepted this delivery, so giving up here is not a bounce. */
+  accepted?: boolean;
 }
 
 type Parked = Omit<MailItem, 'seq' | 'receivedAt'>;
@@ -53,6 +58,7 @@ export interface Store {
   deleteUser(local: string): void;
   userLocals(): string[];
 
+  /** Add an item to a mailbox. An item whose id is already there is not added again; the one already stored is returned (Section 6.9.5). */
   push(local: string, item: Parked): MailItem;
   mailbox(local: string, after?: number): MailItem[];
 
@@ -104,6 +110,13 @@ export interface Store {
   serverKeys(): ServerKeys | undefined;
   setServerKeys(keys: ServerKeys): void;
 
+  /**
+   * Names this mailbox store. It changes if the store is lost and started over, so a client whose cursor
+   * points into the old one notices (Section 6.9.6).
+   */
+  epoch(): string | undefined;
+  setEpoch(id: string): void;
+
   saveOutbound(entry: Outbound): void;
   removeOutbound(id: string): void;
   outbound(): Outbound[];
@@ -111,10 +124,17 @@ export interface Store {
   close(): void;
 }
 
+/** A store that can be written out whole and read back, so a replica can compact its log (Section 6.8.6). */
+export interface SnapshotStore extends Store {
+  snapshot(): unknown;
+  /** Replace everything with a snapshot, or with nothing for null. */
+  restore(data: unknown): void;
+}
+
 const today = (now: Date) => now.toISOString().slice(0, 10);
 
 /** Everything in memory, for tests and local demos. Gone on restart. */
-export class MemoryStore implements Store {
+export class MemoryStore implements SnapshotStore {
   private readonly users = new Map<string, UserRecord>();
   private readonly mailboxes = new Map<string, MailItem[]>();
   private readonly keyPackages = new Map<string, PublishedKeyPackage[]>();
@@ -129,8 +149,68 @@ export class MemoryStore implements Store {
   private readonly orgClaims = new Map<string, string[]>();
   private readonly pending = new Map<string, Outbound>();
   private keys?: ServerKeys;
-  readonly replays = new ReplayCache();
-  readonly recoveryProofs = new ReplayCache();
+  private epochId?: string;
+  replays = new ReplayCache();
+  recoveryProofs = new ReplayCache();
+
+  snapshot(): unknown {
+    return encode({
+      users: [...this.users],
+      mailboxes: [...this.mailboxes],
+      keyPackages: [...this.keyPackages],
+      lastResort: [...this.lastResort],
+      tokens: [...this.tokens].map(([key, set]) => [key, [...set]]),
+      parked: [...this.parked],
+      blobs: [...this.blobs],
+      counters: [...this.counters],
+      spent: [...this.spent],
+      viewGrants: [...this.viewGrants].map(([key, set]) => [key, [...set]]),
+      contacts: [...this.contacts].map(([key, value]) => [key, { contacts: [...value.contacts], trustedDomains: [...value.trustedDomains] }]),
+      orgClaims: [...this.orgClaims],
+      pending: [...this.pending],
+      keys: this.keys ?? null,
+      epoch: this.epochId ?? null,
+      replays: this.replays.entries(),
+      recoveryProofs: this.recoveryProofs.entries(),
+    });
+  }
+
+  restore(data: unknown): void {
+    const saved = (data === null ? {} : decode(data)) as Record<string, [string, unknown][] | string[] | ServerKeys | string | null | undefined>;
+    const pairs = <V>(name: string): [string, V][] => (saved[name] ?? []) as [string, V][];
+    this.users.clear();
+    pairs<UserRecord>('users').forEach(([key, value]) => this.users.set(key, value));
+    this.mailboxes.clear();
+    pairs<MailItem[]>('mailboxes').forEach(([key, value]) => this.mailboxes.set(key, value));
+    this.keyPackages.clear();
+    pairs<PublishedKeyPackage[]>('keyPackages').forEach(([key, value]) => this.keyPackages.set(key, value));
+    this.lastResort.clear();
+    pairs<PublishedKeyPackage>('lastResort').forEach(([key, value]) => this.lastResort.set(key, value));
+    this.tokens.clear();
+    pairs<string[]>('tokens').forEach(([key, value]) => this.tokens.set(key, new Set(value)));
+    this.parked.clear();
+    pairs<{ hash: string; item: Parked; until: number }[]>('parked').forEach(([key, value]) => this.parked.set(key, value));
+    this.blobs.clear();
+    pairs<Buffer>('blobs').forEach(([key, value]) => this.blobs.set(key, value));
+    this.counters.clear();
+    pairs<number>('counters').forEach(([key, value]) => this.counters.set(key, value));
+    this.spent.clear();
+    ((saved.spent ?? []) as string[]).forEach((nonce) => this.spent.add(nonce));
+    this.viewGrants.clear();
+    pairs<string[]>('viewGrants').forEach(([key, value]) => this.viewGrants.set(key, new Set(value)));
+    this.contacts.clear();
+    pairs<{ contacts: string[]; trustedDomains: string[] }>('contacts').forEach(([key, value]) =>
+      this.contacts.set(key, { contacts: new Set(value.contacts), trustedDomains: new Set(value.trustedDomains) }),
+    );
+    this.orgClaims.clear();
+    pairs<string[]>('orgClaims').forEach(([key, value]) => this.orgClaims.set(key, value));
+    this.pending.clear();
+    pairs<Outbound>('pending').forEach(([key, value]) => this.pending.set(key, value));
+    this.keys = (saved.keys as ServerKeys | null | undefined) ?? undefined;
+    this.epochId = (saved.epoch as string | null | undefined) ?? undefined;
+    this.replays = new ReplayCache(undefined, (saved.replays ?? []) as unknown as [string, number][]);
+    this.recoveryProofs = new ReplayCache(undefined, (saved.recoveryProofs ?? []) as unknown as [string, number][]);
+  }
 
   user(local: string): UserRecord | undefined {
     const record = this.users.get(local);
@@ -155,6 +235,8 @@ export class MemoryStore implements Store {
 
   push(local: string, item: Parked): MailItem {
     const mailbox = this.mailboxes.get(local) ?? [];
+    const existing = mailbox.find((entry) => entry.id === item.id);
+    if (existing) return existing;
     const stored = { ...item, seq: mailbox.length + 1, receivedAt: new Date().toISOString() };
     mailbox.push(stored);
     this.mailboxes.set(local, mailbox);
@@ -274,6 +356,14 @@ export class MemoryStore implements Store {
     return this.keys;
   }
 
+  epoch(): string | undefined {
+    return this.epochId;
+  }
+
+  setEpoch(id: string): void {
+    this.epochId = id;
+  }
+
   setServerKeys(keys: ServerKeys): void {
     this.keys = keys;
   }
@@ -386,6 +476,8 @@ export class SqliteStore implements Store {
   }
 
   private pushNow(local: string, item: Parked): MailItem {
+    const existing = this.db.prepare("SELECT item FROM mail WHERE local = ? AND json_extract(item, '$.id') = ?").get(local, item.id) as { item: string } | undefined;
+    if (existing) return JSON.parse(existing.item) as MailItem;
     const { next } = this.db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM mail WHERE local = ?').get(local) as { next: number };
     const stored = { ...item, seq: Number(next), receivedAt: new Date().toISOString() } as MailItem;
     this.db.prepare('INSERT INTO mail (local, seq, item) VALUES (?, ?, ?)').run(local, stored.seq, JSON.stringify(stored));
@@ -536,6 +628,14 @@ export class SqliteStore implements Store {
   serverKeys(): ServerKeys | undefined {
     const row = this.db.prepare("SELECT value FROM settings WHERE name = 'server-keys'").get() as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as ServerKeys) : undefined;
+  }
+
+  epoch(): string | undefined {
+    return (this.db.prepare("SELECT value FROM settings WHERE name = 'epoch'").get() as { value: string } | undefined)?.value;
+  }
+
+  setEpoch(id: string): void {
+    this.db.prepare("INSERT INTO settings (name, value) VALUES ('epoch', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value").run(id);
   }
 
   setServerKeys(keys: ServerKeys): void {

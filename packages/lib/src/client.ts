@@ -45,13 +45,16 @@ import type { IssuerKey } from './privacypass';
 import { blindTokenRequest, finalizeToken } from './privacypass';
 import type { Introduction, SealedRequest, SignedRequest } from './request';
 import { createIntroduction, createRequest, myCopy, openRequest } from './request';
+import { homeGateway } from './operators';
+import type { Receipt } from './receipts';
+import { verifyReceipt } from './receipts';
 import type { Resolver } from './resolver';
 import { NotSignetDomainError } from './resolver';
 import { DELIVERY_LABEL, TOKEN_EPOCHS_KEPT, deliveryTokenHash, randomToken } from './sealed';
 import type { InclusionProof, LatestLeaf, LogLeaf, TreeHead, TrustedLog } from './transparency';
 import { TransparencyError, checkLeafDomain, verifyConsistency, verifyLeaf, verifyTreeHead } from './transparency';
 
-export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce';
+export type MailKind = 'request' | 'welcome' | 'commit' | 'message' | 'legacy' | 'bounce' | 'receipt';
 
 /** A mailbox entry. `from` is empty for sealed deliveries: the server never learned who sent them. */
 export interface MailItem {
@@ -139,6 +142,10 @@ export type SignetEvent =
   | { kind: 'key-changed'; principal: string; how: 'rotated' | 'recovered'; from: string; to: string }
   /** A domain told this client's server one thing about an address and anonymous lookups another. */
   | { kind: 'directory-alert'; principal: string; alert: string }
+  /** A home of this client's domain still lacks an item that others delivered, after the grace period: it may be withholding mail (Section 6.9.6). */
+  | { kind: 'home-missing'; home: string; itemId: string }
+  /** No recipient home has proved it received this send, after resending through other homes (Section 6.9.5). */
+  | { kind: 'delivery-unconfirmed'; id: string; to: string[] }
   | { kind: 'error'; item: MailItem; error: string };
 
 export interface ThreadMeta {
@@ -146,9 +153,35 @@ export interface ThreadMeta {
   linkedTo?: string;
 }
 
+export interface UnconfirmedSend {
+  id: string;
+  /** The addresses still without a receipt. */
+  to: string[];
+  body: { id: string; to: string[]; kind: MailKind; payload: unknown; token?: string; anonymousToken?: string };
+  /** When it was sent or last sent again, how many times it has been sent again, and the home it went through. */
+  at: number;
+  tries: number;
+  via: string;
+}
+
 /** Everything a client carries between runs apart from its signing keys. `mls` holds its MLS key store. */
 export interface ClientSnapshot {
   cursor: number;
+  /** A mailbox cursor for each home of a domain with several (their `seq` values differ), by home URL. */
+  cursors: Record<string, number>;
+  /**
+   * Mail already processed, by id and when, so an item that comes from more than one home, or comes late, is
+   * handled once (Section 6.9.6). Entries are kept for thirty days, longer than any sender retries.
+   */
+  seen: Record<string, number>;
+  /** The epoch each home last gave for its mailbox. A different one means the home started over, so its cursor is void. */
+  epochs: Record<string, string>;
+  /** Registrations a home missed because it was down, repeated at the next sync (Section 6.9.6). */
+  pending: { home: string; path: string; body: unknown }[];
+  /** Sends no recipient home has yet proved it received, kept to send again (Section 6.9.5). */
+  unconfirmed: UnconfirmedSend[];
+  /** Items seen at some homes but not yet all: which homes had each, and when it first showed up. */
+  homeWatch: Record<string, { homes: string[]; at: number; alerted?: boolean }>;
   pins: Record<string, string>;
   admission: AdmissionPolicy;
   mls: string;
@@ -208,6 +241,15 @@ export interface SignetClientOptions {
    * owner's check of what strangers see. Without one those lookups go direct, from this client's address.
    */
   ohttpRelay?: string;
+  /**
+   * How long an item may be missing from one home, when others have it, before the client reports that home
+   * (`home-missing`). Defaults to ten minutes, longer than a sender's first retry.
+   */
+  homeGraceMs?: number;
+  /** How long a send may go without a receipt before it is sent again through another home. Defaults to five minutes. */
+  receiptGraceMs?: number;
+  /** How many times to send again before reporting `delivery-unconfirmed`. Defaults to 3. */
+  receiptRetries?: number;
 }
 
 export interface MonitorReport {
@@ -235,6 +277,12 @@ interface MlsPayload {
 
 const emptySnapshot = (): ClientSnapshot => ({
   cursor: 0,
+  cursors: {},
+  seen: {},
+  epochs: {},
+  pending: [],
+  unconfirmed: [],
+  homeWatch: {},
   pins: {},
   admission: { contacts: [], trustedDomains: [] },
   mls: '',
@@ -257,6 +305,13 @@ const emptySnapshot = (): ClientSnapshot => ({
 });
 
 const SENT_IDS_KEPT = 1000;
+/** How long, and at most how many, processed ids are remembered. */
+const SEEN_MAX_AGE_MS = 30 * 86_400_000;
+const SEEN_MAX = 200_000;
+const PENDING_KEPT = 200;
+const UNCONFIRMED_KEPT = 200;
+const WATCH_KEPT = 500;
+const WATCH_MAX_AGE_MS = 24 * 3_600_000;
 
 const joinerTag = (clientId: string): string => sha256(`signet joiner ${clientId}`);
 const welcomeFor = (thread: string, welcome: string, joiners: Joiner[], meta: ThreadMeta = { humansOnly: false }): WelcomePayload => ({
@@ -299,8 +354,10 @@ export class SignetClient {
     private readonly options: SignetClientOptions,
   ) {
     this.state = { ...emptySnapshot(), ...structuredClone(options.snapshot ?? {}) };
+    // A snapshot from before ids carried times held them as a list.
+    if (Array.isArray(this.state.seen)) this.state.seen = Object.fromEntries((this.state.seen as string[]).map((id) => [`id:${id}`, Date.now()]));
     this.mls = new MlsSession(keys, this.state.mls);
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = resolver.failoverFetch?.(options.fetchImpl ?? fetch) ?? options.fetchImpl ?? fetch;
     this.ohttpRelay = options.ohttpRelay;
   }
 
@@ -342,13 +399,13 @@ export class SignetClient {
   async addContact(address: string): Promise<void> {
     const who = normalizeAddress(address);
     if (!this.state.admission.contacts.includes(who)) this.state.admission.contacts.push(who);
-    await this.call('POST', '/v0/contacts', { contacts: [who] });
+    await this.callEach('POST', '/v0/contacts', { contacts: [who] });
   }
 
   async trustDomain(domain: string): Promise<void> {
     const name = domain.toLowerCase();
     if (!this.state.admission.trustedDomains.includes(name)) this.state.admission.trustedDomains.push(name);
-    await this.call('POST', '/v0/contacts', { trustedDomains: [name] });
+    await this.callEach('POST', '/v0/contacts', { trustedDomains: [name] });
   }
 
   /** Mark a client this device approved itself, so `monitor` doesn't ask whether it was you. */
@@ -730,9 +787,18 @@ export class SignetClient {
 
   /** Download and decrypt an attachment from a message this client has read. */
   async fetchAttachment(ref: AttachmentRef): Promise<Buffer> {
-    const response = await this.fetchImpl(ref.url);
-    if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
-    return openAttachment(ref, new Uint8Array(await response.arrayBuffer()));
+    let failure: unknown;
+    for (const url of [ref.url, ...(ref.copies ?? [])]) {
+      try {
+        const response = await this.fetchImpl(url);
+        if (!response.ok) throw new Error(`could not fetch ${ref.name}: ${response.status}`);
+        // The digest is checked on every copy, so a copy can't hand over anything but the file.
+        return openAttachment(ref, new Uint8Array(await response.arrayBuffer()));
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   /** Plain email through the home server, for recipients who aren't on Signet. It carries the Signet header. */
@@ -837,23 +903,37 @@ export class SignetClient {
   /** Pull new mail from the home server and turn it into events. Bad items become error events. */
   async sync(): Promise<SignetEvent[]> {
     this.directories.clear();
+    this.forgetOldIds();
+    await this.flushPending();
     await this.pullContacts();
     const events: SignetEvent[] = [];
+    let lastAnswered: string[] = [];
     // Joining a thread registers its token, which can release deliveries the server parked; fetch again for those.
     for (let round = 0; round < 3; round += 1) {
       this.released = 0;
-      const { items } = (await this.call('GET', `/v0/mailbox?after=${this.state.cursor}`)) as { items: MailItem[] };
-      for (const item of items) {
-        this.state.cursor = item.seq;
-        if (this.state.sentIds.includes(item.id)) continue;
-        try {
-          events.push(...(await this.process(item)));
-        } catch (error) {
-          events.push({ kind: 'error', item, error: describe(error) });
+      const mailboxes = await this.readMailboxes();
+      for (const { home, items } of mailboxes) {
+        for (const item of items) {
+          this.watch(item.id, home);
+          this.state.cursors[home] = item.seq;
+          this.state.cursor = item.seq;
+          // The prefix keeps an id like __proto__ an ordinary key.
+          const key = `id:${item.id}`;
+          if (Object.hasOwn(this.state.seen, key)) continue;
+          this.state.seen[key] = Date.now();
+          if (this.state.sentIds.includes(item.id)) continue;
+          try {
+            events.push(...(await this.process(item)));
+          } catch (error) {
+            events.push({ kind: 'error', item, error: describe(error) });
+          }
         }
       }
+      lastAnswered = mailboxes.map((mailbox) => mailbox.home);
       if (this.released === 0) break;
     }
+    events.push(...(await this.retryUnconfirmed()));
+    events.push(...(await this.laggingHomes(lastAnswered)));
     await this.topUpKeyPackages();
     events.push(...this.state.keyChanges.splice(0), ...this.state.directoryAlerts.splice(0));
     return events;
@@ -965,6 +1045,13 @@ export class SignetClient {
       case 'bounce': {
         const bounce = item.payload as { id: string; to: string[]; reason: string };
         return [{ kind: 'bounce', ...bounce }];
+      }
+      case 'receipt': {
+        // A retry that landed after the send: the home that queued it passes on the recipient's receipt.
+        const { id, receipts } = item.payload as { id: string; receipts: Receipt[] };
+        const entry = this.state.unconfirmed.find((send) => send.id === id);
+        if (entry) await this.confirm(entry, { receipts });
+        return [];
       }
     }
   }
@@ -1174,10 +1261,24 @@ export class SignetClient {
     const { local, domain } = splitAddress(who);
     const policy = await this.resolver.policy(domain);
     const path = `/v0/directory/${encodeURIComponent(local)}`;
-    if (!this.ohttpRelay || !policy.ohttp) return (await this.getJson(`${policy.server}${path}`)) as DirectoryEntry;
-    const inner = encodeRequest({ method: 'GET', scheme: 'https', authority: new URL(policy.server).host, path, headers: [], body: Buffer.alloc(0) });
-    const { message, pending } = await encapsulateRequest(policy.ohttp.keys, inner);
-    const relayed = await this.fetchImpl(`${this.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}`, {
+    // Any home of the domain can answer; try them in the policy's order.
+    let failure: unknown;
+    for (const base of policy.operators ? (policy.homes ?? [policy.server]) : [policy.server]) {
+      try {
+        return await this.anonymousAt(base, domain, policy, path);
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
+  }
+
+  private async anonymousAt(base: string, domain: string, policy: DomainPolicy, path: string): Promise<DirectoryEntry> {
+    const gateway = homeGateway(policy, base);
+    if (!this.ohttpRelay || !gateway) return (await this.getJson(`${base}${path}`)) as DirectoryEntry;
+    const inner = encodeRequest({ method: 'GET', scheme: 'https', authority: new URL(base).host, path, headers: [], body: Buffer.alloc(0) });
+    const { message, pending } = await encapsulateRequest(gateway.keys, inner);
+    const relayed = await this.fetchImpl(`${this.ohttpRelay}/v0/relay?domain=${encodeURIComponent(domain)}&home=${encodeURIComponent(base)}`, {
       method: 'POST',
       headers: { 'content-type': OHTTP_REQUEST_TYPE },
       body: message,
@@ -1274,7 +1375,7 @@ export class SignetClient {
   /** Let these people's servers fetch this account's contact view from now on. */
   private async releaseView(to: string[]): Promise<void> {
     const others = to.filter((address) => normalizeAddress(address) !== this.address);
-    if (others.length > 0) await this.call('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
+    if (others.length > 0) await this.callEach('POST', '/v0/contacts/grant', { add: others.map(requesterHash) });
   }
 
   private trustedLog(policy: DomainPolicy): TrustedLog {
@@ -1330,10 +1431,13 @@ export class SignetClient {
   private async topUpKeyPackages(): Promise<void> {
     if (!this.keys.cert.scopes.some((scope) => scope === 'read:*')) return;
     const target = this.options.keyPackageTarget ?? 5;
-    const { count, lastResort } = (await this.call('GET', '/v0/keypackages/count')) as { count: number; lastResort: boolean };
-    const packages = Array.from({ length: Math.max(0, target - count) }, () => ({ kpId: randomId('kp'), keyPackage: this.mls.keyPackage(false) }));
-    const fallback = lastResort ? undefined : { kpId: randomId('kp'), keyPackage: this.mls.keyPackage(true) };
-    if (packages.length > 0 || fallback) await this.call('POST', '/v0/keypackages', { packages, lastResort: fallback });
+    // Every home keeps its own pool, so each is topped up.
+    await this.eachHome(async (home) => {
+      const { count, lastResort } = (await this.request(home, 'GET', '/v0/keypackages/count')) as { count: number; lastResort: boolean };
+      const packages = Array.from({ length: Math.max(0, target - count) }, () => ({ kpId: randomId('kp'), keyPackage: this.mls.keyPackage(false) }));
+      const fallback = lastResort ? undefined : { kpId: randomId('kp'), keyPackage: this.mls.keyPackage(true) };
+      if (packages.length > 0 || fallback) await this.request(home, 'POST', '/v0/keypackages', { packages, lastResort: fallback });
+    });
   }
 
   /** One token bound to the recipient's domain, blinded so neither the issuer nor this client's server can link it. */
@@ -1365,14 +1469,15 @@ export class SignetClient {
 
   private async registerTokens(add: string[], remove: string[]): Promise<void> {
     if (add.length === 0 && remove.length === 0) return;
-    const { released = 0 } = (await this.call('POST', '/v0/delivery-tokens', { add, remove })) as { released?: number };
-    this.released += released;
+    for (const result of await this.callEach('POST', '/v0/delivery-tokens', { add, remove })) this.released += (result as { released?: number }).released ?? 0;
   }
 
   private async upload(file: FileInput): Promise<AttachmentRef> {
     const { blob, ref } = sealAttachment(file);
-    const { url } = (await this.call('POST', '/v0/blobs', blob)) as { url: string };
-    return { ...ref, url };
+    // The message names where the ciphertext is, so it goes to every home: one operator being down or
+    // withholding must not cost the reader the file.
+    const urls = await this.eachHome(async (home) => ((await this.request(home, 'POST', '/v0/blobs', blob)) as { url: string }).url);
+    return { ...ref, url: urls[0], ...(urls.length > 1 ? { copies: urls.slice(1) } : {}) };
   }
 
   private thread(thread: string): string {
@@ -1386,8 +1491,15 @@ export class SignetClient {
 
   /** With a token the delivery is sealed; with an anonymous token the request carries no sender. */
   private async submit(to: string[], kind: MailKind, payload: unknown, token?: string, anonymousToken?: string): Promise<void> {
-    const { id } = (await this.call('POST', '/v0/submit', { to, kind, payload, token, anonymousToken })) as { id: string };
+    // The client picks the id, so a send repeated through another home after a lost answer is recognised.
+    const body = { id: randomId('i'), to, kind, payload, token, anonymousToken };
+    const { result, home } = await this.callFrom('POST', '/v0/submit', body);
+    const { id } = result as { id: string };
     this.state.sentIds = [...this.state.sentIds, id].slice(-SENT_IDS_KEPT);
+    // Our own home says it delivered. Only the recipients' homes can prove it.
+    const entry: UnconfirmedSend = { id, to: [...to], body, at: Date.now(), tries: 0, via: home };
+    this.state.unconfirmed = [...this.state.unconfirmed, entry].slice(-UNCONFIRMED_KEPT);
+    await this.confirm(entry, result as { unknown?: string[]; rejected?: string[]; receipts?: Receipt[] });
   }
 
   private async getJson(url: string): Promise<unknown> {
@@ -1407,17 +1519,217 @@ export class SignetClient {
     return { code: pairingCode(slot, newPairingSecret()), channel: new HttpPairingChannel(server, slot, 'a', auth, this.fetchImpl), expires };
   }
 
-  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
-    const { server } = await this.resolver.policy(splitAddress(this.address).domain);
+  /** The homes of this client's own domain, the one that last answered first. One home for any domain without a signed list. */
+  private async homeBases(): Promise<string[]> {
+    const policy = await this.resolver.policy(splitAddress(this.address).domain);
+    const bases = policy.operators ? (policy.homes ?? [policy.server]) : [policy.server];
+    return this.preferredHome && bases.includes(this.preferredHome) ? [this.preferredHome, ...bases.filter((base) => base !== this.preferredHome)] : bases;
+  }
+
+  private preferredHome?: string;
+
+  private async request(base: string, method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
     const binary = body instanceof Uint8Array;
     const payload = body === undefined ? '' : binary ? body : JSON.stringify(body);
     const headers = {
       ...clientAuthHeaders(this.address, this.keys.cert.clientId, this.keys.signing, method, path, payload),
       ...(body === undefined ? {} : { 'content-type': binary ? 'application/octet-stream' : 'application/json' }),
     };
-    const response = await this.fetchImpl(`${server}${path}`, { method, headers, body: body === undefined ? undefined : payload });
+    const response = await this.fetchImpl(`${base}${path}`, { method, headers, body: body === undefined ? undefined : payload });
     if (!response.ok) throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
     return response.json();
+  }
+
+  /** Run `act` at every home, ignoring the ones that fail; throws only if every home did. */
+  private async eachHome<T>(act: (home: string) => Promise<T>): Promise<T[]> {
+    const results: T[] = [];
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        results.push(await act(home));
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (results.length === 0) throw failure;
+    return results;
+  }
+
+  /** The mailbox of every home, each from its own cursor. A home that doesn't answer is skipped. */
+  private async readMailboxes(): Promise<{ home: string; items: MailItem[] }[]> {
+    const bases = await this.homeBases();
+    return this.eachHome(async (home) => {
+      const cursor = this.state.cursors[home] ?? (bases.length === 1 ? this.state.cursor : 0);
+      const known = this.state.epochs[home];
+      const { items, epoch } = (await this.request(home, 'GET', `/v0/mailbox?after=${cursor}${known ? `&epoch=${encodeURIComponent(known)}` : ''}`)) as { items: MailItem[]; epoch?: string };
+      // The home started over: it has answered from the start, and our cursor was into a mailbox that is gone.
+      if (epoch && known && epoch !== known) this.state.cursors[home] = 0;
+      if (epoch) this.state.epochs[home] = epoch;
+      return { home, items };
+    });
+  }
+
+  /** A call to the first home that answers. */
+  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        const result = await this.request(home, method, path, body);
+        this.preferredHome = home;
+        return result;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
+  }
+
+  /**
+   * A call to every home, for state each of them keeps: tokens, contacts and grants. A home that fails gets the
+   * call again at the next sync. Throws only if every home failed.
+   */
+  private async callEach(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown[]> {
+    const results: unknown[] = [];
+    const failed: string[] = [];
+    let failure: unknown;
+    for (const home of await this.homeBases()) {
+      try {
+        results.push(await this.request(home, method, path, body));
+      } catch (error) {
+        failed.push(home);
+        failure = error;
+      }
+    }
+    if (results.length === 0) throw failure;
+    if (method === 'POST' && body !== undefined && !(body instanceof Uint8Array)) {
+      for (const home of failed) this.state.pending.push({ home, path, body });
+      this.state.pending = this.state.pending.slice(-PENDING_KEPT);
+    }
+    return results;
+  }
+
+  /**
+   * A call to the first home that answers, other than `avoid` unless it is the only one. Says which home answered.
+   */
+  private async callFrom(method: 'GET' | 'POST', path: string, body?: unknown, avoid?: string): Promise<{ result: unknown; home: string }> {
+    const bases = await this.homeBases();
+    const order = avoid ? [...bases.filter((base) => base !== avoid), ...bases.filter((base) => base === avoid)] : bases;
+    let failure: unknown;
+    for (const home of order) {
+      try {
+        const result = await this.request(home, method, path, body);
+        this.preferredHome = home;
+        return { result, home };
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure;
+  }
+
+  /**
+   * Count what a send has been proved to reach. An address the server said is unknown or refused is settled; so
+   * is one a valid receipt names. A home vouching for a delivery to its own domain through its own mouth doesn't
+   * count: it is the home that might have dropped it.
+   */
+  private async confirm(entry: UnconfirmedSend, result: { unknown?: string[]; rejected?: string[]; receipts?: Receipt[] }): Promise<void> {
+    const settled = new Set([...(result.unknown ?? []), ...(result.rejected ?? [])].map(normalizeAddress));
+    const ownDomain = splitAddress(this.address).domain;
+    for (const receipt of result.receipts ?? []) {
+      try {
+        const policy = await this.resolver.policy(receipt.body.domain);
+        if (!verifyReceipt(receipt, policy, entry.id)) continue;
+        const viaKey = policy.operators?.body.homes.find((home) => new URL(home.url).origin === new URL(entry.via).origin)?.key;
+        if (receipt.body.domain === ownDomain && receipt.body.home !== undefined && receipt.body.home === viaKey) continue;
+        for (const address of [...receipt.body.to, ...receipt.body.held]) settled.add(normalizeAddress(address));
+      } catch {
+        // A receipt we can't check is no receipt.
+      }
+    }
+    entry.to = entry.to.filter((address) => !settled.has(normalizeAddress(address)));
+    if (entry.to.length === 0) this.state.unconfirmed = this.state.unconfirmed.filter((send) => send !== entry && send.id !== entry.id);
+  }
+
+  /** Send again, through a different home, what no recipient home has proved it got; report what still can't be. */
+  private async retryUnconfirmed(): Promise<SignetEvent[]> {
+    const events: SignetEvent[] = [];
+    const grace = this.options.receiptGraceMs ?? 300_000;
+    const retries = this.options.receiptRetries ?? 3;
+    for (const entry of [...this.state.unconfirmed]) {
+      if (Date.now() - entry.at < grace) continue;
+      if (entry.tries >= retries) {
+        events.push({ kind: 'delivery-unconfirmed', id: entry.id, to: entry.to });
+        this.state.unconfirmed = this.state.unconfirmed.filter((send) => send.id !== entry.id);
+        continue;
+      }
+      entry.tries += 1;
+      entry.at = Date.now();
+      try {
+        const { result, home } = await this.callFrom('POST', '/v0/submit', { ...entry.body, to: entry.to }, entry.via);
+        entry.via = home;
+        await this.confirm(entry, result as { unknown?: string[]; rejected?: string[]; receipts?: Receipt[] });
+      } catch {
+        // No home answered; try again at the next sync.
+      }
+    }
+    return events;
+  }
+
+  /** Drop processed ids older than thirty days, and the oldest beyond the cap. */
+  private forgetOldIds(): void {
+    const cutoff = Date.now() - SEEN_MAX_AGE_MS;
+    const entries = Object.entries(this.state.seen);
+    for (const [key, at] of entries) if (at < cutoff) delete this.state.seen[key];
+    if (entries.length <= SEEN_MAX) return;
+    for (const [key] of entries.sort((a, b) => a[1] - b[1]).slice(0, entries.length - SEEN_MAX)) delete this.state.seen[key];
+  }
+
+  /** Repeat registrations that a home missed, oldest first, and keep the ones that still can't be delivered. */
+  private async flushPending(): Promise<void> {
+    if (this.state.pending.length === 0) return;
+    const stuck: ClientSnapshot['pending'] = [];
+    const blocked = new Set<string>();
+    for (const entry of this.state.pending) {
+      if (blocked.has(entry.home)) {
+        stuck.push(entry);
+        continue;
+      }
+      try {
+        await this.request(entry.home, 'POST', entry.path, entry.body);
+      } catch {
+        blocked.add(entry.home);
+        stuck.push(entry);
+      }
+    }
+    this.state.pending = stuck;
+  }
+
+  /** Note that `home` had the item, for comparing homes (Section 6.9.6). */
+  private watch(id: string, home: string): void {
+    const entry = (this.state.homeWatch[id] ??= { homes: [], at: Date.now() });
+    if (!entry.homes.includes(home)) entry.homes.push(home);
+  }
+
+  /** Homes that answered this sync but still lack an item others delivered, once the grace period has passed. */
+  private async laggingHomes(answered: string[]): Promise<SignetEvent[]> {
+    const events: SignetEvent[] = [];
+    const bases = await this.homeBases();
+    const now = Date.now();
+    const grace = this.options.homeGraceMs ?? 600_000;
+    for (const [id, entry] of Object.entries(this.state.homeWatch)) {
+      // Done once every home has it; forgotten once too old to matter.
+      if (bases.every((home) => entry.homes.includes(home)) || now - entry.at > WATCH_MAX_AGE_MS) {
+        delete this.state.homeWatch[id];
+        continue;
+      }
+      if (!entry.alerted && now - entry.at >= grace) {
+        entry.alerted = true;
+        for (const home of answered) if (!entry.homes.includes(home)) events.push({ kind: 'home-missing', home, itemId: id });
+      }
+    }
+    const ids = Object.keys(this.state.homeWatch);
+    for (const id of ids.slice(0, Math.max(0, ids.length - WATCH_KEPT))) delete this.state.homeWatch[id];
+    return events;
   }
 }
 

@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import type { KeyPair } from './crypto';
 import { sha256, signJson, verifyJson } from './crypto';
+import type { DomainPolicy } from './directory';
+import { verifiedDomainSigner } from './operators';
 
 /** Requests older or newer than this are refused; within it, a `ReplayCache` refuses repeats. */
 export const AUTH_SKEW_MS = 5 * 60_000;
@@ -112,4 +114,45 @@ export function verifyDomainAuth(
   now = new Date(),
 ): boolean {
   return fresh(ts, now) && nonce.length > 0 && verifyJson(domainKey, { kind: 'domain', domain, ...payload(method, path, ts, nonce, body) }, sig);
+}
+
+/**
+ * Headers a home sends another server, signed with the home key rather than the domain key, which the
+ * home doesn't hold (Section 6.9.3). The key names itself in a header and in the signed object.
+ */
+export function homeAuthHeaders(
+  domain: string,
+  homeKey: KeyPair,
+  method: string,
+  path: string,
+  body: string | Uint8Array,
+  now = new Date(),
+): Record<string, string> {
+  const ts = now.toISOString();
+  const nonce = newNonce();
+  return {
+    'signet-domain': domain,
+    'signet-home': homeKey.publicKey,
+    'signet-ts': ts,
+    'signet-nonce': nonce,
+    'signet-sig': signJson(homeKey, { kind: 'domain', domain, home: homeKey.publicKey, ...payload(method, path, ts, nonce, body) }),
+  };
+}
+
+/**
+ * Check a call from another domain's server: signed by the domain key, or by the key of a home in the
+ * domain's verified operators statement when `signet-home` says so.
+ */
+export function verifyDomainCall(
+  policy: Pick<DomainPolicy, 'domain' | 'domainKey' | 'operators'>,
+  headers: { sig: string; ts: string; nonce: string; home?: string },
+  method: string,
+  path: string,
+  body: string | Uint8Array,
+  now = new Date(),
+): boolean {
+  const signer = verifiedDomainSigner(policy, headers.home);
+  if (signer === undefined || !fresh(headers.ts, now) || headers.nonce.length === 0) return false;
+  const signed = headers.home === undefined ? { kind: 'domain', domain: policy.domain } : { kind: 'domain', domain: policy.domain, home: headers.home };
+  return verifyJson(signer, { ...signed, ...payload(method, path, headers.ts, headers.nonce, body) }, headers.sig);
 }

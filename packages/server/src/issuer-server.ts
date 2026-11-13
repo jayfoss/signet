@@ -1,5 +1,5 @@
 import type { IssuerKey, IssuerKeyPair, Resolver } from '@signet/lib';
-import { ReplayCache, blindSign, generateIssuerKey, verifyDomainAuth } from '@signet/lib';
+import { ReplayCache, blindSign, generateIssuerKey, verifyDomainCall } from '@signet/lib';
 import type { HttpRequest } from './http';
 import { HttpError, JsonServer, header, json } from './http';
 
@@ -49,13 +49,11 @@ export class IssuerServer {
 
   private async issue(request: HttpRequest): Promise<{ signatures: string[] }> {
     const domain = header(request.headers, 'signet-domain');
-    const { domainKey } = await this.resolver.policy(domain);
-    const ok = verifyDomainAuth(
-      domain,
-      domainKey,
-      header(request.headers, 'signet-sig'),
-      header(request.headers, 'signet-ts'),
-      header(request.headers, 'signet-nonce'),
+    const policy = await this.resolver.policy(domain);
+    const home = request.headers['signet-home'];
+    const ok = verifyDomainCall(
+      policy,
+      { sig: header(request.headers, 'signet-sig'), ts: header(request.headers, 'signet-ts'), nonce: header(request.headers, 'signet-nonce'), home: typeof home === 'string' ? home : undefined },
       request.method,
       request.path,
       request.body,

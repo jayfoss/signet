@@ -49,6 +49,15 @@ describe('requester proofs (Section 4.7)', () => {
     expect(entry.status === 'enrolled' && entry.view === undefined).toBe(true);
   });
 
+  it('shows the target no labels, scopes or limits of the requester’s clients, only what a contact view holds', async () => {
+    const proofOf = (w.alicePhone as unknown as { requesterProof: (target: string) => Promise<string> }).requesterProof.bind(w.alicePhone);
+    const decoded = Buffer.from(await proofOf('bob@beta.test'), 'base64url').toString('utf8');
+    expect(decoded).not.toMatch(/"label"|"scopes"|"limits"|Phone/);
+    const proof = JSON.parse(decoded) as { view: { view: { members: { kind: string }[] } } };
+    expect(proof.view.view.members[0].kind).toBe('device');
+    expect(decoded).not.toContain('"entries"');
+  });
+
   it('refuses a proof signed for another target', async () => {
     const alpha = w.bed.server('alpha.test') as unknown as Fetcher;
     const proofOf = (w.alicePhone as unknown as { requesterProof: (target: string) => Promise<string> }).requesterProof.bind(w.alicePhone);

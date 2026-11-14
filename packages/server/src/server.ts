@@ -1247,15 +1247,17 @@ export class SignetServer implements LegacyInbox {
   private async requesterProven(proof: string | undefined, hash: string, target: string): Promise<boolean> {
     if (!proof) return false;
     try {
-      const state = verifyRequesterProof(proof, hash, target);
-      const { local, domain } = splitAddress(state.principal);
-      const policy = await this.options.resolver.policy(domain);
-      const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}`);
-      if (!response.ok) return false;
-      const entry = (await response.json()) as DirectoryEntry;
-      if (entry.status !== 'enrolled') return false;
-      const verified = verifyDirectoryEntry(entry, policy);
-      return verified.identityKey === state.identityKey && entry.card.card.logHead === state.head;
+      await verifyRequesterProof(proof, hash, target, async (address) => {
+        const { local, domain } = splitAddress(address);
+        const policy = await this.options.resolver.policy(domain);
+        const response = await this.signedFetchHomes(domain, 'GET', `/v0/directory/${encodeURIComponent(local)}`);
+        if (!response.ok) throw new Error(`${domain} would not say who ${address} is`);
+        const entry = (await response.json()) as DirectoryEntry;
+        if (entry.status !== 'enrolled') throw new Error(`${address} is not enrolled`);
+        // What the requester's own domain vouches for: its binding, card and so its identity key and current log head.
+        return { identityKey: verifyDirectoryEntry(entry, policy).identityKey, logHead: entry.card.card.logHead };
+      });
+      return true;
     } catch {
       return false;
     }

@@ -1736,11 +1736,11 @@ export class SignetClient {
     return (await this.getJson(`${server}/v0/directory/${encodeURIComponent(local)}`)) as DirectoryEntry;
   }
 
-  /** Proof for a lookup of `target`. The log is fetched each time: a cached copy would not match the card once a client is enrolled. */
+  /** Proof for a lookup of `target`. The view is fetched each time: a cached copy would not match the card once a client is enrolled. */
   private async requesterProof(target: string): Promise<string> {
     const own = (await this.call('GET', `/v0/lookup?address=${encodeURIComponent(this.address)}`)) as EnrolledEntry;
-    if (!own.log) throw new Error('home server did not return this account’s log');
-    return signRequesterProof(this.keys, this.address, own.log, target);
+    if (!own.view) throw new Error('home server did not return this account’s contact view');
+    return signRequesterProof(this.keys, this.address, own.view, target);
   }
 
   /** Log queries go through the home server, which authenticates to the log as its domain. */
